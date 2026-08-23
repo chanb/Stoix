@@ -160,6 +160,7 @@ dependencies = [
     "wandb>=0.19.8",
     "playground>=0.0.5",
     "protobuf==3.20.3",
+    "ipdb>=0.13.13",
 ]
 
 [dependency-groups]
