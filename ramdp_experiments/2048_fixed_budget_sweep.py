@@ -92,7 +92,6 @@ class Job:
         cmd = [
             python_bin,
             SYSTEM_TO_SCRIPT[self.system],
-            "env=jumanji/2048",
             f"network={network}",
             "logger.loggers.tensorboard.enabled=True",
             "logger.loggers.json.enabled=True",
@@ -112,8 +111,10 @@ class Job:
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch != "cnn":
+            cmd.append("env=jumanji/2048")
             cmd.append(f"+wrapper._target_=stoa.FlattenObservationWrapper")
         else:
+            cmd.append("env=jumanji/2048_grid")
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[32,32,32]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[2,2,2]")
             cmd.append(f"network.actor_network.input_layer.strides=[1,1,1]")

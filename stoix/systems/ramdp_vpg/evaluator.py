@@ -40,6 +40,8 @@ class RamdpEvalState(NamedTuple):
     timestep: TimeStep
     step_count: chex.Array
     episode_return: chex.Array
+    episode_discounted_return: chex.Array
+    discount_factor: chex.Array
     episode_compute_time: chex.Array
 
 
@@ -70,6 +72,8 @@ def get_ff_evaluator_fn_with_compute_time(
                 last_timestep,
                 step_count,
                 episode_return,
+                episode_discounted_return,
+                discount_factor,
                 episode_compute_time,
             ) = eval_state
 
@@ -90,12 +94,28 @@ def get_ff_evaluator_fn_with_compute_time(
             # Step environment.
             env_state, timestep = env.step(env_state, action.squeeze(0))
 
-            # Log episode metrics.
+            # Log episode metrics. `episode_discounted_return` follows the same
+            # compute-adjusted discounting the actor is trained with (see
+            # `ff_reinforce.get_learner_fn`'s `G_h = gamma^(C_h - 1) * (r_h +
+            # gamma * G_{h+1})`), accumulated forward from the start of the
+            # episode via a running `discount_factor` rather than backward
+            # like the training-time `batch_discounted_returns` recursion.
             episode_return += timestep.reward
+            episode_discounted_return += (
+                discount_factor * config.system.gamma ** (compute_time - 1) * timestep.reward
+            )
+            discount_factor *= config.system.gamma**compute_time
             episode_compute_time += compute_time
             step_count += 1
             eval_state = RamdpEvalState(
-                key, env_state, timestep, step_count, episode_return, episode_compute_time
+                key,
+                env_state,
+                timestep,
+                step_count,
+                episode_return,
+                episode_discounted_return,
+                discount_factor,
+                episode_compute_time,
             )
             return eval_state
 
@@ -109,6 +129,7 @@ def get_ff_evaluator_fn_with_compute_time(
 
         eval_metrics = {
             "episode_return": final_state.episode_return,
+            "episode_discounted_return": final_state.episode_discounted_return,
             "episode_length": final_state.step_count,
             "compute_time": final_state.episode_compute_time / final_state.step_count,
         }
@@ -147,6 +168,8 @@ def get_ff_evaluator_fn_with_compute_time(
             timestep=timesteps,
             step_count=jnp.zeros((eval_batch, 1)),
             episode_return=jnp.zeros_like(timesteps.reward),
+            episode_discounted_return=jnp.zeros_like(timesteps.reward),
+            discount_factor=jnp.ones_like(timesteps.reward),
             episode_compute_time=jnp.zeros((eval_batch, 1)),
         )
 

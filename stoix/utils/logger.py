@@ -323,15 +323,19 @@ class TensorboardLogger(BaseLogger):
 
 
 class JsonLogger(BaseLogger):
-    # These are the only metrics that marl-eval needs to plot. compute_time/mean is
-    # included for RAMDP systems (see stoix.systems.ramdp_vpg.evaluator), where it's
-    # the mean pondering/CoT steps per env step - absent for other systems' metrics,
-    # so this is a no-op there.
+    # These are the only metrics that marl-eval needs to plot. compute_time/mean and
+    # episode_discounted_return/mean are included for RAMDP systems (see
+    # stoix.systems.ramdp_vpg.evaluator) - compute_time/mean is the mean pondering/CoT
+    # steps per env step, and episode_discounted_return/mean is the episode return
+    # discounted the same way the actor is trained (gamma per env step, further
+    # discounted by gamma per pondering step). Both are absent for other systems'
+    # metrics, so this is a no-op there.
     _METRICS_TO_LOG: ClassVar[List[str]] = [
         "episode_return/mean",
         "solve_rate",
         "steps_per_second",
         "compute_time/mean",
+        "episode_discounted_return/mean",
     ]
 
     def __init__(
