@@ -115,9 +115,10 @@ class Job:
             cmd.append(f"+wrapper._target_=stoa.FlattenObservationWrapper")
         else:
             cmd.append("env=jumanji/2048_grid")
-            cmd.append(f"network.actor_network.input_layer.channel_sizes=[32,32,32]")
-            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[2,2,2]")
-            cmd.append(f"network.actor_network.input_layer.strides=[1,1,1]")
+            cmd.append(f"network.actor_network.input_layer.channel_sizes=[32,32]")
+            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[2,2]")
+            cmd.append(f"network.actor_network.input_layer.strides=[2,1]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[64]")
         return cmd
 
     def run_dir(self) -> Path:
@@ -162,6 +163,7 @@ def run_job(
         # With `runs_per_gpu` processes sharing one physical GPU, each must be capped
         # to roughly 1/runs_per_gpu of the GPU or the later processes to allocate OOM.
         "XLA_PYTHON_CLIENT_MEM_FRACTION": str(mem_fraction),
+        "XLA_FLAGS": "--xla_gpu_autotune_level=0",
     }
     import os
 

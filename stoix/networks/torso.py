@@ -7,6 +7,7 @@ from flax.linen.initializers import Initializer, orthogonal
 
 from stoix.networks.layers import NoisyLinear
 from stoix.networks.utils import parse_activation_fn
+import jax
 
 
 class MLPTorso(nn.Module):

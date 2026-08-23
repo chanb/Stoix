@@ -168,8 +168,8 @@ def get_ff_evaluator_fn_with_compute_time(
             timestep=timesteps,
             step_count=jnp.zeros((eval_batch, 1)),
             episode_return=jnp.zeros_like(timesteps.reward),
-            episode_discounted_return=jnp.zeros_like(timesteps.reward),
-            discount_factor=jnp.ones_like(timesteps.reward),
+            episode_discounted_return=jnp.zeros((eval_batch, 1)),
+            discount_factor=jnp.ones((eval_batch, 1)),
             episode_compute_time=jnp.zeros((eval_batch, 1)),
         )
 
