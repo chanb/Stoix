@@ -1,0 +1,27 @@
+# ---MLP Compute-Time-Aware Q Actor-Critic Networks---
+# Same compute-aware ACT actor as mlp_compute.yaml. The critic is
+# stoix.networks.base_qac.ValueAndQCritic: one torso, a scalar value_head
+# V(s), and a q_head whose output shape depends on system.qac_variant (see
+# ff_qac.py's learner_setup and module docstring) - a full (num_actions,
+# max_steps) table for "naive", or just (num_actions,) - Q(s,·,1) - for the
+# runtime-factorized "fac" variant. output_dim/pre_shape for both heads are
+# injected in code, not set here.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute.AdaptiveComputationTimeTorso
+    hidden_dim: 256
+    max_steps: 10
+    activation: relu
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  value_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
+  q_head:
+    _target_: stoix.networks.heads.LinearHead
