@@ -12,5 +12,11 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # controls both the usual reward horizon and the cost of pondering longer.
 ent_coef: 0.001 # Entropy regularisation term for loss function.
 vf_coef: 1.0 # Critic weight in
+delightful: False # Whether to gate the REINFORCE weight by a sigmoid of
+  # (advantage * surprisal / delightful_eta), where surprisal = -log_prob of the
+  # sampled trajectory (stop-gradient'd). Amplifies reinforcement of
+  # good-and-surprising samples, damps punishment of bad-and-surprising ones,
+  # leaving already-likely samples closer to unaffected either way.
+delightful_eta: 1.0 # Temperature for the delightful gate; only used if delightful=True.
 max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
 decay_learning_rates: False # Whether learning rates should be linearly decayed during training.

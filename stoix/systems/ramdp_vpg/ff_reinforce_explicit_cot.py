@@ -19,8 +19,10 @@ both the realised `compute_time` *and* the realised `thought_tokens` to
 replay the exact trajectory that was taken). Everything else - the
 compute-discounted return (see `ff_reinforce.py` for the full derivation:
 `G_h = gamma^(C_h - 1) * (r_h + gamma * G_{h+1})`), the critic, the actor
-loss shape - is identical to the latent-CoT version; only the Transition
-(which now also stores `thought_tokens`) and the torso calls differ.
+loss shape, and the optional `config.system.delightful` gate on the
+REINFORCE weight (see `ff_reinforce.py`'s docstring) - is identical to the
+latent-CoT version; only the Transition (which now also stores
+`thought_tokens`) and the torso calls differ.
 
 This file intentionally duplicates most of `ff_reinforce.py` rather than
 modifying it, so both the plain VPG system and the latent-CoT RAMDP-VPG
@@ -202,8 +204,20 @@ def get_learner_fn(
             # compute-adjusted advantage.
             log_prob = env_log_prob + cot_log_prob
             advantage = monte_carlo_returns - value_predictions
+
+            # "Delightful" policy gradient: gate the REINFORCE weight by how
+            # surprising the sampled trajectory was under the current policy.
+            # `gate` is a function of stop-gradient'd quantities only, so this
+            # changes nothing about where gradient flows - only through
+            # `log_prob` below, same as the un-gated version.
+            weight = advantage
+            if config.system.delightful:
+                surprisal = -jax.lax.stop_gradient(log_prob)
+                gate = jax.nn.sigmoid(advantage * surprisal / config.system.delightful_eta)
+                weight = gate * advantage
+
             # CALCULATE ACTOR LOSS
-            loss_actor = -advantage * log_prob
+            loss_actor = -weight * log_prob
             entropy = actor_policy.entropy().mean()
 
             total_loss_actor = loss_actor.mean() - config.system.ent_coef * entropy
@@ -212,6 +226,8 @@ def get_learner_fn(
                 "entropy": entropy,
                 "compute_time": compute_times,
             }
+            if config.system.delightful:
+                loss_info["delightful_gate"] = gate
             return total_loss_actor, loss_info
 
         def _critic_loss_fn(

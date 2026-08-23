@@ -32,6 +32,15 @@ to think, on top of the usual one `gamma` per environment transition. Both
 the environment action and the halting decisions that produced it are
 trained from the resulting advantage.
 
+Optionally (`config.system.delightful`), the REINFORCE weight itself is
+gated by a stop-gradient'd sigmoid of `advantage * surprisal / eta`, where
+`surprisal = -log_prob` of the sampled trajectory: this pushes reinforcement
+towards samples that were both good *and* surprising (the policy wouldn't
+have predicted them), and damps punishment of samples that were bad but
+surprising, while leaving already-likely samples closer to unaffected either
+way. It never changes where gradient flows - only through `log_prob`, same
+as without it.
+
 This file intentionally duplicates most of `ff_reinforce.py` rather than
 modifying it, so the existing VPG system is left untouched.
 """
@@ -210,8 +219,20 @@ def get_learner_fn(
             # trained jointly, from the same compute-adjusted advantage.
             log_prob = env_log_prob + halting_log_prob
             advantage = monte_carlo_returns - value_predictions
+
+            # "Delightful" policy gradient: gate the REINFORCE weight by how
+            # surprising the sampled trajectory was under the current policy.
+            # `gate` is a function of stop-gradient'd quantities only, so this
+            # changes nothing about where gradient flows - only through
+            # `log_prob` below, same as the un-gated version.
+            weight = advantage
+            if config.system.delightful:
+                surprisal = -jax.lax.stop_gradient(log_prob)
+                gate = jax.nn.sigmoid(advantage * surprisal / config.system.delightful_eta)
+                weight = gate * advantage
+
             # CALCULATE ACTOR LOSS
-            loss_actor = -advantage * log_prob
+            loss_actor = -weight * log_prob
             entropy = actor_policy.entropy().mean()
 
             total_loss_actor = loss_actor.mean() - config.system.ent_coef * entropy
@@ -220,6 +241,8 @@ def get_learner_fn(
                 "entropy": entropy,
                 "compute_time": compute_times,
             }
+            if config.system.delightful:
+                loss_info["delightful_gate"] = gate
             return total_loss_actor, loss_info
 
         def _critic_loss_fn(

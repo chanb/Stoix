@@ -37,7 +37,9 @@ the policy outputs, exactly like the environment action `a`, so the critic
 The actor itself is unchanged from `ff_reinforce.py`: an Adaptive
 Computation Time torso whose sampled halting trajectory is trained via the
 score-function estimator, jointly with the environment action, from this
-Q-based advantage.
+Q-based advantage. It also supports the same optional
+`config.system.delightful` gate on the REINFORCE weight - see
+`ff_reinforce.py`'s docstring.
 
 This file intentionally duplicates most of `ff_reinforce.py` rather than
 modifying it, so the existing REINFORCE-with-baseline RAMDP-VPG system is
@@ -213,8 +215,20 @@ def get_learner_fn(
             # The halting decisions and the environment action they led to are
             # trained jointly, from the same Q-based advantage.
             log_prob = env_log_prob + halting_log_prob
+
+            # "Delightful" policy gradient: gate the REINFORCE weight by how
+            # surprising the sampled trajectory was under the current policy.
+            # `gate` is a function of stop-gradient'd quantities only, so this
+            # changes nothing about where gradient flows - only through
+            # `log_prob` below, same as the un-gated version.
+            weight = advantage
+            if config.system.delightful:
+                surprisal = -jax.lax.stop_gradient(log_prob)
+                gate = jax.nn.sigmoid(advantage * surprisal / config.system.delightful_eta)
+                weight = gate * advantage
+
             # CALCULATE ACTOR LOSS
-            loss_actor = -advantage * log_prob
+            loss_actor = -weight * log_prob
             entropy = actor_policy.entropy().mean()
 
             total_loss_actor = loss_actor.mean() - config.system.ent_coef * entropy
@@ -223,6 +237,8 @@ def get_learner_fn(
                 "entropy": entropy,
                 "compute_time": compute_times,
             }
+            if config.system.delightful:
+                loss_info["delightful_gate"] = gate
             return total_loss_actor, loss_info
 
         def _critic_loss_fn(

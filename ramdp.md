@@ -59,3 +59,37 @@ CUDA_VISIBLE_DEVICES="1" python stoix/systems/ramdp_vpg/ff_qac.py \
   system.qac_variant=naive \
   logger.base_exp_path=results/pondernet-naive-c_max_${c_max}-breakout-hidden_dim_16
 ```
+
+## ARC
+```
+CUDA_VISIBLE_DEVICES="0" python stoix/systems/ramdp_vpg/ff_qac.py \
+    env=jaxarc/default \
+    logger.loggers.tensorboard.enabled=True \
+    system.gamma=0.9999 \
+    arch.total_timesteps=1e8 \
+    network.actor_network.pre_torso.hidden_dim=16 \
+    network.actor_network.pre_torso.max_steps=${c_max} \
+    system.qac_variant=fac \
+    logger.base_exp_path=results_arc/pondernet-fac-c_max_${c_max}-hidden_dim_16 \
+    +env.reward.step_penalty=0.0
+
+CUDA_VISIBLE_DEVICES="0" python stoix/systems/ramdp_vpg/ff_qac.py \
+    env=jaxarc/default \
+    logger.loggers.tensorboard.enabled=True \
+    system.gamma=0.9999 \
+    arch.total_timesteps=1e8 \
+    network.actor_network.pre_torso.hidden_dim=16 \
+    network.actor_network.pre_torso.max_steps=${c_max} \
+    system.qac_variant=naive \
+    logger.base_exp_path=results_arc/pondernet-naive-c_max_${c_max}-hidden_dim_16 \
+    +env.reward.step_penalty=0.0
+
+CUDA_VISIBLE_DEVICES="0" python stoix/systems/ramdp_vpg/ff_reinforce.py \
+    env=jaxarc/default \
+    logger.loggers.tensorboard.enabled=True \
+    system.gamma=0.9999 \
+    arch.total_timesteps=1e8 \
+    network.actor_network.pre_torso.hidden_dim=16 \
+    network.actor_network.pre_torso.max_steps=${c_max} \
+    logger.base_exp_path=results_arc/pondernet-c_max_${c_max}-hidden_dim_16
+```
