@@ -6,6 +6,12 @@
 # max_steps) table for "naive", or just (num_actions,) - Q(s,·,1) - for the
 # runtime-factorized "fac" variant. output_dim/pre_shape for both heads are
 # injected in code, not set here.
+#
+# q_head uses stoix.networks.heads.MLPHead, which is a drop-in superset of
+# LinearHead: with hidden_sizes=[] (the default below) it's identical to a
+# plain LinearHead; set it to e.g. [128] or [128, 128] to give the Q-head its
+# own hidden MLP layers on top of the shared torso embedding, instead of a
+# single linear projection.
 actor_network:
   pre_torso:
     _target_: stoix.networks.torso_compute.AdaptiveComputationTimeTorso
@@ -24,4 +30,7 @@ critic_network:
   value_head:
     _target_: stoix.networks.heads.ScalarCriticHead
   q_head:
-    _target_: stoix.networks.heads.LinearHead
+    _target_: stoix.networks.heads.MLPHead
+    hidden_sizes: []
+    activation: relu
+    use_layer_norm: False

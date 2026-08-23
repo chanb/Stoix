@@ -15,5 +15,5 @@ eval_metric: episode_return
 
 
 # Optional wrapper to flatten the observation space.
-# wrapper:
-#   _target_: stoa.FlattenObservationWrapper
+wrapper:
+  _target_: stoa.FlattenObservationWrapper

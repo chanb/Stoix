@@ -23,6 +23,7 @@ from stoix.networks.distributions import (
     DiscreteValuedTfpDistribution,
     MultiDiscreteActionDistribution,
 )
+from stoix.networks.torso import MLPTorso
 
 tfb = tfp.bijectors
 
@@ -306,6 +307,43 @@ class LinearHead(nn.Module):
     @nn.compact
     def __call__(self, embedding: chex.Array) -> chex.Array:
         out = nn.Dense(self.output_size, kernel_init=self.kernel_init)(embedding)
+        if self.pre_shape is None:
+            return out
+        return out.reshape(out.shape[:-1] + self.shape)
+
+
+class MLPHead(nn.Module):
+    """Like `LinearHead`, but with an optional MLP (`hidden_sizes`) run over
+    the embedding before the final linear projection - e.g. for a Q-head
+    that needs more capacity than a single linear layer on top of a shared
+    torso's embedding can express. With `hidden_sizes=()` (the default) this
+    is identical to `LinearHead`."""
+
+    output_dim: int
+    hidden_sizes: Sequence[int] = ()
+    activation: str = "relu"
+    use_layer_norm: bool = False
+    kernel_init: Initializer = orthogonal(0.01)
+    pre_shape: Optional[Tuple[int, ...]] = None
+
+    def setup(self) -> None:
+        if self.pre_shape is not None:
+            self.shape = self.pre_shape + (self.output_dim,)
+        else:
+            self.shape = (self.output_dim,)
+        self.output_size = int(np.prod(self.shape))
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+        x = embedding
+        if self.hidden_sizes:
+            x = MLPTorso(
+                layer_sizes=self.hidden_sizes,
+                activation=self.activation,
+                use_layer_norm=self.use_layer_norm,
+                activate_final=True,
+            )(x)
+        out = nn.Dense(self.output_size, kernel_init=self.kernel_init)(x)
         if self.pre_shape is None:
             return out
         return out.reshape(out.shape[:-1] + self.shape)

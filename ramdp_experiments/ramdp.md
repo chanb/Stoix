@@ -91,5 +91,10 @@ CUDA_VISIBLE_DEVICES="0" python stoix/systems/ramdp_vpg/ff_reinforce.py \
     arch.total_timesteps=1e8 \
     network.actor_network.pre_torso.hidden_dim=16 \
     network.actor_network.pre_torso.max_steps=${c_max} \
-    logger.base_exp_path=results_arc/pondernet-c_max_${c_max}-hidden_dim_16
+    logger.base_exp_path=results_arc/pondernet-c_max_${c_max}-hidden_dim_16 \
+    +env.reward.step_penalty=0.0
+```
+
+```
+python ramdp_experiments/sokoban_sweep.py --hidden-dim=8,16,32,64 --lr=1e-5,1e-4,3e-4,1e-3 --runs-per-gpu=1 --seeds=3
 ```
