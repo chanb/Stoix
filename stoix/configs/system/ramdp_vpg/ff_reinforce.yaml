@@ -1,0 +1,16 @@
+# --- Defaults Compute-Time-Aware FF-REINFORCE (RAMDP-VPG) ---
+
+system_name: ramdp_ff_reinforce # Name of the system.
+
+# --- RL hyperparameters ---
+actor_lr: 3e-4 # Learning rate for actor network
+critic_lr: 3e-4 # Learning rate for critic network
+rollout_length: 32 # Number of environment steps per vectorised environment.
+gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition that
+  # took `compute_time` pondering steps discounts through `gamma ** compute_time`
+  # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
+  # controls both the usual reward horizon and the cost of pondering longer.
+ent_coef: 0.001 # Entropy regularisation term for loss function.
+vf_coef: 1.0 # Critic weight in
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: False # Whether learning rates should be linearly decayed during training.
