@@ -9,6 +9,8 @@ actor_network:
     _target_: stoix.networks.torso_compute.AdaptiveComputationTimeTorso
     hidden_dim: 256
     max_steps: 10
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
     activation: relu
   action_head:
     _target_: stoix.networks.heads.CategoricalHead

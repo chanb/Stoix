@@ -1,0 +1,50 @@
+# ---CNN Compute-Time-Aware REINFORCE Networks---
+# For grid/pixel observations (e.g. env=jumanji/sokoban_grid): the raw (H, W, C)
+# observation is first encoded into a vector by a CNN + MLP
+# (stoix.networks.torso.CNNTorso, which does conv layers -> flatten -> MLP
+# internally), matching the shape of jumanji's own Sokoban training network
+# (conv channels followed by dense layers - see
+# https://github.com/instadeepai/jumanji/blob/main/jumanji/training/configs/env/sokoban.yaml).
+# That vector is then what AdaptiveComputationTimeTorso ponders over - it always
+# needs a plain vector input, not a spatial one, so the CNN has to run first via
+# `input_layer` rather than being `pre_torso` itself. channel_sizes/hidden_sizes
+# here are deliberately smaller than jumanji's [256,256,512,512]/dense to match
+# the scale of the other RAMDP sweeps; override via the CLI (e.g.
+# network.actor_network.input_layer.channel_sizes=[256,256,512,512]) for a
+# closer match to that reference.
+actor_network:
+  input_layer:
+    _target_: stoix.networks.torso.CNNTorso
+    channel_sizes: [32, 64]
+    kernel_sizes: [3, 3]
+    strides: [1, 1]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False # jumanji's grid observation is already (H, W, C).
+    hidden_sizes: [128]
+  pre_torso:
+    _target_: stoix.networks.torso_compute.AdaptiveComputationTimeTorso
+    hidden_dim: 128
+    max_steps: 10
+    min_steps: 1
+    activation: relu
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  input_layer:
+    _target_: stoix.networks.torso.CNNTorso
+    channel_sizes: [32, 64]
+    kernel_sizes: [3, 3]
+    strides: [1, 1]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False
+    hidden_sizes: [128]
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead

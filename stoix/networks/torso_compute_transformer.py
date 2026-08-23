@@ -95,6 +95,13 @@ class TransformerChainOfThoughtTorso(nn.Module):
         `(embedding, halting_log_prob)` - use this in loss functions.
       - Deterministic mode (`deterministic=True`): halts as soon as the
         halting probability crosses 0.5, for greedy evaluation.
+
+    `min_steps` forbids halting (voluntarily, in replay, or greedily) before
+    that many CoT steps have been taken - `is_final_step` still forces a halt
+    at `max_steps` regardless. Setting `min_steps == max_steps` therefore
+    removes adaptivity entirely: every example always takes exactly
+    `max_steps` - useful as a fixed-budget baseline against the adaptive
+    policy.
     """
 
     hidden_dim: int
@@ -102,6 +109,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     num_layers: int = 2
     mlp_dim: int = 512
     max_steps: int = 8
+    min_steps: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
 
@@ -140,6 +148,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
             raise ValueError(
                 "rng must be provided to TransformerChainOfThoughtTorso when sampling "
                 "(i.e. target_compute_time is None and deterministic=False)."
+            )
+        if not (1 <= self.min_steps <= self.max_steps):
+            raise ValueError(
+                f"min_steps must be between 1 and max_steps ({self.max_steps}), "
+                f"got min_steps={self.min_steps}."
             )
 
         # The first scratchpad token is the observation projected into the
@@ -184,20 +197,32 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
             step_count = step + 1
             is_final_step = step_count == self.max_steps
+            can_halt = step_count >= self.min_steps
 
             if replaying:
                 halts_this_step = still_running & (
-                    (step_count >= target_compute_time) | is_final_step
+                    ((step_count >= target_compute_time) & can_halt) | is_final_step
                 )
             elif deterministic:
-                halts_this_step = still_running & ((halting_prob >= 0.5) | is_final_step)
+                halts_this_step = still_running & (
+                    ((halting_prob >= 0.5) & can_halt) | is_final_step
+                )
             else:
                 rng, step_rng = jax.random.split(rng)
                 sampled_halt = jax.random.bernoulli(step_rng, halting_prob)
-                halts_this_step = still_running & (sampled_halt | is_final_step)
+                halts_this_step = still_running & ((sampled_halt & can_halt) | is_final_step)
 
+            # Halting is forced (not a free policy choice) before min_steps or at
+            # max_steps - stop-gradient halting_prob there so REINFORCE doesn't
+            # credit/blame the halting head for an outcome it didn't control.
+            is_forced_step = (step_count < self.min_steps) or is_final_step
+            halting_prob_for_log = jnp.where(
+                is_forced_step, jax.lax.stop_gradient(halting_prob), halting_prob
+            )
             step_log_prob = jnp.where(
-                halts_this_step, jnp.log(halting_prob), jnp.log(1.0 - halting_prob)
+                halts_this_step,
+                jnp.log(halting_prob_for_log),
+                jnp.log(1.0 - halting_prob_for_log),
             )
             halting_log_prob = halting_log_prob + jnp.where(still_running, step_log_prob, 0.0)
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)

@@ -13,6 +13,8 @@ actor_network:
     num_layers: 2
     mlp_dim: 256
     max_steps: 8
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
     activation: relu
   action_head:
     _target_: stoix.networks.heads.CategoricalHead

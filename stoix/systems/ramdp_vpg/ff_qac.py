@@ -400,8 +400,24 @@ def learner_setup(
             config.network.critic_network.q_head, output_dim=num_actions
         )
 
-    actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
-    critic_network = Critic(torso=critic_torso, value_head=value_head, q_head=q_head)
+    # input_layer is optional (e.g. a CNNTorso encoding a raw grid observation into
+    # a vector before it reaches the pondering torso, which itself needs a plain
+    # vector) - defaults to Actor/Critic's own ArrayInput() (identity) when absent.
+    actor_kwargs = {}
+    if "input_layer" in config.network.actor_network:
+        actor_kwargs["input_layer"] = hydra.utils.instantiate(
+            config.network.actor_network.input_layer
+        )
+    critic_kwargs = {}
+    if "input_layer" in config.network.critic_network:
+        critic_kwargs["input_layer"] = hydra.utils.instantiate(
+            config.network.critic_network.input_layer
+        )
+
+    actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
+    critic_network = Critic(
+        torso=critic_torso, value_head=value_head, q_head=q_head, **critic_kwargs
+    )
 
     actor_lr = make_learning_rate(config.system.actor_lr, config, 1, 1)
     critic_lr = make_learning_rate(config.system.critic_lr, config, 1, 1)

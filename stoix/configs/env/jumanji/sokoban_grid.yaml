@@ -1,0 +1,19 @@
+# ---Environment Configs---
+# Same as jumanji/sokoban.yaml but without the FlattenObservationWrapper - the
+# observation stays a genuine (height, width, channels) grid, for use with a
+# CNN-based network (e.g. network=cnn_compute / cnn_compute_qac) that needs the
+# spatial structure. Plain MLP-based networks (mlp_compute etc.) expect a flat
+# vector and should use env=jumanji/sokoban instead.
+env_name: jumanji
+observation_attribute : grid
+multi_agent : False
+
+scenario:
+  name: Sokoban-v0
+  task_name: sokoban
+
+kwargs: {}
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
