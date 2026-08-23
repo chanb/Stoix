@@ -117,7 +117,7 @@ class Job:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[32,32]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[2,2]")
             cmd.append(f"network.actor_network.input_layer.strides=[2,1]")
-            cmd.append(f"network.actor_network.input_layer.hidden_dim=[64]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[64]")
         return cmd
 
     def run_dir(self) -> Path:
