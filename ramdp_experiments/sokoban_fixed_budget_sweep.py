@@ -107,12 +107,25 @@ class Job:
             f"network.actor_network.pre_torso.min_steps={self.budget}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
+            f"system.ent_coef=0.01",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch != "cnn":
+            cmd.append("env=jumanji/sokoban")
             cmd.append(f"+wrapper._target_=stoa.FlattenObservationWrapper")
+        else:
+            cmd.append("env=jumanji/sokoban")
+            cmd.append(f"network.actor_network.input_layer.channel_sizes=[128,128,128,128]")
+            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3,3,3,3]")
+            cmd.append(f"network.actor_network.input_layer.strides=[2,1,1,1]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[64]")
+            cmd.append(f"network.critic_network.input_layer.channel_sizes=[128,128,128,128]")
+            cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3,3,3,3]")
+            cmd.append(f"network.critic_network.input_layer.strides=[2,1,1,1]")
+            cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
+            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
         return cmd
 
     def run_dir(self) -> Path:
@@ -157,6 +170,7 @@ def run_job(
         # With `runs_per_gpu` processes sharing one physical GPU, each must be capped
         # to roughly 1/runs_per_gpu of the GPU or the later processes to allocate OOM.
         "XLA_PYTHON_CLIENT_MEM_FRACTION": str(mem_fraction),
+        "XLA_FLAGS": "--xla_gpu_autotune_level=0",
     }
     import os
 

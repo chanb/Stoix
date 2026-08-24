@@ -225,6 +225,7 @@ def get_learner_fn(
                 "actor_loss": loss_actor,
                 "entropy": entropy,
                 "compute_time": compute_times,
+                "advantage": advantage.mean(),
             }
             if config.system.delightful:
                 loss_info["delightful_gate"] = gate

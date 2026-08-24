@@ -97,4 +97,6 @@ CUDA_VISIBLE_DEVICES="0" python stoix/systems/ramdp_vpg/ff_reinforce.py \
 
 ```
 python ramdp_experiments/sokoban_sweep.py --hidden-dim=8,16,32,64 --lr=1e-5,1e-4,3e-4,1e-3 --runs-per-gpu=1 --seeds=3
+
+CUDA_VISIBLE_DEVICES="0" XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 ```
