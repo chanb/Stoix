@@ -19,17 +19,32 @@ quantity.
 Grid axes:
   - env:         MinAtar game (env=gymnax/<env>) - subset of MINATAR_GAMES
   - system:      ff_reinforce (PonderNet-style REINFORCE) | ff_qac_fac | ff_qac_naive
-  - architecture: mlp (AdaptiveComputationTimeTorso) | transformer (TransformerChainOfThoughtTorso)
+  - architecture: mlp (AdaptiveComputationTimeTorso) | transformer
+                 (TransformerChainOfThoughtTorso, latent CoT) |
+                 transformer_explicit_cot (TransformerExplicitCoTTorso, explicit
+                 token CoT - only implemented for system=ff_reinforce, via
+                 stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py; requested
+                 (system, architecture) combos outside that are skipped) |
+                 cnn+mlp (CNNTorso input_layer feeding AdaptiveComputationTimeTorso) |
+                 cnn+transformer (CNNTorso input_layer feeding
+                 TransformerChainOfThoughtTorso)
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
-  - lr:          shared actor_lr/critic_lr
+  - lr:          system.actor_lr - has its own value list, independent of critic_lr's
+                 (the full lr x critic_lr cross product is still swept)
+  - critic_lr:   system.critic_lr - has its own value list, independent of lr's
   - delightful:  whether to gate the REINFORCE weight by the "delightful" surprisal
                  sigmoid (system.delightful); off by default. When on, also sweeps
                  delightful_eta (system.delightful_eta).
-  - use_layer_norm, use_input_layer_norm: LayerNorm options on
-                 AdaptiveComputationTimeTorso (mlp/cnn only - the transformer
-                 torso doesn't have these params, so this axis is forced off
-                 for architecture=transformer regardless of what's requested).
+  - use_layer_norm: LayerNorm inside the shared ACTStep of
+                 AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
+                 cnn+transformer, and transformer_explicit_cot have no such
+                 param, so this is forced off for them regardless of what's
+                 requested).
+  - use_input_layer_norm: LayerNorm on the raw observation before the
+                 initial token/state projection; supported by mlp/cnn+mlp/
+                 transformer/cnn+transformer, not yet by
+                 transformer_explicit_cot (forced off).
   - seed:        5 seeds per config by default
 
 gamma is fixed at 0.9999, matching seaquest_sweep.py. total_timesteps defaults
@@ -51,6 +66,10 @@ Usage:
       --delightful-eta 1.0,3.0                                    # sweep delightful PG on/off
   python ramdp_experiments/minatar_fixed_budget_sweep.py --architectures mlp \\
       --use-layer-norm true,false --use-input-layer-norm true,false  # sweep LayerNorm options
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_reinforce \\
+      --architectures transformer_explicit_cot                       # explicit-CoT sweep
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
 """
 
 from __future__ import annotations
@@ -76,10 +95,32 @@ SYSTEM_TO_SCRIPT = {
 }
 SYSTEM_TO_QAC_VARIANT = {"ff_qac_fac": "fac", "ff_qac_naive": "naive"}
 ARCH_TO_NETWORK = {
-    "ff_reinforce": {"mlp": "mlp_compute", "transformer": "transformer_compute", "cnn": "cnn_compute"},
-    "ff_qac_fac": {"mlp": "mlp_compute_qac", "transformer": "transformer_compute_qac", "cnn": "cnn_compute_qac"},
-    "ff_qac_naive": {"mlp": "mlp_compute_qac", "transformer": "transformer_compute_qac", "cnn": "cnn_compute_qac"},
+    "ff_reinforce": {
+        "mlp": "mlp_compute",
+        "transformer": "transformer_compute",
+        "cnn+mlp": "cnn_mlp_compute",
+        "cnn+transformer": "cnn_transformer_compute",
+    },
+    "ff_qac_fac": {
+        "mlp": "mlp_compute_qac",
+        "transformer": "transformer_compute_qac",
+        "cnn+mlp": "cnn_mlp_compute_qac",
+        "cnn+transformer": "cnn_transformer_compute_qac",
+    },
+    "ff_qac_naive": {
+        "mlp": "mlp_compute_qac",
+        "transformer": "transformer_compute_qac",
+        "cnn+mlp": "cnn_mlp_compute_qac",
+        "cnn+transformer": "cnn_transformer_compute_qac",
+    },
 }
+# Architectures whose pre_torso is TransformerChainOfThoughtTorso (has
+# use_input_layer_norm but not use_layer_norm) vs. AdaptiveComputationTimeTorso
+# (has both) - used to pick the right LayerNorm overrides in Job.command().
+TRANSFORMER_LIKE_ARCHES = ("transformer", "cnn+transformer")
+# Architectures whose input_layer is a CNNTorso (need the CNN-specific
+# overrides below instead of the flatten-observation wrapper).
+CNN_ARCHES = ("cnn+mlp", "cnn+transformer")
 MINATAR_GAMES = (
     "asterix",
     "breakout",
@@ -87,6 +128,15 @@ MINATAR_GAMES = (
     "seaquest",
     "space_invaders",
 )
+
+# TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
+# doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
+# it only exists for ff_reinforce, and via a different training script
+# (ff_reinforce_explicit_cot.py, not ff_reinforce.py), so it's handled separately.
+EXPLICIT_COT_ARCH = "transformer_explicit_cot"
+EXPLICIT_COT_SCRIPT = "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"
+EXPLICIT_COT_NETWORK = "transformer_explicit_cot"
+EXPLICIT_COT_SYSTEMS = ("ff_reinforce",)
 
 @dataclass
 class Job:
@@ -120,10 +170,15 @@ class Job:
         return name + f"-seed_{self.seed}"
 
     def command(self, python_bin: str) -> List[str]:
-        network = ARCH_TO_NETWORK[self.system][self.arch]
+        if self.arch == EXPLICIT_COT_ARCH:
+            script = EXPLICIT_COT_SCRIPT
+            network = EXPLICIT_COT_NETWORK
+        else:
+            script = SYSTEM_TO_SCRIPT[self.system]
+            network = ARCH_TO_NETWORK[self.system][self.arch]
         cmd = [
             python_bin,
-            SYSTEM_TO_SCRIPT[self.system],
+            script,
             f"env=gymnax/{self.env}",
             f"network={network}",
             "logger.loggers.tensorboard.enabled=True",
@@ -145,16 +200,22 @@ class Job:
         ]
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
-        if self.arch != "transformer":
-            # TransformerChainOfThoughtTorso has no LayerNorm params - these
-            # only exist on AdaptiveComputationTimeTorso (mlp/cnn).
+        if self.arch == EXPLICIT_COT_ARCH:
+            pass  # TransformerExplicitCoTTorso has no LayerNorm params yet.
+        elif self.arch in TRANSFORMER_LIKE_ARCHES:
+            # TransformerChainOfThoughtTorso only has use_input_layer_norm,
+            # not use_layer_norm (see stoix/networks/torso_compute_transformer.py).
+            cmd.append(
+                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+            )
+        else:
             cmd.append(f"network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
             cmd.append(
                 f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
-        if self.arch != "cnn":
+        if self.arch not in CNN_ARCHES:
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         else:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
@@ -185,25 +246,45 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
-    # (arch, use_layer_norm, use_input_layer_norm) combos: these params only
-    # exist on AdaptiveComputationTimeTorso (mlp/cnn), not the transformer
-    # torso, so architecture=transformer is forced to a single (False, False)
-    # combo instead of being needlessly duplicated per requested LN setting.
-    arch_ln_combos = []
-    for arch in args.architectures:
-        if arch == "transformer":
-            arch_ln_combos.append((arch, False, False))
-        else:
-            for uln in args.use_layer_norm:
-                for uiln in args.use_input_layer_norm:
-                    arch_ln_combos.append((arch, uln, uiln))
-    arch_ln_combos = list(dict.fromkeys(arch_ln_combos))
+    # (system, arch, use_layer_norm, use_input_layer_norm) combos:
+    #  - transformer_explicit_cot only exists for ff_reinforce (see
+    #    EXPLICIT_COT_SYSTEMS) - any other requested (system, architecture)
+    #    pair is skipped rather than erroring, so e.g. the default
+    #    `--systems ff_reinforce,ff_qac_fac,ff_qac_naive` still works if the
+    #    user adds `--architectures ...,transformer_explicit_cot`.
+    #  - use_layer_norm only exists on AdaptiveComputationTimeTorso (mlp/cnn).
+    #  - use_input_layer_norm exists on mlp/cnn/transformer, not yet on
+    #    transformer_explicit_cot.
+    # Unsupported axes are forced to a single False rather than needlessly
+    # duplicated per requested setting.
+    system_arch_ln_combos = []
+    n_skipped_incompatible = 0
+    for system in args.systems:
+        for arch in args.architectures:
+            if arch == EXPLICIT_COT_ARCH:
+                if system not in EXPLICIT_COT_SYSTEMS:
+                    n_skipped_incompatible += 1
+                    continue
+                ln_options = [(False, False)]
+            elif arch in TRANSFORMER_LIKE_ARCHES:
+                ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
+            else:
+                ln_options = [
+                    (uln, uiln) for uln in args.use_layer_norm for uiln in args.use_input_layer_norm
+                ]
+            for use_layer_norm, use_input_layer_norm in ln_options:
+                system_arch_ln_combos.append((system, arch, use_layer_norm, use_input_layer_norm))
+    system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
+    if n_skipped_incompatible:
+        print(
+            f"Skipping {n_skipped_incompatible} (system, architecture) combo(s) requesting "
+            f"{EXPLICIT_COT_ARCH}, which is only implemented for {EXPLICIT_COT_SYSTEMS}."
+        )
 
     jobs = []
     for (
         env,
-        system,
-        (arch, use_layer_norm, use_input_layer_norm),
+        (system, arch, use_layer_norm, use_input_layer_norm),
         budget,
         hidden_dim,
         lr,
@@ -212,12 +293,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         seed,
     ) in itertools.product(
         args.envs,
-        args.systems,
-        arch_ln_combos,
+        system_arch_ln_combos,
         args.budget,
         args.hidden_dim,
         args.lr,
-        args.lr,
+        args.critic_lr,
         delightful_combos,
         range(args.seeds),
     ):
@@ -307,7 +387,12 @@ def main() -> None:
         help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive}.",
     )
     parser.add_argument(
-        "--architectures", default="mlp,transformer", help="Comma-separated subset of {mlp, transformer, cnn}."
+        "--architectures",
+        default="mlp,transformer",
+        help="Comma-separated subset of {mlp, transformer, transformer_explicit_cot, cnn+mlp, "
+        "cnn+transformer}. transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
+        f"implemented for system in {EXPLICIT_COT_SYSTEMS} - other (system, architecture) combos "
+        "requesting it are skipped, not errored.",
     )
     parser.add_argument(
         "--budget",
@@ -315,7 +400,18 @@ def main() -> None:
         help="Comma-separated fixed compute budgets - each sets max_steps == min_steps to this value.",
     )
     parser.add_argument("--hidden-dim", default="16,32", help="Comma-separated actor torso widths.")
-    parser.add_argument("--lr", default="1e-4,3e-4,1e-3", help="Comma-separated shared actor_lr/critic_lr values.")
+    parser.add_argument(
+        "--lr",
+        default="1e-4,3e-4,1e-3",
+        help="Comma-separated system.actor_lr values, swept independently of --critic-lr "
+        "(full cross product).",
+    )
+    parser.add_argument(
+        "--critic-lr",
+        default="1e-4,3e-4,1e-3",
+        help="Comma-separated system.critic_lr values, swept independently of --lr "
+        "(full cross product).",
+    )
     parser.add_argument(
         "--delightful",
         default="false",
@@ -331,15 +427,17 @@ def main() -> None:
         "--use-layer-norm",
         default="false",
         help="Comma-separated bools (true/false) - LayerNorm inside AdaptiveComputationTimeTorso's "
-        "shared ACTStep (network.actor_network.pre_torso.use_layer_norm). Ignored (forced off) for "
-        "architecture=transformer, which has no such param.",
+        "shared ACTStep (network.actor_network.pre_torso.use_layer_norm). Only applies to "
+        "architecture in {mlp, cnn+mlp}; ignored (forced off) otherwise, since those torsos have "
+        "no such param.",
     )
     parser.add_argument(
         "--use-input-layer-norm",
         default="false",
-        help="Comma-separated bools (true/false) - LayerNorm on the raw observation before "
-        "AdaptiveComputationTimeTorso's initial projection (network.actor_network.pre_torso."
-        "use_input_layer_norm). Ignored (forced off) for architecture=transformer.",
+        help="Comma-separated bools (true/false) - LayerNorm on the raw observation before the "
+        "initial token/state projection (network.actor_network.pre_torso.use_input_layer_norm). "
+        "Supported by architecture in {mlp, transformer, cnn+mlp, cnn+transformer}; ignored "
+        "(forced off) for transformer_explicit_cot.",
     )
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
@@ -370,6 +468,7 @@ def main() -> None:
     args.budget = [int(x) for x in args.budget.split(",")]
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
+    args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
@@ -381,8 +480,9 @@ def main() -> None:
         assert e in MINATAR_GAMES, f"unknown env {e!r}, expected one of {list(MINATAR_GAMES)}"
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
+    valid_architectures = ("mlp", "transformer", EXPLICIT_COT_ARCH) + CNN_ARCHES
     for a in args.architectures:
-        assert a in ("mlp", "transformer", "cnn"), f"unknown architecture {a!r}"
+        assert a in valid_architectures, f"unknown architecture {a!r}, expected one of {valid_architectures}"
     for b in args.budget:
         assert b >= 1, f"budget must be >= 1, got {b}"
 
@@ -415,11 +515,12 @@ def main() -> None:
     print(f"Grid: {len(jobs)} jobs to run" + (f" ({n_skipped} skipped as already-existing)" if n_skipped else ""))
     print(f"  envs={args.envs}")
     print(f"  systems={args.systems} architectures={args.architectures}")
-    print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} lr={args.lr} seeds=0..{args.seeds - 1}")
+    print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
+    print(f"  lr={args.lr} critic_lr={args.critic_lr}")
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta}")
     print(
-        f"  use_layer_norm={args.use_layer_norm} use_input_layer_norm={args.use_input_layer_norm} "
-        "(mlp/cnn only; forced off for transformer)"
+        f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "
+        f"use_input_layer_norm={args.use_input_layer_norm} (not transformer_explicit_cot)"
     )
     print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
 

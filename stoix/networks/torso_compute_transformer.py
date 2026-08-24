@@ -102,6 +102,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
     removes adaptivity entirely: every example always takes exactly
     `max_steps` - useful as a fixed-budget baseline against the adaptive
     policy.
+
+    `use_input_layer_norm` normalizes the raw `observation` before it becomes
+    the first scratchpad token (i.e. before its projection into `hidden_dim`).
     """
 
     hidden_dim: int
@@ -112,6 +115,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     min_steps: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    use_input_layer_norm: bool = False
 
     @nn.compact
     def __call__(
@@ -157,6 +161,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
         # The first scratchpad token is the observation projected into the
         # model width.
+        if self.use_input_layer_norm:
+            observation = nn.LayerNorm()(observation)
         initial_token = parse_activation_fn(self.activation)(
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         )

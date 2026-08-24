@@ -1,12 +1,15 @@
-# ---CNN Compute-Time-Aware Q Actor-Critic Networks---
-# Same CNN + MLP input_layer as cnn_compute.yaml (see that file's comment for the
-# jumanji-Sokoban-network rationale) feeding an AdaptiveComputationTimeTorso actor.
-# The critic is stoix.networks.base_qac.ValueAndQCritic, matching
+# ---CNN+MLP Compute-Time-Aware Q Actor-Critic Networks---
+# Same CNN + MLP input_layer as cnn_mlp_compute.yaml (see that file's comment for
+# the jumanji-Sokoban-network rationale) feeding an AdaptiveComputationTimeTorso
+# actor. The critic is stoix.networks.base_qac.ValueAndQCritic, matching
 # mlp_compute_qac.yaml: one torso, a scalar value_head V(s), and a q_head whose
 # output shape depends on system.qac_variant - a full (num_actions, max_steps)
 # table for "naive", or just (num_actions,) - Q(s,·,1) - for the
 # runtime-factorized "fac" variant. output_dim/pre_shape for both heads are
 # injected in code, not set here.
+#
+# See cnn_transformer_compute_qac.yaml for the same CNN input_layer feeding a
+# TransformerChainOfThoughtTorso instead of this AdaptiveComputationTimeTorso.
 actor_network:
   input_layer:
     _target_: stoix.networks.torso.CNNTorso

@@ -1,4 +1,4 @@
-# ---CNN Compute-Time-Aware REINFORCE Networks---
+# ---CNN+MLP Compute-Time-Aware REINFORCE Networks---
 # For grid/pixel observations (e.g. env=jumanji/sokoban_grid): the raw (H, W, C)
 # observation is first encoded into a vector by a CNN + MLP
 # (stoix.networks.torso.CNNTorso, which does conv layers -> flatten -> MLP
@@ -12,6 +12,9 @@
 # the scale of the other RAMDP sweeps; override via the CLI (e.g.
 # network.actor_network.input_layer.channel_sizes=[256,256,512,512]) for a
 # closer match to that reference.
+#
+# See cnn_transformer_compute.yaml for the same CNN input_layer feeding a
+# TransformerChainOfThoughtTorso instead of this AdaptiveComputationTimeTorso.
 actor_network:
   input_layer:
     _target_: stoix.networks.torso.CNNTorso
