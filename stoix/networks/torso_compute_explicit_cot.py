@@ -11,30 +11,32 @@ gets appended to the scratchpad and attended over at the next step. This
 makes the reasoning trace literally inspectable (a sequence of token ids that
 could be decoded/rendered), rather than an opaque vector.
 
-Both the halting decision and the thought-token choice are discrete sampled
-actions, so both are trained the same way: via the score-function
-(REINFORCE) estimator, using the log-probability of the sampled trajectory.
-This torso therefore has the same rollout/replay/deterministic modes as
-`AdaptiveComputationTimeTorso`, except replaying also needs the actual
-sequence of emitted token ids (not just how many steps were taken), since a
-different token would have led the model to think something different at the
-next step:
+There is no separate halt predictor. The categorical distribution at each
+step has one extra class beyond the `vocab_size` thought tokens - "predict
+the environment action now" - and *choosing that class is what halts*.
+Halting and "which thought to think next" are therefore a single discrete
+choice, trained the same way as the environment action itself: via the
+score-function (REINFORCE) estimator, using the log-probability of the
+sampled trajectory. This torso therefore has the same rollout/replay/
+deterministic modes as `AdaptiveComputationTimeTorso`, except replaying also
+needs the actual sequence of emitted token ids (not just how many steps were
+taken), since a different token would have led the model to think something
+different at the next step:
 
-  - Rollout mode (`target_compute_time=None`, `target_tokens=None`): samples
-    both the halting trajectory and the emitted thought tokens, and returns
+  - Rollout mode (`target_tokens=None`): samples the token trajectory
+    (thoughts and, eventually, the halting "act now" token) and returns
     `(embedding, compute_time, thought_tokens)`. `thought_tokens` has shape
-    `(*batch, max_steps - 1)` - the maximum number of thoughts that could ever
-    be emitted before a forced final halt - padded arbitrarily past
-    `compute_time - 1` (those entries are never read back in replay mode,
-    since replaying masks by the same halting trajectory that produced them).
-  - Replay mode (`target_compute_time=<array>`, `target_tokens=<array>`):
-    deterministically replays exactly that halting-and-token trajectory (no
-    rng) and returns `(embedding, log_prob)`: the log-probability, under the
-    current parameters, of the halting decisions *and* the thought tokens
-    together.
-  - Deterministic mode (`deterministic=True`): halts as soon as the halting
-    probability crosses 0.5, and picks the highest-probability token instead
-    of sampling - for greedy evaluation.
+    `(*batch, max_steps)`, one entry per step including the halting one;
+    entries past `compute_time` are never read back in replay mode, since
+    replaying halts at the same step that produced them (the first "act now"
+    token in the sequence).
+  - Replay mode (`target_tokens=<array>`): deterministically replays exactly
+    that token trajectory (no rng) and returns `(embedding, log_prob)`: the
+    log-probability, under the current parameters, of the whole trajectory
+    (thought choices and the halting choice together).
+  - Deterministic mode (`deterministic=True`): at every step, picks the
+    highest-probability class - a thought token or "act now" - instead of
+    sampling, for greedy evaluation.
 
 The environment action head still reads off the final continuous hidden
 state (not a token embedding) - the discrete tokens are a communicative side
@@ -54,7 +56,7 @@ from flax.linen.initializers import Initializer, normal, orthogonal
 from stoix.networks.torso_compute_transformer import TransformerBlock
 from stoix.networks.utils import parse_activation_fn
 
-_PROB_EPS = 1e-6
+_NEG_INF = jnp.finfo(jnp.float32).min
 
 
 class TransformerExplicitCoTTorso(nn.Module):
@@ -83,7 +85,6 @@ class TransformerExplicitCoTTorso(nn.Module):
         self,
         observation: chex.Array,
         rng: Optional[chex.PRNGKey] = None,
-        target_compute_time: Optional[chex.Array] = None,
         target_tokens: Optional[chex.Array] = None,
         deterministic: bool = False,
     ) -> Union[Tuple[chex.Array, chex.Array], Tuple[chex.Array, chex.Array, chex.Array]]:
@@ -91,26 +92,21 @@ class TransformerExplicitCoTTorso(nn.Module):
         Args:
             observation: the input embedding to think about; becomes the
                 first scratchpad token.
-            rng: PRNG key used to sample halting decisions and thought
-                tokens. Required unless replaying or `deterministic=True`.
-            target_compute_time: paired with `target_tokens` for replay mode
-                - see module docstring.
-            target_tokens: paired with `target_compute_time` for replay mode.
-            deterministic: if True (and not replaying), halt as soon as the
-                halting probability crosses 0.5 and pick the highest
-                probability thought token, instead of sampling.
+            rng: PRNG key used to sample the per-step token (thought or
+                "act now") choices. Required unless replaying or
+                `deterministic=True`.
+            target_tokens: for replay mode, the exact per-step token
+                trajectory (shape `(*batch, max_steps)`) to replay - see
+                module docstring.
+            deterministic: if True (and not replaying), pick the highest
+                probability class at each step instead of sampling.
 
         Returns:
             `(embedding, compute_time, thought_tokens)` when not replaying,
             or `(embedding, log_prob)` when replaying a known trajectory.
         """
         batch_shape = observation.shape[:-1]
-        replaying = target_compute_time is not None
-        if replaying != (target_tokens is not None):
-            raise ValueError(
-                "target_compute_time and target_tokens must be provided together "
-                "(replay mode) or not at all."
-            )
+        replaying = target_tokens is not None
         if not replaying and not deterministic and rng is None:
             raise ValueError(
                 "rng must be provided to TransformerExplicitCoTTorso when sampling "
@@ -122,7 +118,11 @@ class TransformerExplicitCoTTorso(nn.Module):
                 f"got min_steps={self.min_steps}."
             )
 
-        max_thoughts = self.max_steps - 1
+        # The token vocabulary has one extra class beyond the `vocab_size`
+        # thought tokens: choosing it means "predict the environment action
+        # now" - i.e. it is the halting decision.
+        act_token_id = self.vocab_size
+        num_classes = self.vocab_size + 1
 
         initial_token = parse_activation_fn(self.activation)(
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
@@ -132,8 +132,7 @@ class TransformerExplicitCoTTorso(nn.Module):
             "pos_embedding", normal(stddev=0.02), (self.max_steps + 1, self.hidden_dim)
         )
         token_embed = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_dim)
-        token_head = nn.Dense(self.vocab_size, kernel_init=self.kernel_init)
-        halting_head = nn.Dense(1, kernel_init=self.kernel_init)
+        token_head = nn.Dense(num_classes, kernel_init=self.kernel_init)
 
         scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
         scratchpad = scratchpad.at[..., 0, :].set(initial_token)
@@ -149,7 +148,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         num_steps_taken = jnp.zeros(batch_shape)
         log_prob = jnp.zeros(batch_shape)
         final_state = initial_token
-        emitted_tokens = jnp.zeros(batch_shape + (max_thoughts,), dtype=jnp.int32)
+        emitted_tokens = jnp.zeros(batch_shape + (self.max_steps,), dtype=jnp.int32)
 
         for step in range(self.max_steps):
             seq_len = step + 1
@@ -158,65 +157,57 @@ class TransformerExplicitCoTTorso(nn.Module):
                 tokens_in = block(tokens_in)
             state = tokens_in[..., -1, :]
 
-            halting_prob = nn.sigmoid(halting_head(state))
-            halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
-
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
 
-            if replaying:
-                halts_this_step = still_running & (
-                    ((step_count >= target_compute_time) & can_halt) | is_final_step
-                )
-            elif deterministic:
-                halts_this_step = still_running & (
-                    ((halting_prob >= 0.5) & can_halt) | is_final_step
-                )
-            else:
-                rng, halt_rng = jax.random.split(rng)
-                sampled_halt = jax.random.bernoulli(halt_rng, halting_prob)
-                halts_this_step = still_running & ((sampled_halt & can_halt) | is_final_step)
+            token_logits = token_head(state)
+            # `step`/`is_final_step`/`can_halt` are Python-level (the loop is
+            # unrolled), so this masking is static per iteration - no need to
+            # broadcast over the batch.
+            if is_final_step:
+                # A halt is forced here regardless of the policy: mask out
+                # every thought class so "act now" is the only one left. Its
+                # log-probability under that mask is an inputs-independent
+                # constant (zero), so no gradient flows through a step that
+                # was never really a choice.
+                mask = jnp.full((num_classes,), _NEG_INF).at[act_token_id].set(0.0)
+                token_logits = token_logits + mask
+            elif not can_halt:
+                # Before min_steps, "act now" isn't a legal choice yet.
+                token_logits = token_logits.at[..., act_token_id].set(_NEG_INF)
 
-            # Halting is forced (not a free policy choice) before min_steps or at
-            # max_steps - stop-gradient halting_prob there so REINFORCE doesn't
-            # credit/blame the halting head for an outcome it didn't control.
-            is_forced_step = (step_count < self.min_steps) or is_final_step
-            halting_prob_for_log = jnp.where(
-                is_forced_step, jax.lax.stop_gradient(halting_prob), halting_prob
-            )
-            step_log_prob = jnp.where(
-                halts_this_step,
-                jnp.log(halting_prob_for_log),
-                jnp.log(1.0 - halting_prob_for_log),
-            )
-            log_prob = log_prob + jnp.where(still_running, step_log_prob, 0.0)
+            log_token_probs = jax.nn.log_softmax(token_logits)
+
+            if replaying:
+                token_id = target_tokens[..., step]
+            elif deterministic:
+                token_id = jnp.argmax(token_logits, axis=-1)
+            else:
+                rng, token_rng = jax.random.split(rng)
+                token_id = jax.random.categorical(token_rng, token_logits)
+
+            token_log_prob = jnp.take_along_axis(
+                log_token_probs, token_id[..., None], axis=-1
+            ).squeeze(axis=-1)
+
+            halts_this_step = still_running & (token_id == act_token_id)
+
+            log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
+            emitted_tokens = emitted_tokens.at[..., step].set(token_id)
 
-            # `still_running` now means "continuing past this step" - exactly
-            # the examples that will go on to emit a thought token below.
             still_running = still_running & (~halts_this_step)
 
             if not is_final_step:
-                token_logits = token_head(state)
-                log_token_probs = jax.nn.log_softmax(token_logits)
-
-                if replaying:
-                    token_id = target_tokens[..., step]
-                elif deterministic:
-                    token_id = jnp.argmax(token_logits, axis=-1)
-                else:
-                    rng, token_rng = jax.random.split(rng)
-                    token_id = jax.random.categorical(token_rng, token_logits)
-
-                token_log_prob = jnp.take_along_axis(
-                    log_token_probs, token_id[..., None], axis=-1
-                ).squeeze(axis=-1)
-                log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
-
-                emitted_tokens = emitted_tokens.at[..., step].set(token_id)
-                scratchpad = scratchpad.at[..., step + 1, :].set(token_embed(token_id))
+                # `act_token_id` is out of range for `token_embed` (which only
+                # knows the `vocab_size` thought tokens); substitute a dummy
+                # id where it was chosen - those entries are never read back,
+                # since scratchpad positions for already-halted examples are
+                # only ever fed to blocks whose output gets discarded above.
+                thought_id = jnp.where(token_id == act_token_id, 0, token_id)
+                scratchpad = scratchpad.at[..., step + 1, :].set(token_embed(thought_id))
 
         if replaying:
             return final_state, log_prob

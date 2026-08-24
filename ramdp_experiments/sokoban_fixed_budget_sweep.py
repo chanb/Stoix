@@ -114,14 +114,14 @@ class Job:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch != "cnn":
             cmd.append("env=jumanji/sokoban")
-            cmd.append(f"+wrapper._target_=stoa.FlattenObservationWrapper")
+            cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         else:
             cmd.append("env=jumanji/sokoban")
-            cmd.append(f"network.actor_network.input_layer.channel_sizes=[128,128,128,128]")
+            cmd.append(f"network.actor_network.input_layer.channel_sizes=[256,256,512,512]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3,3,3,3]")
             cmd.append(f"network.actor_network.input_layer.strides=[2,1,1,1]")
             cmd.append(f"network.actor_network.input_layer.hidden_sizes=[64]")
-            cmd.append(f"network.critic_network.input_layer.channel_sizes=[128,128,128,128]")
+            cmd.append(f"network.critic_network.input_layer.channel_sizes=[256,256,512,512]")
             cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3,3,3,3]")
             cmd.append(f"network.critic_network.input_layer.strides=[2,1,1,1]")
             cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")

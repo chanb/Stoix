@@ -4,19 +4,21 @@ This is a variant of `stoix.systems.ramdp_vpg.ff_reinforce` whose actor's
 torso is `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`
 instead of the latent-CoT `AdaptiveComputationTimeTorso`/
 `TransformerChainOfThoughtTorso`: at every pondering step, the actor doesn't
-just decide whether to keep thinking, it also *emits an explicit thought
-token* - sampled from a learned vocabulary, in exactly the same sense as the
-environment action is sampled - and it is that token's embedding, not a raw
-hidden state, that gets fed back in as context for the next step. The
-resulting chain of thought is therefore a literal, inspectable sequence of
-token ids, not an opaque vector.
+sample a separate "keep thinking?" decision, it samples a token from a
+learned vocabulary that has one extra class meaning "predict the environment
+action now" - so halting *is* emitting that token, in exactly the same sense
+as any other thought token or the environment action itself. A thought
+token's embedding (not a raw hidden state) is what gets fed back in as
+context for the next step. The resulting chain of thought is therefore a
+literal, inspectable sequence of token ids, not an opaque vector.
 
-Both the halting decisions and the thought tokens are discrete sampled
-choices, so - like the environment action - both are trained via the
-score-function (REINFORCE) estimator, using the log-probability of the
-sampled trajectory (`TransformerExplicitCoTTorso`'s replay mode, which needs
-both the realised `compute_time` *and* the realised `thought_tokens` to
-replay the exact trajectory that was taken). Everything else - the
+Both the halting decision and the thought tokens are therefore the same
+discrete sampled choice, trained via the score-function (REINFORCE)
+estimator, using the log-probability of the sampled trajectory
+(`TransformerExplicitCoTTorso`'s replay mode, which needs the realised
+`thought_tokens` to replay the exact trajectory that was taken - the halting
+step is recoverable from where the "act now" token appears in it). Everything
+else - the
 compute-discounted return (see `ff_reinforce.py` for the full derivation:
 `G_h = gamma^(C_h - 1) * (r_h + gamma * G_{h+1})`), the critic, the actor
 loss shape, and the optional `config.system.delightful` gate on the
@@ -193,10 +195,7 @@ def get_learner_fn(
             actor_policy, cot_log_prob = actor_apply_fn(
                 actor_params,
                 observations,
-                torso_kwargs={
-                    "target_compute_time": compute_times,
-                    "target_tokens": thought_tokens,
-                },
+                torso_kwargs={"target_tokens": thought_tokens},
             )
             env_log_prob = actor_policy.log_prob(actions)
             # The halting decisions, the thought tokens, and the environment

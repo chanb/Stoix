@@ -135,7 +135,7 @@ def _create_gymnax_env_instance(
 def make_gymnax_env(scenario_name: str, config: DictConfig) -> Tuple[Environment, Environment]:
     """Creates and wraps a Gymnax environment."""
     import gymnax
-    from stoa.env_adapters.gymnax import GymnaxToStoa
+    from stoix.utils.gymnax import GymnaxToStoa
 
     env_kwargs = dict(copy.deepcopy(config.env.kwargs))
     env, env_params = _create_gymnax_env_instance(scenario_name, env_kwargs, gymnax.make)

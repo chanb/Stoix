@@ -1,10 +1,11 @@
 # ---Explicit Chain-of-Thought Compute-Time-Aware REINFORCE Networks---
 # The actor's pre_torso is an explicit Chain-of-Thought transformer torso: at
-# each step it samples a discrete "thought token" from a learned vocabulary
-# (a genuine, inspectable output of the policy) whose embedding is fed back
-# in as context for the next step, and separately samples a "keep thinking?"
-# decision. The actual (sampled) number of CoT steps taken is reported as
-# `compute_time` (see
+# each step it samples a discrete token from a learned vocabulary (a genuine,
+# inspectable output of the policy) that has one extra class beyond
+# `vocab_size` meaning "predict the environment action now" - choosing a
+# thought token feeds that token's embedding back in as context for the next
+# step, choosing the extra class halts. The actual (sampled) number of CoT
+# steps taken is reported as `compute_time` (see
 # stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso).
 actor_network:
   pre_torso:

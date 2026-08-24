@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Fixed-computation-budget sweep for RAMDP systems on Sokoban.
+"""Fixed-computation-budget sweep for RAMDP systems on seaquest.
 
-Companion to snake_sweep.py: instead of letting the actor's compute torso
+Companion to seaquest_sweep.py: instead of letting the actor's compute torso
 adaptively halt (min_steps=1, sampled/learned halting), every job here pins
 `min_steps == max_steps == budget`, which - per the min_steps mechanism added
 to the compute torsos (see stoix/networks/torso_compute*.py) - forbids
@@ -10,7 +10,7 @@ So every example always takes exactly `budget` steps of computation, with no
 adaptivity at all.
 
 This answers "does more computation help on this task?" directly (sweeping
-`budget` at a fixed, non-adaptive cost, comparable to snake_sweep.py's
+`budget` at a fixed, non-adaptive cost, comparable to seaquest_sweep.py's
 adaptive c_max axis) and is also a simpler system to debug against, since
 compute_time is deterministic (== budget) rather than a learned/sampled
 quantity.
@@ -23,7 +23,7 @@ Grid axes:
   - lr:          shared actor_lr/critic_lr
   - seed:        5 seeds per config by default
 
-gamma is fixed at 0.9999, matching snake_sweep.py. total_timesteps defaults
+gamma is fixed at 0.9999, matching seaquest_sweep.py. total_timesteps defaults
 to 2e7 (a reduced sweep budget) rather than the 1e8 used for full runs --
 re-run the winning config(s) at full budget afterwards.
 
@@ -32,10 +32,10 @@ GPU (a GPU "slot" queue + thread pool), each run pinned via
 CUDA_VISIBLE_DEVICES and logged to its own file under <output-dir>/logs/.
 
 Usage:
-  python ramdp_experiments/snake_fixed_budget_sweep.py --dry-run                # preview the grid
-  python ramdp_experiments/snake_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
-  python ramdp_experiments/snake_fixed_budget_sweep.py                           # run the full sweep
-  python ramdp_experiments/snake_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
+  python ramdp_experiments/seaquest_fixed_budget_sweep.py --dry-run                # preview the grid
+  python ramdp_experiments/seaquest_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
+  python ramdp_experiments/seaquest_fixed_budget_sweep.py                           # run the full sweep
+  python ramdp_experiments/seaquest_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
       --budget 1,8 --hidden-dim 16 --lr 3e-4 --seeds 1             # small pilot / debug run
 """
 
@@ -92,7 +92,7 @@ class Job:
         cmd = [
             python_bin,
             SYSTEM_TO_SCRIPT[self.system],
-            "env=jumanji/snake",
+            "env=gymnax/seaquest",
             f"network={network}",
             "logger.loggers.tensorboard.enabled=True",
             "logger.loggers.json.enabled=True",
@@ -107,6 +107,7 @@ class Job:
             f"network.actor_network.pre_torso.min_steps={self.budget}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
+            f"system.ent_coef=0.01",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
         if self.system in SYSTEM_TO_QAC_VARIANT:
@@ -114,10 +115,15 @@ class Job:
         if self.arch != "cnn":
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         else:
-            cmd.append(f"network.actor_network.input_layer.channel_sizes=[32,32]")
-            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[2,2]")
-            cmd.append(f"network.actor_network.input_layer.strides=[2,1]")
-            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[64]")
+            cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
+            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
+            cmd.append(f"network.actor_network.input_layer.strides=[1]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[128]")
+            cmd.append(f"network.critic_network.input_layer.channel_sizes=[16]")
+            cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
+            cmd.append(f"network.critic_network.input_layer.strides=[1]")
+            cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
+            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
         return cmd
 
     def run_dir(self) -> Path:
@@ -162,6 +168,7 @@ def run_job(
         # With `runs_per_gpu` processes sharing one physical GPU, each must be capped
         # to roughly 1/runs_per_gpu of the GPU or the later processes to allocate OOM.
         "XLA_PYTHON_CLIENT_MEM_FRACTION": str(mem_fraction),
+        "XLA_FLAGS": "--xla_gpu_autotune_level=0",
     }
     import os
 
@@ -220,7 +227,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results_snake_fixed_budget_sweep",
+        default=REPO_ROOT / "results_seaquest_fixed_budget_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")

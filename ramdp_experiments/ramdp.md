@@ -1,3 +1,9 @@
+##
+Gymnax 1.0.0 supports seaquest
+```
+uv pip install --no-deps "gymnax==1.0.0"
+```
+
 ## Transformer with implicit CoT
 ```
 c_max=8
