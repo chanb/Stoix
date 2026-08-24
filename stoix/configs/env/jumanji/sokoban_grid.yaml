@@ -1,7 +1,8 @@
 # ---Environment Configs---
 # Same as jumanji/sokoban.yaml but without the FlattenObservationWrapper - the
 # observation stays a genuine (height, width, channels) grid, for use with a
-# CNN-based network (e.g. network=cnn_compute / cnn_compute_qac) that needs the
+# CNN-based network (e.g. network=cnn_mlp_compute / cnn_mlp_compute_qac /
+# cnn_transformer_compute / cnn_transformer_compute_qac) that needs the
 # spatial structure. Plain MLP-based networks (mlp_compute etc.) expect a flat
 # vector and should use env=jumanji/sokoban instead.
 env_name: jumanji

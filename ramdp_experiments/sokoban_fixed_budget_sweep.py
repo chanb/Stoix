@@ -17,7 +17,9 @@ quantity.
 
 Grid axes:
   - system:      ff_reinforce (PonderNet-style REINFORCE) | ff_qac_fac | ff_qac_naive
-  - architecture: mlp (AdaptiveComputationTimeTorso) | transformer (TransformerChainOfThoughtTorso)
+  - architecture: mlp (AdaptiveComputationTimeTorso) | transformer (TransformerChainOfThoughtTorso) |
+                 cnn+mlp (CNNTorso input_layer feeding AdaptiveComputationTimeTorso) |
+                 cnn+transformer (CNNTorso input_layer feeding TransformerChainOfThoughtTorso)
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
   - lr:          shared actor_lr/critic_lr
@@ -62,10 +64,26 @@ SYSTEM_TO_SCRIPT = {
 }
 SYSTEM_TO_QAC_VARIANT = {"ff_qac_fac": "fac", "ff_qac_naive": "naive"}
 ARCH_TO_NETWORK = {
-    "ff_reinforce": {"mlp": "mlp_compute", "transformer": "transformer_compute", "cnn": "cnn_compute"},
-    "ff_qac_fac": {"mlp": "mlp_compute_qac", "transformer": "transformer_compute_qac", "cnn": "cnn_compute_qac"},
-    "ff_qac_naive": {"mlp": "mlp_compute_qac", "transformer": "transformer_compute_qac", "cnn": "cnn_compute_qac"},
+    "ff_reinforce": {
+        "mlp": "mlp_compute",
+        "transformer": "transformer_compute",
+        "cnn+mlp": "cnn_mlp_compute",
+        "cnn+transformer": "cnn_transformer_compute",
+    },
+    "ff_qac_fac": {
+        "mlp": "mlp_compute_qac",
+        "transformer": "transformer_compute_qac",
+        "cnn+mlp": "cnn_mlp_compute_qac",
+        "cnn+transformer": "cnn_transformer_compute_qac",
+    },
+    "ff_qac_naive": {
+        "mlp": "mlp_compute_qac",
+        "transformer": "transformer_compute_qac",
+        "cnn+mlp": "cnn_mlp_compute_qac",
+        "cnn+transformer": "cnn_transformer_compute_qac",
+    },
 }
+CNN_ARCHES = ("cnn+mlp", "cnn+transformer")
 
 
 @dataclass
@@ -112,7 +130,7 @@ class Job:
         ]
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
-        if self.arch != "cnn":
+        if self.arch not in CNN_ARCHES:
             cmd.append("env=jumanji/sokoban")
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         else:

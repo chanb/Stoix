@@ -189,7 +189,13 @@ class AdaptiveComputationTimeTorso(nn.Module):
                 jnp.log(halting_prob_for_log),
                 jnp.log(1.0 - halting_prob_for_log),
             )
-            halting_log_prob = halting_log_prob + jnp.where(still_running, step_log_prob, 0.0)
+            # Forced steps (before min_steps, or the forced halt at max_steps)
+            # contribute no log prob: the true probability of a forced outcome
+            # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
+            # reflect a "choice" the policy never actually got to make.
+            halting_log_prob = halting_log_prob + jnp.where(
+                jnp.logical_and(still_running, not is_forced_step), step_log_prob, 0.0
+            )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 

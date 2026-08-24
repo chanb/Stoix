@@ -2,8 +2,9 @@
 # Same as jumanji/2048.yaml but instead of flattening (which also collapses the
 # 2D board into a 1D vector), this uses GridObservationWrapper to keep the
 # (4, 4) spatial structure, casting to float32 and adding a trailing singleton
-# channel axis - (4, 4, 1) - so a CNN-based network (network=cnn_compute /
-# cnn_compute_qac) can operate on the real board layout. The dtype cast is also
+# channel axis - (4, 4, 1) - so a CNN-based network (network=cnn_mlp_compute /
+# cnn_mlp_compute_qac / cnn_transformer_compute / cnn_transformer_compute_qac)
+# can operate on the real board layout. The dtype cast is also
 # required for `env.observation_space().generate_value()` to work at all here:
 # the board is unbounded (int32, no declared bounds), and stoa's ArraySpace.sample()
 # only supports float/complex dtypes - see stoix/wrappers/grid_observation.py.
