@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Fixed-computation-budget sweep for RAMDP systems on seaquest.
+"""Fixed-computation-budget sweep for RAMDP systems on MinAtar environments
+(gymnax/<env>, e.g. gymnax/seaquest).
 
 Companion to seaquest_sweep.py: instead of letting the actor's compute torso
 adaptively halt (min_steps=1, sampled/learned halting), every job here pins
@@ -16,6 +17,7 @@ compute_time is deterministic (== budget) rather than a learned/sampled
 quantity.
 
 Grid axes:
+  - env:         MinAtar game (env=gymnax/<env>) - subset of MINATAR_GAMES
   - system:      ff_reinforce (PonderNet-style REINFORCE) | ff_qac_fac | ff_qac_naive
   - architecture: mlp (AdaptiveComputationTimeTorso) | transformer (TransformerChainOfThoughtTorso)
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
@@ -24,6 +26,10 @@ Grid axes:
   - delightful:  whether to gate the REINFORCE weight by the "delightful" surprisal
                  sigmoid (system.delightful); off by default. When on, also sweeps
                  delightful_eta (system.delightful_eta).
+  - use_layer_norm, use_input_layer_norm: LayerNorm options on
+                 AdaptiveComputationTimeTorso (mlp/cnn only - the transformer
+                 torso doesn't have these params, so this axis is forced off
+                 for architecture=transformer regardless of what's requested).
   - seed:        5 seeds per config by default
 
 gamma is fixed at 0.9999, matching seaquest_sweep.py. total_timesteps defaults
@@ -35,13 +41,16 @@ GPU (a GPU "slot" queue + thread pool), each run pinned via
 CUDA_VISIBLE_DEVICES and logged to its own file under <output-dir>/logs/.
 
 Usage:
-  python ramdp_experiments/seaquest_fixed_budget_sweep.py --dry-run                # preview the grid
-  python ramdp_experiments/seaquest_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
-  python ramdp_experiments/seaquest_fixed_budget_sweep.py                           # run the full sweep
-  python ramdp_experiments/seaquest_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
-      --budget 1,8 --hidden-dim 16 --lr 3e-4 --seeds 1             # small pilot / debug run
-  python ramdp_experiments/seaquest_fixed_budget_sweep.py --delightful true,false \\
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --dry-run                # preview the grid
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
+  python ramdp_experiments/minatar_fixed_budget_sweep.py                          # run the full sweep (all MinAtar games)
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --envs seaquest,breakout  # only these games
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
+      --envs seaquest --budget 1,8 --hidden-dim 16 --lr 3e-4 --seeds 1  # small pilot / debug run
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --delightful true,false \\
       --delightful-eta 1.0,3.0                                    # sweep delightful PG on/off
+  python ramdp_experiments/minatar_fixed_budget_sweep.py --architectures mlp \\
+      --use-layer-norm true,false --use-input-layer-norm true,false  # sweep LayerNorm options
 """
 
 from __future__ import annotations
@@ -71,10 +80,17 @@ ARCH_TO_NETWORK = {
     "ff_qac_fac": {"mlp": "mlp_compute_qac", "transformer": "transformer_compute_qac", "cnn": "cnn_compute_qac"},
     "ff_qac_naive": {"mlp": "mlp_compute_qac", "transformer": "transformer_compute_qac", "cnn": "cnn_compute_qac"},
 }
-
+MINATAR_GAMES = (
+    "asterix",
+    "breakout",
+    "freeway",
+    "seaquest",
+    "space_invaders",
+)
 
 @dataclass
 class Job:
+    env: str
     system: str
     arch: str
     budget: int
@@ -83,6 +99,8 @@ class Job:
     critic_lr: float
     delightful: bool
     delightful_eta: float
+    use_layer_norm: bool
+    use_input_layer_norm: bool
     seed: int
     total_timesteps: float
     output_dir: Path
@@ -90,11 +108,15 @@ class Job:
     @property
     def run_name(self) -> str:
         name = (
-            f"{self.system}-{self.arch}-budget_{self.budget}"
+            f"{self.env}-{self.system}-{self.arch}-budget_{self.budget}"
             f"-hidden_dim_{self.hidden_dim}-lr_{self.lr:g}-critic_lr_{self.critic_lr:g}"
         )
         if self.delightful:
             name += f"-delightful_eta_{self.delightful_eta:g}"
+        if self.use_layer_norm:
+            name += "-ln"
+        if self.use_input_layer_norm:
+            name += "-input_ln"
         return name + f"-seed_{self.seed}"
 
     def command(self, python_bin: str) -> List[str]:
@@ -102,7 +124,7 @@ class Job:
         cmd = [
             python_bin,
             SYSTEM_TO_SCRIPT[self.system],
-            "env=gymnax/seaquest",
+            f"env=gymnax/{self.env}",
             f"network={network}",
             "logger.loggers.tensorboard.enabled=True",
             "logger.loggers.json.enabled=True",
@@ -123,6 +145,13 @@ class Job:
         ]
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
+        if self.arch != "transformer":
+            # TransformerChainOfThoughtTorso has no LayerNorm params - these
+            # only exist on AdaptiveComputationTimeTorso (mlp/cnn).
+            cmd.append(f"network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
+            cmd.append(
+                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+            )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch != "cnn":
@@ -131,7 +160,7 @@ class Job:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
             cmd.append(f"network.actor_network.input_layer.strides=[1]")
-            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[128]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
             cmd.append(f"network.critic_network.input_layer.channel_sizes=[16]")
             cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
             cmd.append(f"network.critic_network.input_layer.strides=[1]")
@@ -156,10 +185,35 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
+    # (arch, use_layer_norm, use_input_layer_norm) combos: these params only
+    # exist on AdaptiveComputationTimeTorso (mlp/cnn), not the transformer
+    # torso, so architecture=transformer is forced to a single (False, False)
+    # combo instead of being needlessly duplicated per requested LN setting.
+    arch_ln_combos = []
+    for arch in args.architectures:
+        if arch == "transformer":
+            arch_ln_combos.append((arch, False, False))
+        else:
+            for uln in args.use_layer_norm:
+                for uiln in args.use_input_layer_norm:
+                    arch_ln_combos.append((arch, uln, uiln))
+    arch_ln_combos = list(dict.fromkeys(arch_ln_combos))
+
     jobs = []
-    for system, arch, budget, hidden_dim, lr, critic_lr, (delightful, delightful_eta), seed in itertools.product(
+    for (
+        env,
+        system,
+        (arch, use_layer_norm, use_input_layer_norm),
+        budget,
+        hidden_dim,
+        lr,
+        critic_lr,
+        (delightful, delightful_eta),
+        seed,
+    ) in itertools.product(
+        args.envs,
         args.systems,
-        args.architectures,
+        arch_ln_combos,
         args.budget,
         args.hidden_dim,
         args.lr,
@@ -169,6 +223,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     ):
         jobs.append(
             Job(
+                env=env,
                 system=system,
                 arch=arch,
                 budget=budget,
@@ -177,6 +232,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_lr=critic_lr,
                 delightful=delightful,
                 delightful_eta=delightful_eta,
+                use_layer_norm=use_layer_norm,
+                use_input_layer_norm=use_input_layer_norm,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 output_dir=args.output_dir,
@@ -240,6 +297,11 @@ def run_job(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
+        "--envs",
+        default=",".join(MINATAR_GAMES),
+        help=f"Comma-separated subset of {{{','.join(MINATAR_GAMES)}}} (env=gymnax/<env>).",
+    )
+    parser.add_argument(
         "--systems",
         default="ff_reinforce,ff_qac_fac,ff_qac_naive",
         help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive}.",
@@ -265,6 +327,20 @@ def main() -> None:
         default="1.0",
         help="Comma-separated system.delightful_eta values, swept only for delightful=true jobs.",
     )
+    parser.add_argument(
+        "--use-layer-norm",
+        default="false",
+        help="Comma-separated bools (true/false) - LayerNorm inside AdaptiveComputationTimeTorso's "
+        "shared ACTStep (network.actor_network.pre_torso.use_layer_norm). Ignored (forced off) for "
+        "architecture=transformer, which has no such param.",
+    )
+    parser.add_argument(
+        "--use-input-layer-norm",
+        default="false",
+        help="Comma-separated bools (true/false) - LayerNorm on the raw observation before "
+        "AdaptiveComputationTimeTorso's initial projection (network.actor_network.pre_torso."
+        "use_input_layer_norm). Ignored (forced off) for architecture=transformer.",
+    )
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids, or 'auto' to detect via nvidia-smi.")
@@ -272,7 +348,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results_seaquest_fixed_budget_sweep",
+        default=REPO_ROOT / "results_minatar_fixed_budget_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")
@@ -288,6 +364,7 @@ def main() -> None:
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt before launching.")
     args = parser.parse_args()
 
+    args.envs = args.envs.split(",")
     args.systems = args.systems.split(",")
     args.architectures = args.architectures.split(",")
     args.budget = [int(x) for x in args.budget.split(",")]
@@ -295,7 +372,13 @@ def main() -> None:
     args.lr = [float(x) for x in args.lr.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
+    args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
+    args.use_input_layer_norm = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
+    ]
 
+    for e in args.envs:
+        assert e in MINATAR_GAMES, f"unknown env {e!r}, expected one of {list(MINATAR_GAMES)}"
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
     for a in args.architectures:
@@ -330,9 +413,14 @@ def main() -> None:
         f"(XLA_PYTHON_CLIENT_MEM_FRACTION={mem_fraction:g} per process)"
     )
     print(f"Grid: {len(jobs)} jobs to run" + (f" ({n_skipped} skipped as already-existing)" if n_skipped else ""))
+    print(f"  envs={args.envs}")
     print(f"  systems={args.systems} architectures={args.architectures}")
     print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} lr={args.lr} seeds=0..{args.seeds - 1}")
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta}")
+    print(
+        f"  use_layer_norm={args.use_layer_norm} use_input_layer_norm={args.use_input_layer_norm} "
+        "(mlp/cnn only; forced off for transformer)"
+    )
     print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
 
     if args.dry_run:

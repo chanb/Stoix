@@ -28,6 +28,8 @@ actor_network:
     max_steps: 10
     min_steps: 1
     activation: relu
+    use_input_layer_norm: False
+    use_layer_norm: False
   action_head:
     _target_: stoix.networks.heads.CategoricalHead
 

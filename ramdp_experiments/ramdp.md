@@ -106,3 +106,8 @@ python ramdp_experiments/sokoban_sweep.py --hidden-dim=8,16,32,64 --lr=1e-5,1e-4
 
 CUDA_VISIBLE_DEVICES="0" XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 ```
+
+## Fixed budget sweep
+```
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_reinforce --budget 1,2,4,8,16 --seeds 3 --runs-per-gpu 4 --yes --architectures cnn --hidden-dim=64 --total-timesteps 3e8 --lr 3e-4 --no-skip-existing --delightful false,true --envs seaquest --use-layer-norm false,true --use-input-layer-norm false,true --gpus 0,1,2,3,4,5
+```

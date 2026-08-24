@@ -12,6 +12,8 @@ actor_network:
     min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
       # fixed-budget, non-adaptive baseline.
     activation: relu
+    use_input_layer_norm: False
+    use_layer_norm: False
   action_head:
     _target_: stoix.networks.heads.CategoricalHead
 

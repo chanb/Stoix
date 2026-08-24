@@ -51,9 +51,12 @@ class ACTStep(nn.Module):
     hidden_dim: int
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    use_layer_norm: bool = False
 
     @nn.compact
     def __call__(self, state: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        if self.use_layer_norm:
+            state = nn.LayerNorm()(state)
         state = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(state)
         state = parse_activation_fn(self.activation)(state)
         halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(state))
@@ -79,6 +82,12 @@ class AdaptiveComputationTimeTorso(nn.Module):
     `max_steps` regardless. Setting `min_steps == max_steps` therefore removes
     adaptivity entirely: every example always takes exactly `max_steps` -
     useful as a fixed-budget baseline against the adaptive policy.
+
+    `use_input_layer_norm` normalizes the raw `observation` before it's
+    projected into the shared recurrent width, once, up front.
+    `use_layer_norm` normalizes the running `state` inside every shared
+    `ACTStep` before that step's Dense layer (pre-LN), reused across all
+    `max_steps` applications since the step's parameters are shared.
     """
 
     hidden_dim: int
@@ -86,6 +95,8 @@ class AdaptiveComputationTimeTorso(nn.Module):
     min_steps: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    use_input_layer_norm: bool = False
+    use_layer_norm: bool = False
 
     @nn.compact
     def __call__(
@@ -133,10 +144,14 @@ class AdaptiveComputationTimeTorso(nn.Module):
         # Project into the shared recurrent width once up front, so the shared
         # step below always sees `hidden_dim`-sized states (its parameters are
         # reused across every pondering step).
+        if self.use_input_layer_norm:
+            observation = nn.LayerNorm()(observation)
         state = parse_activation_fn(self.activation)(
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         )
-        step_fn = ACTStep(self.hidden_dim, self.activation, self.kernel_init)
+        step_fn = ACTStep(
+            self.hidden_dim, self.activation, self.kernel_init, use_layer_norm=self.use_layer_norm
+        )
 
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
