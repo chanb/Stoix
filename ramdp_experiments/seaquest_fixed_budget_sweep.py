@@ -21,6 +21,9 @@ Grid axes:
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
   - lr:          shared actor_lr/critic_lr
+  - delightful:  whether to gate the REINFORCE weight by the "delightful" surprisal
+                 sigmoid (system.delightful); off by default. When on, also sweeps
+                 delightful_eta (system.delightful_eta).
   - seed:        5 seeds per config by default
 
 gamma is fixed at 0.9999, matching seaquest_sweep.py. total_timesteps defaults
@@ -37,6 +40,8 @@ Usage:
   python ramdp_experiments/seaquest_fixed_budget_sweep.py                           # run the full sweep
   python ramdp_experiments/seaquest_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
       --budget 1,8 --hidden-dim 16 --lr 3e-4 --seeds 1             # small pilot / debug run
+  python ramdp_experiments/seaquest_fixed_budget_sweep.py --delightful true,false \\
+      --delightful-eta 1.0,3.0                                    # sweep delightful PG on/off
 """
 
 from __future__ import annotations
@@ -76,16 +81,21 @@ class Job:
     hidden_dim: int
     lr: float
     critic_lr: float
+    delightful: bool
+    delightful_eta: float
     seed: int
     total_timesteps: float
     output_dir: Path
 
     @property
     def run_name(self) -> str:
-        return (
+        name = (
             f"{self.system}-{self.arch}-budget_{self.budget}"
-            f"-hidden_dim_{self.hidden_dim}-lr_{self.lr:g}-critic_lr_{self.critic_lr:g}-seed_{self.seed}"
+            f"-hidden_dim_{self.hidden_dim}-lr_{self.lr:g}-critic_lr_{self.critic_lr:g}"
         )
+        if self.delightful:
+            name += f"-delightful_eta_{self.delightful_eta:g}"
+        return name + f"-seed_{self.seed}"
 
     def command(self, python_bin: str) -> List[str]:
         network = ARCH_TO_NETWORK[self.system][self.arch]
@@ -108,8 +118,11 @@ class Job:
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
             f"system.ent_coef=0.01",
+            f"system.delightful={self.delightful}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
+        if self.delightful:
+            cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch != "cnn":
@@ -131,9 +144,28 @@ class Job:
 
 
 def build_grid(args: argparse.Namespace) -> List[Job]:
+    # (delightful, delightful_eta) combos: eta only matters (and is only swept)
+    # when delightful=True, so a delightful=False entry doesn't get needlessly
+    # duplicated once per requested eta value.
+    delightful_combos = []
+    for d in args.delightful:
+        if d:
+            for eta in args.delightful_eta:
+                delightful_combos.append((True, eta))
+        else:
+            delightful_combos.append((False, args.delightful_eta[0]))
+    delightful_combos = list(dict.fromkeys(delightful_combos))
+
     jobs = []
-    for system, arch, budget, hidden_dim, lr, critic_lr, seed in itertools.product(
-        args.systems, args.architectures, args.budget, args.hidden_dim, args.lr, args.lr, range(args.seeds)
+    for system, arch, budget, hidden_dim, lr, critic_lr, (delightful, delightful_eta), seed in itertools.product(
+        args.systems,
+        args.architectures,
+        args.budget,
+        args.hidden_dim,
+        args.lr,
+        args.lr,
+        delightful_combos,
+        range(args.seeds),
     ):
         jobs.append(
             Job(
@@ -143,6 +175,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 hidden_dim=hidden_dim,
                 lr=lr,
                 critic_lr=critic_lr,
+                delightful=delightful,
+                delightful_eta=delightful_eta,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 output_dir=args.output_dir,
@@ -220,6 +254,17 @@ def main() -> None:
     )
     parser.add_argument("--hidden-dim", default="16,32", help="Comma-separated actor torso widths.")
     parser.add_argument("--lr", default="1e-4,3e-4,1e-3", help="Comma-separated shared actor_lr/critic_lr values.")
+    parser.add_argument(
+        "--delightful",
+        default="false",
+        help="Comma-separated bools (true/false) - whether to gate the REINFORCE weight by the "
+        "'delightful' surprisal sigmoid (system.delightful). Default off, matching prior behavior.",
+    )
+    parser.add_argument(
+        "--delightful-eta",
+        default="1.0",
+        help="Comma-separated system.delightful_eta values, swept only for delightful=true jobs.",
+    )
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids, or 'auto' to detect via nvidia-smi.")
@@ -248,6 +293,8 @@ def main() -> None:
     args.budget = [int(x) for x in args.budget.split(",")]
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
+    args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
+    args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
 
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
@@ -285,6 +332,7 @@ def main() -> None:
     print(f"Grid: {len(jobs)} jobs to run" + (f" ({n_skipped} skipped as already-existing)" if n_skipped else ""))
     print(f"  systems={args.systems} architectures={args.architectures}")
     print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} lr={args.lr} seeds=0..{args.seeds - 1}")
+    print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta}")
     print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
 
     if args.dry_run:
