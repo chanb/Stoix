@@ -1,0 +1,27 @@
+# ---Environment Configs---
+# Box-moving (Sokoban-like) puzzle with the "variable quarter" level generator
+# (see stoix.envs.block_moving.generators.VariableQuarterGenerator): boxes and
+# targets are placed in two grid_size/quarter_size quadrants, with `quarter`
+# filtering (below) truncating the episode if the agent strays outside the
+# two allowed quadrants. Requires number_of_boxes_min == number_of_boxes_max
+# == number_of_moving_boxes_max, and number_of_boxes_max <= quarter_size^2.
+env_name: block_moving
+
+scenario:
+  name: block_moving-variable
+  task_name: block_moving_variable
+
+kwargs:
+  grid_size: 8
+  quarter_size: 2
+  episode_length: 50
+  number_of_boxes_min: 2
+  number_of_boxes_max: 2
+  number_of_moving_boxes_max: 2
+  generator_special: false
+  terminate_when_success: true
+  dense_rewards: false # currently unused by BoxMovingEnv.step - see block_moving_env.py
+  negative_sparse: true # currently unused by BoxMovingEnv.step - see block_moving_env.py
+  filtering: quarter # null | horizontal | vertical | quarter - see make_block_moving_env
+
+eval_metric: episode_return

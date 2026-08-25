@@ -1,0 +1,21 @@
+# ---Environment Configs---
+# Box-moving (Sokoban-like) puzzle with the default (uniform-random) level
+# generator (see stoix.envs.block_moving.generators.DefaultLevelGenerator).
+env_name: block_moving
+
+scenario:
+  name: block_moving-default
+  task_name: block_moving_default
+
+kwargs:
+  grid_size: 6
+  episode_length: 50
+  number_of_boxes_min: 2
+  number_of_boxes_max: 3
+  number_of_moving_boxes_max: 2
+  terminate_when_success: true
+  dense_rewards: false # currently unused by BoxMovingEnv.step - see block_moving_env.py
+  negative_sparse: true # currently unused by BoxMovingEnv.step - see block_moving_env.py
+  # filtering: null  # null (default) | horizontal | vertical | quarter - see make_block_moving_env
+
+eval_metric: episode_return
