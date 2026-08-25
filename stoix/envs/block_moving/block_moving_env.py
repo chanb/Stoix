@@ -37,7 +37,7 @@ class BoxMovingEnv:
         number_of_moving_boxes_max: int = 2,
         terminate_when_success: bool = False,
         dense_rewards: bool = False,
-        negative_sparse: bool = True,
+        negative_sparse: bool = False,
         level_generator: str = "default",
         quarter_size: int | None = None,
         **kwargs,

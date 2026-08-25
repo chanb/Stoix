@@ -156,7 +156,8 @@ class LightsOutEnv(Environment):
         success = jnp.all(new_grid == data.goal.astype(jnp.int32))
 
         # reward = 1.0 if solved, else a small penalty to encourage speed
-        reward = success.astype(jnp.float32) - 0.1
+        # reward = success.astype(jnp.float32) - 0.1
+        reward = success.astype(jnp.float32)
 
         terminated = success
         truncated = (new_step_count >= self._config.episode_length) & (~terminated)

@@ -21,7 +21,7 @@ kwargs:
   generator_special: false
   terminate_when_success: true
   dense_rewards: false # currently unused by BoxMovingEnv.step - see block_moving_env.py
-  negative_sparse: true # currently unused by BoxMovingEnv.step - see block_moving_env.py
+  negative_sparse: false # currently unused by BoxMovingEnv.step - see block_moving_env.py
   filtering: quarter # null | horizontal | vertical | quarter - see make_block_moving_env
 
 eval_metric: episode_return

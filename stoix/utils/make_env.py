@@ -486,6 +486,13 @@ def make_block_moving_env(scenario_name: str, config: DictConfig) -> Tuple[Envir
     Stoa adapter. Both require an even `grid_size`; `"quarter"` additionally
     requires `level_generator="variable"` (only that generator populates the
     `fields_allowed` extra `QuarterFilter` reads).
+
+    `config.env.kwargs.eval_generator_special`, if given, overrides
+    `generator_special` for the eval environment only (train keeps whatever
+    `generator_special` is set to) - e.g. train on `generator_special=False`'s
+    broader corner-pair pool and evaluate generalization on
+    `generator_special=True`'s held-out one. Omit it to keep train/eval
+    symmetric (the default).
     """
     from stoix.envs.block_moving.block_moving_env import BoxMovingEnv
     from stoix.envs.block_moving.stoa_adapter import BoxMovingToStoa
@@ -501,9 +508,13 @@ def make_block_moving_env(scenario_name: str, config: DictConfig) -> Tuple[Envir
 
     env_kwargs = dict(config.env.get("kwargs", {}) or {})
     filtering = env_kwargs.pop("filtering", None)
+    eval_generator_special = env_kwargs.pop("eval_generator_special", None)
 
-    def _make_one() -> BoxMovingToStoa:
-        box_env = BoxMovingEnv(level_generator=level_generator, **env_kwargs)
+    def _make_one(is_eval: bool) -> BoxMovingToStoa:
+        kwargs = dict(env_kwargs)
+        if is_eval and eval_generator_special is not None:
+            kwargs["generator_special"] = eval_generator_special
+        box_env = BoxMovingEnv(level_generator=level_generator, **kwargs)
         if filtering in ("horizontal", "vertical"):
             box_env = SymmetryFilter(box_env, axis=filtering)
         elif filtering == "quarter":
@@ -512,8 +523,8 @@ def make_block_moving_env(scenario_name: str, config: DictConfig) -> Tuple[Envir
             raise ValueError(f"Unknown filtering type: {filtering!r}")
         return BoxMovingToStoa(box_env)
 
-    env = _make_one()
-    eval_env = _make_one()
+    env = _make_one(is_eval=False)
+    eval_env = _make_one(is_eval=True)
 
     env = NoExtrasWrapper(env)
     eval_env = NoExtrasWrapper(eval_env)

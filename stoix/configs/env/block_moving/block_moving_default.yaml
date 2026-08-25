@@ -15,7 +15,7 @@ kwargs:
   number_of_moving_boxes_max: 2
   terminate_when_success: true
   dense_rewards: false # currently unused by BoxMovingEnv.step - see block_moving_env.py
-  negative_sparse: true # currently unused by BoxMovingEnv.step - see block_moving_env.py
+  negative_sparse: false # currently unused by BoxMovingEnv.step - see block_moving_env.py
   # filtering: null  # null (default) | horizontal | vertical | quarter - see make_block_moving_env
 
 eval_metric: episode_return
