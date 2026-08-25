@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import re
 from typing import Any, Callable, Tuple
 
 import hydra
@@ -416,6 +417,111 @@ def make_playground_env(scenario_name: str, config: DictConfig) -> Tuple[Environ
     return env, eval_env
 
 
+def make_lightsout_env(scenario_name: str, config: DictConfig) -> Tuple[Environment, Environment]:
+    """Creates and wraps a LightsOut environment.
+
+    LightsOut (`stoix.envs.lightsout.lightsout_env`) is natively Stoa-compatible
+    (like `stoix.utils.debug_env`'s custom in-repo environments), so no adapter
+    is needed - just `NoExtrasWrapper` plus the standard optional/core wrappers.
+
+    `scenario_name` (`config.env.scenario.name`) must be of the form
+    `"lightsout-<m>x<n>"`, e.g. `"lightsout-3x3"`, setting the puzzle grid size.
+    `episode_length` defaults to `m * n`; both it and `difficulty_threshold` may
+    be overridden via `config.env.kwargs`. The eval environment samples harder
+    (higher-`dist`) goals than the train environment - see `LightsOutEnv`.
+    """
+    from stoix.envs.lightsout.lightsout_env import LightsOutEnv, default_config
+
+    match = re.fullmatch(r"lightsout-(\d+)x(\d+)", scenario_name)
+    if match is None:
+        raise ValueError(
+            f"Invalid LightsOut scenario name {scenario_name!r}; expected "
+            "'lightsout-<m>x<n>', e.g. 'lightsout-3x3'."
+        )
+    m, n = int(match.group(1)), int(match.group(2))
+
+    env_kwargs = config.env.get("kwargs", {}) or {}
+    env_config = default_config()
+    env_config.m = m
+    env_config.n = n
+    env_config.episode_length = env_kwargs.get("episode_length", m * n)
+    if "difficulty_threshold" in env_kwargs:
+        env_config.difficulty_threshold = env_kwargs["difficulty_threshold"]
+
+    env = LightsOutEnv(env_config, eval=False)
+    eval_env = LightsOutEnv(env_config, eval=True)
+
+    env = NoExtrasWrapper(env)
+    eval_env = NoExtrasWrapper(eval_env)
+    env, eval_env = apply_optional_wrappers((env, eval_env), config)
+    env = apply_core_wrappers(env, config)
+    return env, eval_env
+
+
+def make_block_moving_env(scenario_name: str, config: DictConfig) -> Tuple[Environment, Environment]:
+    """Creates and wraps a BoxMoving (block-moving, Sokoban-like) environment.
+
+    `BoxMovingEnv` (`stoix.envs.block_moving.block_moving_env`) has its own
+    established `reset`/`step` API (not Stoa's `(State, TimeStep)`) already
+    used directly by that package's `play.py`/`tests.py`, so - unlike
+    `LightsOutEnv` - it isn't rewritten in place; instead it's wrapped by
+    `BoxMovingToStoa` (`stoix.envs.block_moving.stoa_adapter`), the same
+    external-library-adapter pattern used for jumanji/gymnax/etc. above.
+
+    `scenario_name` (`config.env.scenario.name`) selects the level generator:
+    `"block_moving-default"` (`DefaultLevelGenerator`) or
+    `"block_moving-variable"` (`VariableQuarterGenerator` - needs
+    `config.env.kwargs.quarter_size`, `generator_special`, and
+    `number_of_boxes_min == number_of_boxes_max == number_of_moving_boxes_max`,
+    see that generator). All other `BoxMovingEnv` constructor arguments
+    (`grid_size`, `episode_length`, `number_of_boxes_min`/`max`,
+    `number_of_moving_boxes_max`, `terminate_when_success`, `dense_rewards`,
+    `negative_sparse`) are read from `config.env.kwargs`.
+
+    `config.env.kwargs.filtering` (`None` (default) | `"horizontal"` |
+    `"vertical"` | `"quarter"`) optionally applies
+    `stoix.envs.block_moving.wrappers`' `SymmetryFilter`/`QuarterFilter`
+    (domain-specific curriculum truncation - marks an episode truncated once
+    the agent crosses into the "wrong" half/quarter of the grid) before the
+    Stoa adapter. Both require an even `grid_size`; `"quarter"` additionally
+    requires `level_generator="variable"` (only that generator populates the
+    `fields_allowed` extra `QuarterFilter` reads).
+    """
+    from stoix.envs.block_moving.block_moving_env import BoxMovingEnv
+    from stoix.envs.block_moving.stoa_adapter import BoxMovingToStoa
+    from stoix.envs.block_moving.wrappers import QuarterFilter, SymmetryFilter
+
+    match = re.fullmatch(r"block_moving-(default|variable)", scenario_name)
+    if match is None:
+        raise ValueError(
+            f"Invalid block_moving scenario name {scenario_name!r}; expected "
+            "'block_moving-default' or 'block_moving-variable'."
+        )
+    level_generator = match.group(1)
+
+    env_kwargs = dict(config.env.get("kwargs", {}) or {})
+    filtering = env_kwargs.pop("filtering", None)
+
+    def _make_one() -> BoxMovingToStoa:
+        box_env = BoxMovingEnv(level_generator=level_generator, **env_kwargs)
+        if filtering in ("horizontal", "vertical"):
+            box_env = SymmetryFilter(box_env, axis=filtering)
+        elif filtering == "quarter":
+            box_env = QuarterFilter(box_env)
+        elif filtering is not None:
+            raise ValueError(f"Unknown filtering type: {filtering!r}")
+        return BoxMovingToStoa(box_env)
+
+    env = _make_one()
+    eval_env = _make_one()
+
+    env = NoExtrasWrapper(env)
+    eval_env = NoExtrasWrapper(eval_env)
+    env, eval_env = apply_optional_wrappers((env, eval_env), config)
+    env = apply_core_wrappers(env, config)
+    return env, eval_env
+
+
 # A dispatcher mapping environment suite names to their respective maker functions.
 ENV_MAKERS = {
     "jumanji": make_jumanji_env,
@@ -429,6 +535,8 @@ ENV_MAKERS = {
     "navix": make_navix_env,
     "kinetix": make_kinetix_env,
     "mujoco_playground": make_playground_env,
+    "lightsout": make_lightsout_env,
+    "block_moving": make_block_moving_env,
     "debug": make_debug_env,
 }
 
