@@ -14,3 +14,5 @@ class Transition(NamedTuple):
     obs: chex.Array
     info: Dict
     compute_time: chex.Array
+    first_convergence_step: chex.Array
+    num_close_steps: chex.Array

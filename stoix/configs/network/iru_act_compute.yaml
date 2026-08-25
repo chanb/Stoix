@@ -1,0 +1,29 @@
+# ---IRU Compute-Time-Aware REINFORCE Networks---
+# The actor's pre_torso is an IRU-based Adaptive Computation Time torso: its
+# shared step is an "interpolation recurrent unit" (see
+# stoix.networks.torso_compute.IRUStep) - the running cell state is updated
+# as an interpolation between its previous value and a fresh candidate, both
+# computed from the (fixed) encoded observation and tanh of the current cell
+# state, gated by a learned forget probability. Samples a "halt now?"
+# decision at each step from a learned probability, and reports the actual
+# (sampled) number of steps taken as `compute_time` (see
+# stoix.networks.torso_compute.IRUAdaptiveComputationTimeTorso).
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute.IRUAdaptiveComputationTimeTorso
+    hidden_dim: 256
+    max_steps: 10
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    use_input_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead

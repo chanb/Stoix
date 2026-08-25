@@ -90,29 +90,32 @@ def get_distribution_act_fn_with_compute_time(
     """Like `stoix.evaluator.get_distribution_act_fn`, but for actor networks
     whose torso samples a halting trajectory (see
     `stoix.networks.torso_compute.AdaptiveComputationTimeTorso`) and so
-    return `(action_distribution, compute_time)` instead of just the action
-    distribution. Returns `(action, compute_time)` so evaluation (see
-    `stoix.systems.ramdp_vpg.evaluator`) can report compute time too, not
-    just training."""
+    return `(action_distribution, compute_time, first_convergence_step,
+    num_close_steps)` instead of just the action distribution. Returns
+    `(action, compute_time, first_convergence_step, num_close_steps)` so
+    evaluation (see `stoix.systems.ramdp_vpg.evaluator`) can report compute
+    time and the torso's latent-convergence diagnostics too, not just
+    training."""
 
     def act_fn(
         params: FrozenDict, observation: chex.Array, key: chex.PRNGKey
-    ) -> Tuple[chex.Array, chex.Array]:
-        """Get the action from the distribution, alongside the realised compute time."""
+    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+        """Get the action from the distribution, alongside the realised compute
+        time and latent-convergence diagnostics."""
         if config.arch.evaluation_greedy:
             # Halt deterministically (as soon as halting probability crosses 0.5)
             # to match the deterministic (mode) environment action.
-            pi, compute_time = actor_apply(
+            pi, compute_time, first_convergence_step, num_close_steps = actor_apply(
                 params, observation, torso_kwargs={"deterministic": True}
             )
             action = pi.mode()
         else:
             halting_key, action_key = jax.random.split(key)
-            pi, compute_time = actor_apply(
+            pi, compute_time, first_convergence_step, num_close_steps = actor_apply(
                 params, observation, torso_kwargs={"rng": halting_key}
             )
             action = pi.sample(seed=action_key)
-        return action, compute_time
+        return action, compute_time, first_convergence_step, num_close_steps
 
     return act_fn
 
@@ -140,7 +143,7 @@ def get_learner_fn(
 
             # SELECT ACTION
             key, policy_key, halting_key = jax.random.split(key, 3)
-            actor_policy, compute_time = actor_apply_fn(
+            actor_policy, compute_time, first_convergence_step, num_close_steps = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"rng": halting_key},
@@ -163,6 +166,8 @@ def get_learner_fn(
                 last_timestep.observation,
                 info,
                 compute_time,
+                first_convergence_step,
+                num_close_steps,
             )
             learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
             return learner_state, transition
@@ -205,6 +210,8 @@ def get_learner_fn(
             monte_carlo_returns: chex.Array,
             value_predictions: chex.Array,
             compute_times: chex.Array,
+            first_convergence_steps: chex.Array,
+            num_close_steps: chex.Array,
         ) -> Tuple:
             """Calculate the actor loss."""
             # RERUN NETWORK. Replay (rather than re-sample) the halting trajectory
@@ -240,6 +247,8 @@ def get_learner_fn(
                 "actor_loss": loss_actor,
                 "entropy": entropy,
                 "compute_time": compute_times,
+                "first_convergence_step": first_convergence_steps,
+                "num_close_steps": num_close_steps,
                 "advantage": advantage.mean(),
             }
             if config.system.delightful:
@@ -273,6 +282,8 @@ def get_learner_fn(
             monte_carlo_returns,
             traj_batch.value,
             traj_batch.compute_time,
+            traj_batch.first_convergence_step,
+            traj_batch.num_close_steps,
         )
 
         # CALCULATE CRITIC LOSS

@@ -134,7 +134,7 @@ def get_learner_fn(
 
             # SELECT ACTION
             key, policy_key, halting_key = jax.random.split(key, 3)
-            actor_policy, compute_time = actor_apply_fn(
+            actor_policy, compute_time, first_convergence_step, num_close_steps = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"rng": halting_key},
@@ -164,6 +164,8 @@ def get_learner_fn(
                 last_timestep.observation,
                 info,
                 compute_time,
+                first_convergence_step,
+                num_close_steps,
             )
             learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
             return learner_state, transition
@@ -202,6 +204,8 @@ def get_learner_fn(
             actions: chex.Array,
             advantage: chex.Array,
             compute_times: chex.Array,
+            first_convergence_steps: chex.Array,
+            num_close_steps: chex.Array,
         ) -> Tuple:
             """Calculate the actor loss."""
             # RERUN NETWORK. Replay (rather than re-sample) the halting trajectory
@@ -236,6 +240,8 @@ def get_learner_fn(
                 "actor_loss": loss_actor,
                 "entropy": entropy,
                 "compute_time": compute_times,
+                "first_convergence_step": first_convergence_steps,
+                "num_close_steps": num_close_steps,
                 "advantage": advantage.mean(),
             }
             if config.system.delightful:
@@ -283,6 +289,8 @@ def get_learner_fn(
             traj_batch.action,
             advantage,
             traj_batch.compute_time,
+            traj_batch.first_convergence_step,
+            traj_batch.num_close_steps,
         )
 
         # CALCULATE CRITIC LOSS

@@ -105,6 +105,19 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
     `use_input_layer_norm` normalizes the raw `observation` before it becomes
     the first scratchpad token (i.e. before its projection into `hidden_dim`).
+
+    Also tracks, per example, how quickly the "thought" (the representation
+    read off the last scratchpad position) settles: the L2 distance between
+    consecutive steps' thoughts (step `t` vs `t - 1`, starting at `t = 2`
+    since there's no step 0 to compare step 1 against) is compared against
+    `convergence_threshold`. This gives two diagnostics, only while the
+    example hasn't halted yet:
+
+      - `first_convergence_step`: the (1-indexed) step count `t` at which
+        that distance first drops below `convergence_threshold`, or `-1` if
+        it never does within the steps actually taken.
+      - `num_close_steps`: how many steps (not necessarily consecutive) had
+        a distance below `convergence_threshold`.
     """
 
     hidden_dim: int
@@ -116,6 +129,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
+    convergence_threshold: float = 0.1
 
     @nn.compact
     def __call__(
@@ -124,7 +138,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         rng: Optional[chex.PRNGKey] = None,
         target_compute_time: Optional[chex.Array] = None,
         deterministic: bool = False,
-    ) -> Tuple[chex.Array, chex.Array]:
+    ) -> Tuple[chex.Array, ...]:
         """
         Args:
             observation: the input embedding to think about; becomes the
@@ -142,9 +156,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
                 sampling. Useful for greedy evaluation.
 
         Returns:
-            `(embedding, compute_time)` when `target_compute_time` is None,
-            or `(embedding, halting_log_prob)` when replaying a known
-            trajectory.
+            `(embedding, compute_time, first_convergence_step,
+            num_close_steps)` when `target_compute_time` is None, or
+            `(embedding, halting_log_prob)` when replaying a known
+            trajectory (see class docstring for the convergence diagnostics).
         """
         batch_shape = observation.shape[:-1]
         replaying = target_compute_time is not None
@@ -190,6 +205,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
         num_steps_taken = jnp.zeros(batch_shape)
         halting_log_prob = jnp.zeros(batch_shape)
         final_state = initial_token
+        first_convergence_step = jnp.full(batch_shape, -1.0)
+        num_close_steps = jnp.zeros(batch_shape)
+        prev_state = None
 
         for step in range(self.max_steps):
             seq_len = step + 1
@@ -204,6 +222,23 @@ class TransformerChainOfThoughtTorso(nn.Module):
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
+
+            if not replaying and step > 0:
+                # Only meaningful from the second step on (step 0 has no
+                # previous thought to compare against), and only while still
+                # running - once an example has halted, later thoughts keep
+                # being computed (the loop is unrolled over every example)
+                # but are discarded, so they say nothing about the example's
+                # real trajectory.
+                l2_dist = jnp.linalg.norm(state - prev_state, axis=-1)
+                is_close = still_running & (l2_dist < self.convergence_threshold)
+                num_close_steps = num_close_steps + is_close.astype(jnp.float32)
+                first_convergence_step = jnp.where(
+                    is_close & (first_convergence_step < 0),
+                    jnp.float32(step_count),
+                    first_convergence_step,
+                )
+            prev_state = state
 
             if replaying:
                 halts_this_step = still_running & (
@@ -247,4 +282,4 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
         if replaying:
             return final_state, halting_log_prob
-        return final_state, num_steps_taken
+        return final_state, num_steps_taken, first_convergence_step, num_close_steps

@@ -7,8 +7,10 @@ evaluation - not just training - reports how much the actor "thinks" per
 action. `stoix.evaluator.get_ff_evaluator_fn`'s `act_fn` returns a bare
 action, which is why it can't be reused directly here: our `act_fn`
 (`stoix.systems.ramdp_vpg.ff_reinforce.get_distribution_act_fn_with_compute_time`)
-also returns the realised `compute_time`, which needs to be threaded through
-episode accumulation and into the reported metrics.
+also returns the realised `compute_time` and the torso's latent-convergence
+diagnostics (`first_convergence_step`, `num_close_steps` - see
+`stoix.networks.torso_compute.AdaptiveComputationTimeTorso`), which need to
+be threaded through episode accumulation and into the reported metrics.
 """
 
 from typing import Callable, Dict, Optional, Tuple
@@ -27,13 +29,17 @@ from stoix.evaluator import make_random_initial_eval_reset_fn
 from stoix.utils.jax_utils import unreplicate_batch_dim
 from stoix.utils.running_statistics import RunningStatisticsState, normalize
 
-# Returns (action, compute_time) rather than just an action.
-ComputeAwareActFn = Callable[[FrozenDict, chex.Array, chex.PRNGKey], Tuple[chex.Array, chex.Array]]
+# Returns (action, compute_time, first_convergence_step, num_close_steps)
+# rather than just an action.
+ComputeAwareActFn = Callable[
+    [FrozenDict, chex.Array, chex.PRNGKey], Tuple[chex.Array, chex.Array, chex.Array, chex.Array]
+]
 
 
 class RamdpEvalState(NamedTuple):
     """Like `stoix.base_types.EvalState`, but additionally accumulates the
-    actor's compute time over the episode."""
+    actor's compute time, and latent-convergence diagnostics, over the
+    episode."""
 
     key: chex.PRNGKey
     env_state: State
@@ -43,6 +49,8 @@ class RamdpEvalState(NamedTuple):
     episode_discounted_return: chex.Array
     discount_factor: chex.Array
     episode_compute_time: chex.Array
+    episode_first_convergence_step: chex.Array
+    episode_num_close_steps: chex.Array
 
 
 def get_ff_evaluator_fn_with_compute_time(
@@ -75,6 +83,8 @@ def get_ff_evaluator_fn_with_compute_time(
                 episode_discounted_return,
                 discount_factor,
                 episode_compute_time,
+                episode_first_convergence_step,
+                episode_num_close_steps,
             ) = eval_state
 
             # Select action.
@@ -85,7 +95,7 @@ def get_ff_evaluator_fn_with_compute_time(
             if running_statistics is not None:
                 observation = normalize(observation, running_statistics)
 
-            action, compute_time = act_fn(
+            action, compute_time, first_convergence_step, num_close_steps = act_fn(
                 params,
                 jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], observation),
                 policy_key,
@@ -106,6 +116,8 @@ def get_ff_evaluator_fn_with_compute_time(
             )
             discount_factor *= config.system.gamma**compute_time
             episode_compute_time += compute_time
+            episode_first_convergence_step += first_convergence_step
+            episode_num_close_steps += num_close_steps
             step_count += 1
             eval_state = RamdpEvalState(
                 key,
@@ -116,6 +128,8 @@ def get_ff_evaluator_fn_with_compute_time(
                 episode_discounted_return,
                 discount_factor,
                 episode_compute_time,
+                episode_first_convergence_step,
+                episode_num_close_steps,
             )
             return eval_state
 
@@ -132,6 +146,14 @@ def get_ff_evaluator_fn_with_compute_time(
             "episode_discounted_return": final_state.episode_discounted_return,
             "episode_length": final_state.step_count,
             "compute_time": final_state.episode_compute_time / final_state.step_count,
+            # Mean over the episode's actions; each action's own
+            # `first_convergence_step` is -1 if that action's pondering never
+            # converged, which pulls this mean down - a simple, honest signal
+            # that convergence is rare/slow, at the cost of not being a "mean
+            # convergence step among the actions that did converge".
+            "first_convergence_step": final_state.episode_first_convergence_step
+            / final_state.step_count,
+            "num_close_steps": final_state.episode_num_close_steps / final_state.step_count,
         }
         # Log solved episode if solve rate is required.
         if log_solve_rate:
@@ -171,6 +193,8 @@ def get_ff_evaluator_fn_with_compute_time(
             episode_discounted_return=jnp.zeros((eval_batch, 1)),
             discount_factor=jnp.ones((eval_batch, 1)),
             episode_compute_time=jnp.zeros((eval_batch, 1)),
+            episode_first_convergence_step=jnp.zeros((eval_batch, 1)),
+            episode_num_close_steps=jnp.zeros((eval_batch, 1)),
         )
 
         eval_metrics = jax.vmap(
