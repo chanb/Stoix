@@ -80,11 +80,19 @@ def get_distribution_act_fn_with_compute_time(
     emitted tokens aren't needed for evaluation metrics (only `compute_time`
     is, see `stoix.systems.ramdp_vpg.evaluator`), so they're dropped here;
     they still exist in the trajectory and could be decoded/inspected by a
-    caller that wants to read the actor's reasoning trace."""
+    caller that wants to read the actor's reasoning trace.
+
+    `TransformerExplicitCoTTorso` has no latent-convergence diagnostics
+    (unlike `AdaptiveComputationTimeTorso`/`GRUAdaptiveComputationTimeTorso`/
+    `IRUAdaptiveComputationTimeTorso` - its "thoughts" are discrete token ids,
+    not a continuous state to measure L2 distance between), so this always
+    reports the sentinel `first_convergence_step=-1`, `num_close_steps=0` -
+    matching the shape of `evaluator.py`'s shared `ComputeAwareActFn`
+    interface, which every RAMDP system's act_fn must satisfy."""
 
     def act_fn(
         params: FrozenDict, observation: chex.Array, key: chex.PRNGKey
-    ) -> Tuple[chex.Array, chex.Array]:
+    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """Get the action from the distribution, alongside the realised compute time."""
         if config.arch.evaluation_greedy:
             # Halt deterministically and pick the highest-probability thought
@@ -99,7 +107,9 @@ def get_distribution_act_fn_with_compute_time(
                 params, observation, torso_kwargs={"rng": halting_key}
             )
             action = pi.sample(seed=action_key)
-        return action, compute_time
+        first_convergence_step = -jnp.ones_like(compute_time)
+        num_close_steps = jnp.zeros_like(compute_time)
+        return action, compute_time, first_convergence_step, num_close_steps
 
     return act_fn
 
