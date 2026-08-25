@@ -1,0 +1,44 @@
+# ---CNN+GRU Compute-Time-Aware REINFORCE Networks---
+# Same CNN + MLP input_layer as cnn_mlp_compute.yaml (see that file's comment
+# for the jumanji-Sokoban-network rationale) for grid/pixel observations, but
+# feeding a GRU-based Adaptive Computation Time torso instead of a plain
+# AdaptiveComputationTimeTorso: its shared step re-feeds the (fixed) encoded
+# observation into a GRU cell alongside its own running recurrent state at
+# every pondering step (see
+# stoix.networks.torso_compute.GRUAdaptiveComputationTimeTorso).
+actor_network:
+  input_layer:
+    _target_: stoix.networks.torso.CNNTorso
+    channel_sizes: [32, 64]
+    kernel_sizes: [3, 3]
+    strides: [1, 1]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False # jumanji's grid observation is already (H, W, C).
+    hidden_sizes: [128]
+  pre_torso:
+    _target_: stoix.networks.torso_compute.GRUAdaptiveComputationTimeTorso
+    hidden_dim: 128
+    max_steps: 10
+    min_steps: 1
+    use_input_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  input_layer:
+    _target_: stoix.networks.torso.CNNTorso
+    channel_sizes: [32, 64]
+    kernel_sizes: [3, 3]
+    strides: [1, 1]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False
+    hidden_sizes: [128]
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
