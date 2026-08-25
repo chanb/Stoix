@@ -25,27 +25,24 @@ JsonLogger`, see `stoix.utils.logger.JsonLogger`) to pull out:
 rather than assumed from the manifest, since older sweep scripts didn't
 record an `env` field.
 
-For each (env, system, arch, budget), multiple hyperparameter combinations
-(hidden_dim, lr, critic_lr, delightful/eta, layer norm options) may have been
-swept. Rather than averaging across all of them (which would blend in
-obviously-bad hyperparameters), the best combination is selected per point -
-by mean discounted return across seeds by default (`--select-by`) - and its
-mean +/- std across seeds is what gets plotted, mirroring standard practice
-for hyperparameter-swept RL results.
+For each (env, arch), multiple hyperparameter combinations (system,
+hidden_dim, lr, critic_lr, delightful/eta, layer norm options) may have been
+swept - every combination actually run gets its own row (no "pick the best"
+selection), so nothing is hidden from the plot.
 
-One figure is produced per environment. Within each figure, rows are
-architectures (`arch`) and there are two columns:
+One figure is produced per (env, arch) pair. Within each figure, rows are
+hyperparameter settings and there are two columns:
   1. timesteps (x) vs. performance (y): the training curve, one line per
-     budget, averaged across seeds (of the best hyperparameter combo).
-  2. budget (x) vs. final performance (y): mean +/- std across seeds (of
-     the best hyperparameter combo) at each budget.
+     budget, averaged across seeds.
+  2. budget (x) vs. final performance (y): mean +/- std across seeds at each
+     budget.
 
 Usage:
   python ramdp_experiments/plot_fixed_budget_sweep.py results_minatar_fixed_budget_sweep
   python ramdp_experiments/plot_fixed_budget_sweep.py results_seaquest_fixed_budget_sweep \\
       results_minatar_fixed_budget_sweep --output-dir sweep_plots
   python ramdp_experiments/plot_fixed_budget_sweep.py results_sokoban_fixed_budget_sweep \\
-      --select-by undiscounted --title "Sokoban fixed-budget sweep"
+      --metric undiscounted --title "Sokoban fixed-budget sweep"
 """
 
 from __future__ import annotations
@@ -236,66 +233,81 @@ def collect_results(results_dirs: List[Path]) -> List[RunResult]:
     return results
 
 
-GroupKey = Tuple[str, str, str, bool, bool, int]  # env, system, arch, use_layer_norm, use_input_layer_norm, budget
+# env, arch, system, hidden_dim, lr, critic_lr, delightful, delightful_eta,
+# use_layer_norm, use_input_layer_norm - every axis except `budget` and `seed`,
+# which are what's aggregated/plotted within a row (see plot_env_arch).
+RowKey = Tuple[str, str, str, int, float, float, bool, float, bool, bool]
 
 
-def format_arch_row_label(arch: str, use_layer_norm: bool, use_input_layer_norm: bool) -> str:
-    tags = []
+def format_hyperparam_row_label(row_key: RowKey, show_system: bool) -> str:
+    (
+        _env,
+        _arch,
+        system,
+        hidden_dim,
+        lr,
+        critic_lr,
+        delightful,
+        delightful_eta,
+        use_layer_norm,
+        use_input_layer_norm,
+    ) = row_key
+    parts = [f"hidden_dim={hidden_dim}", f"lr={lr:g}", f"critic_lr={critic_lr:g}"]
+    if delightful:
+        parts.append(f"delightful_eta={delightful_eta:g}")
     if use_layer_norm:
-        tags.append("ln")
+        parts.append("ln")
     if use_input_layer_norm:
-        tags.append("input_ln")
-    return f"{arch} ({'+'.join(tags)})" if tags else arch
+        parts.append("input_ln")
+    label = ", ".join(parts)
+    return f"{system} | {label}" if show_system else label
 
 
-def select_best_hyperparams(results: List[RunResult], select_by: str) -> Dict[GroupKey, List[RunResult]]:
-    """Groups runs by (env, system, arch, use_layer_norm, use_input_layer_norm,
-    budget) - i.e. each layer-norm variant of an architecture is treated as
-    its own row rather than being selected over. Within each group, picks
-    the remaining hyperparameter combination (hidden_dim, lr, critic_lr,
-    delightful settings) with the best mean `select_by` return across seeds,
-    and returns that combo's list of per-seed RunResults."""
-    metric_attr = "discounted_return" if select_by == "discounted" else "undiscounted_return"
-
-    # group_key -> hyperparam_key -> [RunResult, ...]
-    groups: Dict[GroupKey, Dict[tuple, List[RunResult]]] = {}
+def group_all_variants(results: List[RunResult]) -> Dict[RowKey, Dict[int, List[RunResult]]]:
+    """Groups runs by every hyperparameter axis (env, arch, system,
+    hidden_dim, lr, critic_lr, delightful, delightful_eta, use_layer_norm,
+    use_input_layer_norm) -> {budget: [RunResult per seed]}. Unlike a
+    "pick-the-best" selection, every combination actually swept becomes its
+    own row when plotted - nothing is hidden."""
+    groups: Dict[RowKey, Dict[int, List[RunResult]]] = {}
     for r in results:
-        group_key = (r.env, r.system, r.arch, r.use_layer_norm, r.use_input_layer_norm, r.budget)
-        hp_key = (r.hidden_dim, r.lr, r.critic_lr, r.delightful, r.delightful_eta)
-        groups.setdefault(group_key, {}).setdefault(hp_key, []).append(r)
-
-    best: Dict[GroupKey, List[RunResult]] = {}
-    for group_key, hp_to_runs in groups.items():
-        best_hp_runs = max(
-            hp_to_runs.values(),
-            key=lambda runs: np.mean([getattr(r, metric_attr) for r in runs]),
+        row_key = (
+            r.env,
+            r.arch,
+            r.system,
+            r.hidden_dim,
+            r.lr,
+            r.critic_lr,
+            r.delightful,
+            r.delightful_eta,
+            r.use_layer_norm,
+            r.use_input_layer_norm,
         )
-        best[group_key] = best_hp_runs
-    return best
+        groups.setdefault(row_key, {}).setdefault(r.budget, []).append(r)
+    return groups
 
 
-def plot_env(
+def plot_env_arch(
     env: str,
-    best: Dict[GroupKey, List[RunResult]],
+    arch: str,
+    row_keys: List[RowKey],
+    grouped: Dict[RowKey, Dict[int, List[RunResult]]],
     metric: str,
     output_path: Path,
     title: Optional[str],
 ) -> None:
-    """One figure for `env`: rows are (architecture, layer-norm variant)
-    combinations, columns are (timesteps vs. performance) and (budget vs.
-    final performance)."""
+    """One figure for (env, arch): rows are hyperparameter settings, columns
+    are (timesteps vs. performance) and (budget vs. final performance)."""
     metric_attr = "discounted_return" if metric == "discounted" else "undiscounted_return"
     curve_idx = 2 if metric == "discounted" else 1
     metric_label = "Discounted return" if metric == "discounted" else "Undiscounted return"
 
-    row_keys = sorted({(a, ln, iln) for (e, s, a, ln, iln, b) in best if e == env})
-    budgets = sorted({b for (e, s, a, ln, iln, b) in best if e == env})
-    systems = sorted({s for (e, s, a, ln, iln, b) in best if e == env})
-
+    all_budgets = sorted({budget for row_key in row_keys for budget in grouped[row_key]})
     color_map = plt.get_cmap("viridis")
-    budget_colors = {budget: color_map(i / max(len(budgets) - 1, 1)) for i, budget in enumerate(budgets)}
-    line_styles = ["-", "--", "-.", ":"]
-    system_styles = {system: line_styles[i % len(line_styles)] for i, system in enumerate(systems)}
+    budget_colors = {
+        budget: color_map(i / max(len(all_budgets) - 1, 1)) for i, budget in enumerate(all_budgets)
+    }
+    show_system = len({row_key[2] for row_key in row_keys}) > 1
 
     fig, axes = plt.subplots(
         len(row_keys),
@@ -304,19 +316,15 @@ def plot_env(
         squeeze=False,
     )
 
-    for row, (arch, use_layer_norm, use_input_layer_norm) in enumerate(row_keys):
+    for row, row_key in enumerate(row_keys):
         ax_curve, ax_budget = axes[row]
-        group_keys = [
-            (s, b)
-            for (e, s, a, ln, iln, b) in best
-            if e == env and a == arch and ln == use_layer_norm and iln == use_input_layer_norm
-        ]
+        budgets_data = grouped[row_key]
+        row_budgets = sorted(budgets_data)
 
         # Column 1: timesteps (x) vs. performance (y), one line per budget,
-        # averaged across seeds (of the best hyperparameter combo).
-        for system, budget in sorted(group_keys):
-            runs = best[(env, system, arch, use_layer_norm, use_input_layer_norm, budget)]
-            curves = [r.curve for r in runs if r.curve]
+        # averaged across seeds.
+        for budget in row_budgets:
+            curves = [r.curve for r in budgets_data[budget] if r.curve]
             if not curves:
                 continue
             min_len = min(len(c) for c in curves)
@@ -326,13 +334,8 @@ def plot_env(
             values = np.array([[c[i][curve_idx] for i in range(min_len)] for c in curves])
             mean_curve = values.mean(axis=0)
             std_curve = values.std(axis=0)
-            label = f"budget={budget}" if len(systems) == 1 else f"{system}-budget={budget}"
             ax_curve.plot(
-                steps,
-                mean_curve,
-                label=label,
-                color=budget_colors[budget],
-                linestyle=system_styles[system],
+                steps, mean_curve, label=f"budget={budget}", color=budget_colors[budget]
             )
             ax_curve.fill_between(
                 steps,
@@ -342,44 +345,31 @@ def plot_env(
                 alpha=0.15,
             )
         ax_curve.set_xlabel("Timesteps")
-        row_label = format_arch_row_label(arch, use_layer_norm, use_input_layer_norm)
-        ax_curve.set_ylabel(f"{metric_label}\n\n{row_label}", fontsize=10)
+        row_label = format_hyperparam_row_label(row_key, show_system)
+        ax_curve.set_ylabel(f"{metric_label}\n\n{row_label}", fontsize=9)
         if row == 0:
             ax_curve.set_title("Training curve")
         ax_curve.grid(True, alpha=0.3)
         ax_curve.legend(fontsize=8)
 
         # Column 2: budget (x) vs. final performance (y), mean +/- std
-        # across seeds (of the best hyperparameter combo).
-        for system in sorted({s for (s, b) in group_keys}):
-            row_budgets = sorted(b for (s, b) in group_keys if s == system)
-            means = []
-            stds = []
-            for budget in row_budgets:
-                runs = best[(env, system, arch, use_layer_norm, use_input_layer_norm, budget)]
-                values = [getattr(r, metric_attr) for r in runs]
-                means.append(np.mean(values))
-                stds.append(np.std(values))
-            ax_budget.errorbar(
-                row_budgets,
-                means,
-                yerr=stds,
-                marker="o",
-                capsize=3,
-                label=system,
-                color="tab:blue",
-            )
+        # across seeds.
+        means = []
+        stds = []
+        for budget in row_budgets:
+            values = [getattr(r, metric_attr) for r in budgets_data[budget]]
+            means.append(np.mean(values))
+            stds.append(np.std(values))
+        ax_budget.errorbar(row_budgets, means, yerr=stds, marker="o", capsize=3, color="tab:blue")
         ax_budget.set_xscale("log", base=2)
-        ax_budget.set_xticks(budgets)
-        ax_budget.set_xticklabels(budgets)
+        ax_budget.set_xticks(all_budgets)
+        ax_budget.set_xticklabels(all_budgets)
         ax_budget.set_xlabel("Compute budget (min_steps == max_steps)")
         if row == 0:
             ax_budget.set_title("Final performance vs. budget")
         ax_budget.grid(True, alpha=0.3)
-        if len(systems) > 1:
-            ax_budget.legend(fontsize=8)
 
-    fig.suptitle(title or env, y=1.0, fontsize=14)
+    fig.suptitle(title or f"{env} - {arch}", y=1.0, fontsize=14)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=150)
     print(f"Saved plot to {output_path}")
@@ -391,26 +381,22 @@ def main() -> None:
         "results_dirs", type=Path, nargs="+", help="One or more *_fixed_budget_sweep.py output directories."
     )
     parser.add_argument(
-        "--select-by",
-        choices=["discounted", "undiscounted"],
-        default="discounted",
-        help="Which return to use when picking the best hyperparameter combination per "
-        "(env, system, arch, budget) point (default: discounted, matching the actual "
-        "training objective).",
-    )
-    parser.add_argument(
         "--metric",
         choices=["discounted", "undiscounted"],
-        default=None,
-        help="Which return to plot as 'performance' (default: same as --select-by).",
+        default="discounted",
+        help="Which return to plot as 'performance' (default: discounted, matching the actual "
+        "training objective).",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("."),
-        help="Directory to write one '<env>_fixed_budget_sweep.png' plot into per environment.",
+        help="Directory to write one '<env>_<arch>_fixed_budget_sweep.png' plot into per "
+        "(env, arch) pair.",
     )
-    parser.add_argument("--title", default=None, help="Optional title prefix (env name is appended).")
+    parser.add_argument(
+        "--title", default=None, help="Optional title prefix (env and arch are appended)."
+    )
     args = parser.parse_args()
 
     results = collect_results(args.results_dirs)
@@ -418,15 +404,15 @@ def main() -> None:
         print("No usable runs found.", file=sys.stderr)
         sys.exit(1)
 
-    metric = args.metric or args.select_by
-    best = select_best_hyperparams(results, args.select_by)
-    envs = sorted({env for env, *_ in best})
+    grouped = group_all_variants(results)
+    env_archs = sorted({(row_key[0], row_key[1]) for row_key in grouped})
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    for env in envs:
-        title = f"{args.title} - {env}" if args.title else env
-        output_path = args.output_dir / f"{env}_fixed_budget_sweep.png"
-        plot_env(env, best, metric, output_path, title)
+    for env, arch in env_archs:
+        row_keys = sorted(rk for rk in grouped if rk[0] == env and rk[1] == arch)
+        title = f"{args.title} - {env} - {arch}" if args.title else f"{env} - {arch}"
+        output_path = args.output_dir / f"{env}_{arch}_fixed_budget_sweep.png"
+        plot_env_arch(env, arch, row_keys, grouped, args.metric, output_path, title)
 
 
 if __name__ == "__main__":
