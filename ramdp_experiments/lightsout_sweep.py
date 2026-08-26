@@ -295,7 +295,13 @@ class Job:
             # input_layer), so this applies to them too. Not swept for
             # transformer_explicit_cot (TransformerExplicitCoTTorso keeps its
             # own yaml default instead).
-            cmd.append(f"network.actor_network.pre_torso.num_layers={self.num_layers}")
+            # `++` (override-or-add), not `=`: only transformer_compute.yaml/
+            # cnn_transformer_compute.yaml declare num_layers already (it
+            # pre-existed there); mlp/gru/iru's yaml configs never had the key
+            # added (only the Python dataclass default), so a plain `=`
+            # override fails with "Key 'num_layers' is not in struct" for
+            # those architectures.
+            cmd.append(f"++network.actor_network.pre_torso.num_layers={self.num_layers}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to

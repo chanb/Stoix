@@ -54,12 +54,15 @@ from stoix.base_types import (
     AnakinExperimentOutput,
     CriticApply,
     LearnerFn,
-    OnPolicyLearnerState,
 )
 from stoix.networks.base import FeedForwardCritic as Critic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.explicit_cot_types import ExplicitCoTTransition as Transition
+from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
+    RamdpOnPolicyLearnerState,
+    update_discounted_return,
+)
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
@@ -119,7 +122,7 @@ def get_learner_fn(
     apply_fns: Tuple[ActorApply, CriticApply],
     update_fns: Tuple[optax.TransformUpdateFn, optax.TransformUpdateFn],
     config: DictConfig,
-) -> LearnerFn[OnPolicyLearnerState]:
+) -> LearnerFn[RamdpOnPolicyLearnerState]:
     """Get the learner function."""
 
     # Get apply and update functions for actor and critic networks.
@@ -127,13 +130,22 @@ def get_learner_fn(
     actor_update_fn, critic_update_fn = update_fns
 
     def _update_step(
-        learner_state: OnPolicyLearnerState, _: Any
-    ) -> Tuple[OnPolicyLearnerState, Tuple]:
+        learner_state: RamdpOnPolicyLearnerState, _: Any
+    ) -> Tuple[RamdpOnPolicyLearnerState, Tuple]:
         def _env_step(
-            learner_state: OnPolicyLearnerState, _: Any
-        ) -> Tuple[OnPolicyLearnerState, Transition]:
+            learner_state: RamdpOnPolicyLearnerState, _: Any
+        ) -> Tuple[RamdpOnPolicyLearnerState, Transition]:
             """Step the environment."""
-            params, opt_states, key, env_state, last_timestep = learner_state
+            (
+                params,
+                opt_states,
+                key,
+                env_state,
+                last_timestep,
+                running_cum_compute_time,
+                running_discounted_return,
+                episode_discounted_return,
+            ) = learner_state
 
             # SELECT ACTION
             key, policy_key, halting_key = jax.random.split(key, 3)
@@ -150,7 +162,23 @@ def get_learner_fn(
 
             # LOG EPISODE METRICS
             done = timestep.last().reshape(-1)
-            info = timestep.extras["episode_metrics"]
+            (
+                running_cum_compute_time,
+                running_discounted_return,
+                episode_discounted_return,
+            ) = update_discounted_return(
+                running_cum_compute_time,
+                running_discounted_return,
+                episode_discounted_return,
+                compute_time,
+                timestep.reward,
+                done,
+                config.system.gamma,
+            )
+            info = {
+                **timestep.extras["episode_metrics"],
+                "episode_discounted_return": episode_discounted_return,
+            }
 
             transition = Transition(
                 done,
@@ -162,7 +190,16 @@ def get_learner_fn(
                 compute_time,
                 thought_tokens,
             )
-            learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
+            learner_state = RamdpOnPolicyLearnerState(
+                params,
+                opt_states,
+                key,
+                env_state,
+                timestep,
+                running_cum_compute_time,
+                running_discounted_return,
+                episode_discounted_return,
+            )
             return learner_state, transition
 
         # STEP ENVIRONMENT FOR ROLLOUT LENGTH
@@ -171,7 +208,16 @@ def get_learner_fn(
         )
 
         # CALCULATE ADVANTAGE
-        params, opt_states, key, env_state, last_timestep = learner_state
+        (
+            params,
+            opt_states,
+            key,
+            env_state,
+            last_timestep,
+            running_cum_compute_time,
+            running_discounted_return,
+            episode_discounted_return,
+        ) = learner_state
         last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
         # Swap the batch and time axes.
         traj_batch = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), traj_batch)
@@ -318,15 +364,22 @@ def get_learner_fn(
             **critic_loss_info,
         }
 
-        learner_state = OnPolicyLearnerState(
-            new_params, new_opt_state, key, env_state, last_timestep
+        learner_state = RamdpOnPolicyLearnerState(
+            new_params,
+            new_opt_state,
+            key,
+            env_state,
+            last_timestep,
+            running_cum_compute_time,
+            running_discounted_return,
+            episode_discounted_return,
         )
         metric = traj_batch.info
         return learner_state, (metric, loss_info)
 
     def learner_fn(
-        learner_state: OnPolicyLearnerState,
-    ) -> AnakinExperimentOutput[OnPolicyLearnerState]:
+        learner_state: RamdpOnPolicyLearnerState,
+    ) -> AnakinExperimentOutput[RamdpOnPolicyLearnerState]:
 
         batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
 
@@ -344,7 +397,7 @@ def get_learner_fn(
 
 def learner_setup(
     env: Environment, keys: chex.Array, config: DictConfig
-) -> Tuple[LearnerFn[OnPolicyLearnerState], Actor, OnPolicyLearnerState]:
+) -> Tuple[LearnerFn[RamdpOnPolicyLearnerState], Actor, RamdpOnPolicyLearnerState]:
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.
     n_devices = len(jax.devices())
@@ -445,9 +498,25 @@ def learner_setup(
     # Duplicate learner across devices.
     replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
-    # Initialise learner state.
+    # Initialise learner state. running_cum_compute_time/running_discounted_return/
+    # episode_discounted_return (see RamdpOnPolicyLearnerState) start at 0 for every
+    # env - shape matches env_states/timesteps' leading (devices, update_batch_size,
+    # num_envs) dims, since these are per-env running accumulators, not replicated
+    # network state.
     params, opt_states = replicate_learner
-    init_learner_state = OnPolicyLearnerState(params, opt_states, step_keys, env_states, timesteps)
+    zeros_per_env = jnp.zeros(
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs), dtype=jnp.float32
+    )
+    init_learner_state = RamdpOnPolicyLearnerState(
+        params,
+        opt_states,
+        step_keys,
+        env_states,
+        timesteps,
+        zeros_per_env,
+        zeros_per_env,
+        zeros_per_env,
+    )
 
     return learn, actor_network, init_learner_state
 
