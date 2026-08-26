@@ -33,6 +33,10 @@ Grid axes:
                  that re-feeds the encoded observation every pondering step) |
                  iru (IRUAdaptiveComputationTimeTorso, interpolation-recurrent-
                  unit-based recurrent block, same re-feeding) |
+                 iru_unshared (UnsharedIRUAdaptiveComputationTimeTorso - like
+                 iru, but each pondering step is its own independently-
+                 parameterized IRU layer instead of one shared step reused at
+                 every iteration, so max_steps grows the parameter count) |
                  transformer_explicit_cot (TransformerExplicitCoTTorso, explicit
                  token CoT - only implemented for system=ff_reinforce, via
                  stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py; requested
@@ -127,7 +131,7 @@ SYSTEM_TO_QAC_VARIANT = {"ff_qac_fac": "fac", "ff_qac_naive": "naive"}
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
-        "mlp_unshared": "mlp_unshared_compute",
+        "iru_unshared": "iru_unshared_compute",
         "transformer": "transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
@@ -138,7 +142,7 @@ ARCH_TO_NETWORK = {
     },
     "ff_qac_fac": {
         "mlp": "mlp_compute_qac",
-        "mlp_unshared": "mlp_unshared_compute_qac",
+        "iru_unshared": "iru_unshared_compute_qac",
         "transformer": "transformer_compute_qac",
         "gru": "gru_compute_qac",
         "iru": "iru_compute_qac",
@@ -149,7 +153,7 @@ ARCH_TO_NETWORK = {
     },
     "ff_qac_naive": {
         "mlp": "mlp_compute_qac",
-        "mlp_unshared": "mlp_unshared_compute_qac",
+        "iru_unshared": "iru_unshared_compute_qac",
         "transformer": "transformer_compute_qac",
         "gru": "gru_compute_qac",
         "iru": "iru_compute_qac",
@@ -161,9 +165,9 @@ ARCH_TO_NETWORK = {
 }
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
-# both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso, and
-# IRUAdaptiveComputationTimeTorso. Used to pick the right LayerNorm overrides
-# in Job.command().
+# both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso,
+# IRUAdaptiveComputationTimeTorso, and UnsharedIRUAdaptiveComputationTimeTorso.
+# Used to pick the right LayerNorm overrides in Job.command().
 NO_LAYER_NORM_ARCHES = (
     "transformer",
     "cnn+transformer",
@@ -171,6 +175,7 @@ NO_LAYER_NORM_ARCHES = (
     "cnn+gru",
     "iru",
     "cnn+iru",
+    "iru_unshared",
 )
 # Architectures whose input_layer is a CNNTorso (need the CNN-specific
 # overrides below instead of the flatten-observation wrapper).
@@ -514,9 +519,11 @@ def main() -> None:
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
-        help="Comma-separated subset of {mlp, transformer, gru, iru, transformer_explicit_cot, "
-        "cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}. transformer_explicit_cot "
-        "(TransformerExplicitCoTTorso) is only "
+        help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, "
+        "transformer_explicit_cot, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}. iru_unshared "
+        "(UnsharedIRUAdaptiveComputationTimeTorso) is like iru but with no weight sharing across "
+        "pondering steps - each step is its own independently-parameterized IRU layer. "
+        "transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
         f"implemented for system in {EXPLICIT_COT_SYSTEMS} - other (system, architecture) combos "
         "requesting it are skipped, not errored.",
     )
@@ -655,7 +662,14 @@ def main() -> None:
         assert GRID_SIZE_RE.match(g), f"invalid grid size {g!r}, expected 'MxN' (e.g. '3x3')"
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
-    valid_architectures = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
+    valid_architectures = (
+        "mlp",
+        "iru_unshared",
+        "transformer",
+        "gru",
+        "iru",
+        EXPLICIT_COT_ARCH,
+    ) + CNN_ARCHES
     for a in args.architectures:
         assert a in valid_architectures, f"unknown architecture {a!r}, expected one of {valid_architectures}"
     for b in args.budget:
