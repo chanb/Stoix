@@ -262,6 +262,178 @@ class AdaptiveComputationTimeTorso(nn.Module):
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
+class UnsharedAdaptiveComputationTimeTorso(nn.Module):
+    """Like `AdaptiveComputationTimeTorso`, but with no weight sharing across
+    pondering steps: each of the `max_steps` steps gets its own
+    independently-parameterized `ACTStep` (a fresh `Dense[+...] ->
+    activation -> halting head`), rather than one shared step reused at
+    every iteration. So this is a genuinely deep, unshared stack of up to
+    `max_steps` distinct layers - not a weight-tied recurrent block -
+    "adaptive computation time" in the sense that halting can still stop
+    early anywhere in that stack, but each depth reached is its own
+    dedicated layer rather than another application of the same one.
+    `compute_time` accordingly means "how many of these distinct layers were
+    used", not "how many times was the shared step applied."
+
+    Deliberately a separate class from `AdaptiveComputationTimeTorso` (not a
+    shared-vs-unshared flag on it), since the two have a genuinely different
+    parameter count/growth behaviour as `max_steps` changes - increasing
+    `max_steps` here adds a whole new layer's worth of parameters, whereas
+    for the shared version it's free.
+
+    Same sampled/replayed/deterministic halting modes, `min_steps`/
+    `max_steps` semantics (see that class's docstring), `num_layers`
+    stacking *within* each step (see `ACTStep`), and latent-convergence
+    diagnostics as `AdaptiveComputationTimeTorso` - only how `step_fn` is
+    instantiated differs (see `__call__`).
+    """
+
+    hidden_dim: int
+    max_steps: int = 10
+    min_steps: int = 1
+    num_layers: int = 1
+    activation: str = "relu"
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    use_input_layer_norm: bool = False
+    use_layer_norm: bool = False
+    convergence_threshold: float = 0.1
+
+    @nn.compact
+    def __call__(
+        self,
+        observation: chex.Array,
+        rng: Optional[chex.PRNGKey] = None,
+        target_compute_time: Optional[chex.Array] = None,
+        deterministic: bool = False,
+    ) -> Tuple[chex.Array, ...]:
+        """
+        Args:
+            observation: the input embedding to ponder over.
+            rng: PRNG key used to sample halting decisions. Required unless
+                `target_compute_time` is given or `deterministic=True`.
+            target_compute_time: if given (e.g. `Transition.compute_time`
+                from a prior rollout), halting is *not* sampled - instead the
+                trajectory is replayed deterministically to halt at exactly
+                this many steps per example, and the returned second output
+                is `halting_log_prob`: the log-probability of that exact
+                halting trajectory under the current parameters. Use this in
+                loss functions.
+            deterministic: if True (and `target_compute_time` is None), halt
+                as soon as the halting probability crosses 0.5 instead of
+                sampling. Useful for greedy evaluation.
+
+        Returns:
+            `(embedding, compute_time, first_convergence_step,
+            num_close_steps)` when `target_compute_time` is None, or
+            `(embedding, halting_log_prob)` when replaying a known
+            trajectory (see class docstring for the convergence diagnostics).
+        """
+        batch_shape = observation.shape[:-1]
+        replaying = target_compute_time is not None
+        if not replaying and not deterministic:
+            if rng is None:
+                raise ValueError(
+                    "rng must be provided to UnsharedAdaptiveComputationTimeTorso when sampling "
+                    "(i.e. target_compute_time is None and deterministic=False)."
+                )
+        if not (1 <= self.min_steps <= self.max_steps):
+            raise ValueError(
+                f"min_steps must be between 1 and max_steps ({self.max_steps}), "
+                f"got min_steps={self.min_steps}."
+            )
+
+        # Project into the pondering width once up front, so every step's
+        # (separately-parameterized) ACTStep sees a `hidden_dim`-sized state.
+        if self.use_input_layer_norm:
+            observation = nn.LayerNorm()(observation)
+        state = parse_activation_fn(self.activation)(
+            nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+        )
+
+        still_running = jnp.ones(batch_shape, dtype=bool)
+        num_steps_taken = jnp.zeros(batch_shape)
+        halting_log_prob = jnp.zeros(batch_shape)
+        final_state = state
+        first_convergence_step = jnp.full(batch_shape, -1.0)
+        num_close_steps = jnp.zeros(batch_shape)
+
+        for step in range(self.max_steps):
+            prev_state = state
+            # A fresh ACTStep instance per step (unique `name`), unlike
+            # AdaptiveComputationTimeTorso's single `step_fn` created once
+            # outside this loop and reused - this is what makes every step's
+            # parameters independent rather than shared/tied.
+            step_fn = ACTStep(
+                self.hidden_dim,
+                self.num_layers,
+                self.activation,
+                self.kernel_init,
+                use_layer_norm=self.use_layer_norm,
+                name=f"act_step_{step}",
+            )
+            state, halting_prob = step_fn(state)
+            step_count = step + 1
+            is_final_step = step_count == self.max_steps
+            can_halt = step_count >= self.min_steps
+
+            if not replaying and step > 0:
+                # Only meaningful from the second step on (step 0 has no
+                # previous ACT-step state to compare against), and only while
+                # still running - once an example has halted, `state` keeps
+                # being recomputed (the loop is unrolled over every example)
+                # but that continuation is discarded, so it says nothing
+                # about the example's real trajectory.
+                l2_dist = jnp.linalg.norm(state - prev_state, axis=-1)
+                is_close = still_running & (l2_dist < self.convergence_threshold)
+                num_close_steps = num_close_steps + is_close.astype(jnp.float32)
+                first_convergence_step = jnp.where(
+                    is_close & (first_convergence_step < 0),
+                    jnp.float32(step_count),
+                    first_convergence_step,
+                )
+
+            if replaying:
+                halts_this_step = still_running & (
+                    ((step_count >= target_compute_time) & can_halt) | is_final_step
+                )
+            elif deterministic:
+                halts_this_step = still_running & (
+                    ((halting_prob >= 0.5) & can_halt) | is_final_step
+                )
+            else:
+                rng, step_rng = jax.random.split(rng)
+                sampled_halt = jax.random.bernoulli(step_rng, halting_prob)
+                halts_this_step = still_running & ((sampled_halt & can_halt) | is_final_step)
+
+            # Halting is forced (not a free policy choice) before min_steps or at
+            # max_steps - stop-gradient halting_prob there so REINFORCE doesn't
+            # credit/blame the halting head for an outcome it didn't control.
+            is_forced_step = (step_count < self.min_steps) or is_final_step
+            halting_prob_for_log = jnp.where(
+                is_forced_step, jax.lax.stop_gradient(halting_prob), halting_prob
+            )
+            step_log_prob = jnp.where(
+                halts_this_step,
+                jnp.log(halting_prob_for_log),
+                jnp.log(1.0 - halting_prob_for_log),
+            )
+            # Forced steps (before min_steps, or the forced halt at max_steps)
+            # contribute no log prob: the true probability of a forced outcome
+            # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
+            # reflect a "choice" the policy never actually got to make.
+            halting_log_prob = halting_log_prob + jnp.where(
+                jnp.logical_and(still_running, not is_forced_step), step_log_prob, 0.0
+            )
+            num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
+            final_state = jnp.where(halts_this_step[..., None], state, final_state)
+
+            still_running = still_running & (~halts_this_step)
+
+        if replaying:
+            return final_state, halting_log_prob
+        return final_state, num_steps_taken, first_convergence_step, num_close_steps
+
+
 class RecurrentACTStep(nn.Module):
     """A single shared computation step for `GRUAdaptiveComputationTimeTorso`:
     unlike `ACTStep` (which only ever sees its own running state, having
