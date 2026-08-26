@@ -1,0 +1,17 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ramdp_vpg/ff_ppo
+  - network: mlp_compute
+  - env: gymnax/cartpole
+  - _self_
+
+# The "reinforce" (G - V) qac_variant uses a plain V-only critic
+# (network: mlp_compute), unlike the default "fac"/"naive" (Q - V) variants
+# which use network: mlp_compute_qac - see stoix/configs/system/ramdp_vpg/ff_ppo.yaml.
+system:
+  qac_variant: reinforce
+
+hydra:
+  searchpath:
+    - file://stoix/configs
