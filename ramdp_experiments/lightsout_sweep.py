@@ -31,7 +31,14 @@ Grid axes:
   - grid_size:   Lights Out puzzle grid, e.g. "3x3" - sets env.scenario.name=
                  lightsout-<grid_size> and env.kwargs.episode_length=m*n
                  (overridable via --episode-length)
-  - system:      ff_reinforce (PonderNet-style REINFORCE) | ff_qac_fac | ff_qac_naive
+  - system:      ff_reinforce (PonderNet-style REINFORCE, G - V) | ff_qac_fac (Q - V,
+                 runtime-factorized) | ff_qac_naive (Q - V, full table) | ff_ppo_fac
+                 (PPO, Q - V runtime-factorized) | ff_ppo_naive (PPO, Q - V full table) |
+                 ff_ppo_reinforce (PPO, G - V REINFORCE-with-baseline). The ff_ppo_*
+                 systems train stoix/systems/ramdp_vpg/ff_ppo.py - PPO's clipped
+                 surrogate over several epochs of minibatch updates per rollout,
+                 vs. one REINFORCE/QAC gradient step per rollout for the others -
+                 see --epochs/--num-minibatches/--clip-eps.
   - architecture: mlp (AdaptiveComputationTimeTorso) | transformer
                  (TransformerChainOfThoughtTorso, latent CoT) |
                  gru (GRUAdaptiveComputationTimeTorso, GRU-based recurrent block
@@ -64,7 +71,15 @@ Grid axes:
   - critic_lr:   system.critic_lr - has its own value list, independent of lr's
   - delightful:  whether to gate the REINFORCE weight by the "delightful" surprisal
                  sigmoid (system.delightful); off by default. When on, also sweeps
-                 delightful_eta (system.delightful_eta).
+                 delightful_eta (system.delightful_eta). Not supported by the
+                 ff_ppo_* systems (forced off - see PPO_SYSTEMS).
+  - epochs:      system.epochs - PPO epochs per rollout; swept independently of
+                 num_minibatches/clip_eps (full cross product). ff_ppo_* systems
+                 only, forced to the first requested value otherwise.
+  - num_minibatches: system.num_minibatches - PPO minibatches per epoch; ff_ppo_*
+                 systems only, see epochs.
+  - clip_eps:    system.clip_eps - PPO ratio/value clipping; ff_ppo_* systems only,
+                 see epochs.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
                  cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
@@ -123,6 +138,8 @@ Usage:
   python ramdp_experiments/lightsout_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
   python ramdp_experiments/lightsout_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
   python ramdp_experiments/lightsout_sweep.py --difficulty-threshold 0.3  # easier training goals
+  python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
+      --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
 """
 
 from __future__ import annotations
@@ -146,8 +163,28 @@ SYSTEM_TO_SCRIPT = {
     "ff_reinforce": "stoix/systems/ramdp_vpg/ff_reinforce.py",
     "ff_qac_fac": "stoix/systems/ramdp_vpg/ff_qac.py",
     "ff_qac_naive": "stoix/systems/ramdp_vpg/ff_qac.py",
+    # PPO (ff_ppo.py) reuses the same "qac_variant" config knob as ff_qac.py to
+    # select its advantage estimator, extended with a "reinforce" (G - V)
+    # value - see SYSTEM_TO_QAC_VARIANT and stoix/systems/ramdp_vpg/ff_ppo.py's
+    # module docstring.
+    "ff_ppo_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
+    "ff_ppo_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
+    "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
 }
-SYSTEM_TO_QAC_VARIANT = {"ff_qac_fac": "fac", "ff_qac_naive": "naive"}
+SYSTEM_TO_QAC_VARIANT = {
+    "ff_qac_fac": "fac",
+    "ff_qac_naive": "naive",
+    "ff_ppo_fac": "fac",
+    "ff_ppo_naive": "naive",
+    "ff_ppo_reinforce": "reinforce",
+}
+# Systems trained by ff_ppo.py (PPO's clipped surrogate, several epochs of
+# minibatch updates per rollout) rather than ff_reinforce.py/ff_qac.py (a
+# single REINFORCE/QAC gradient step per rollout) - these get the
+# epochs/num_minibatches/clip_eps axes (see Job.command()) and don't support
+# system.delightful (ff_ppo.py doesn't have that knob - see its module
+# docstring for why).
+PPO_SYSTEMS = ("ff_ppo_fac", "ff_ppo_naive", "ff_ppo_reinforce")
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
@@ -183,6 +220,13 @@ ARCH_TO_NETWORK = {
         "cnn+iru": "cnn_iru_compute_qac",
     },
 }
+# ff_ppo_fac/ff_ppo_naive use the same Q-V critic (ValueAndQCritic) as
+# ff_qac_fac/ff_qac_naive; ff_ppo_reinforce uses the same plain V-only critic
+# as ff_reinforce - so they reuse those networks' (arch -> network) mappings
+# rather than duplicating them.
+ARCH_TO_NETWORK["ff_ppo_fac"] = ARCH_TO_NETWORK["ff_qac_fac"]
+ARCH_TO_NETWORK["ff_ppo_naive"] = ARCH_TO_NETWORK["ff_qac_naive"]
+ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
 # both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso,
@@ -230,6 +274,9 @@ class Job:
     critic_lr: float
     delightful: bool
     delightful_eta: float
+    epochs: int
+    num_minibatches: int
+    clip_eps: float
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -266,6 +313,11 @@ class Job:
         # TRANSFORMER_ARCHES/build_grid.
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
             name += f"-num_heads_{self.num_heads}"
+        # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
+        # exist for ff_reinforce.py/ff_qac.py (single gradient step per
+        # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
+        if self.system in PPO_SYSTEMS:
+            name += f"-epochs_{self.epochs}-minibatches_{self.num_minibatches}-clip_{self.clip_eps:g}"
         if self.delightful:
             name += f"-delightful_eta_{self.delightful_eta:g}"
         if self.use_layer_norm:
@@ -308,9 +360,18 @@ class Job:
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
             f"system.ent_coef=0.01",
-            f"system.delightful={self.delightful}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
+        if self.system in PPO_SYSTEMS:
+            # epochs/num_minibatches/clip_eps: PPO-specific hyperparameters,
+            # not present in ff_reinforce.py/ff_qac.py's system config - see
+            # ff_ppo.yaml. ff_ppo.py also has no system.delightful knob (see
+            # its module docstring), so that override is skipped here.
+            cmd.append(f"system.epochs={self.epochs}")
+            cmd.append(f"system.num_minibatches={self.num_minibatches}")
+            cmd.append(f"system.clip_eps={self.clip_eps:g}")
+        else:
+            cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
             # Attention head count - TransformerChainOfThoughtTorso/
             # TransformerExplicitCoTTorso only (see TRANSFORMER_ARCHES).
@@ -379,6 +440,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         else:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
+
+    # (epochs, num_minibatches, clip_eps) combos: only meaningful for PPO_SYSTEMS
+    # (ff_ppo.py) - forced to the first requested value for every other system
+    # in the main product loop below, then deduplicated by run_name, mirroring
+    # how delightful_combos/num_heads_options collapse axes that don't apply.
+    ppo_combos = list(itertools.product(args.epochs, args.num_minibatches, args.clip_eps))
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads) combos:
     #  - transformer_explicit_cot only exists for ff_reinforce (see
@@ -464,6 +531,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         lr,
         critic_lr,
         (delightful, delightful_eta),
+        (epochs, num_minibatches, clip_eps),
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -473,8 +541,16 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.lr,
         args.critic_lr,
         delightful_combos,
+        ppo_combos,
         range(args.seeds),
     ):
+        # Neither axis applies to both kinds of system at once (see
+        # PPO_SYSTEMS) - force the inapplicable one to its default so a sweep
+        # over both doesn't multiply out into identical duplicate jobs.
+        if system in PPO_SYSTEMS:
+            delightful, delightful_eta = False, args.delightful_eta[0]
+        else:
+            epochs, num_minibatches, clip_eps = ppo_combos[0]
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         jobs.append(
@@ -489,6 +565,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_lr=critic_lr,
                 delightful=delightful,
                 delightful_eta=delightful_eta,
+                epochs=epochs,
+                num_minibatches=num_minibatches,
+                clip_eps=clip_eps,
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
                 num_layers=num_layers,
@@ -503,7 +582,26 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 wandb_project=args.wandb_project,
             )
         )
-    return jobs
+
+    # Collapsing the inapplicable axis above (delightful for PPO_SYSTEMS,
+    # epochs/num_minibatches/clip_eps for everything else) can produce
+    # duplicate run_names (e.g. sweeping --delightful true,false together with
+    # a PPO system) - dedupe rather than schedule two jobs that would write to
+    # the same output directory.
+    seen_run_names = set()
+    deduped_jobs = []
+    for job in jobs:
+        if job.run_name in seen_run_names:
+            continue
+        seen_run_names.add(job.run_name)
+        deduped_jobs.append(job)
+    n_deduped = len(jobs) - len(deduped_jobs)
+    if n_deduped:
+        print(
+            f"Deduplicated {n_deduped} job(s) with identical run_name (an axis not applicable "
+            "to that job's system, e.g. delightful for a PPO system)."
+        )
+    return deduped_jobs
 
 
 def run_job(
@@ -570,7 +668,13 @@ def main() -> None:
     parser.add_argument(
         "--systems",
         default="ff_reinforce,ff_qac_fac,ff_qac_naive",
-        help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive}.",
+        help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive, ff_ppo_fac, "
+        "ff_ppo_naive, ff_ppo_reinforce}. The ff_ppo_* systems train stoix/systems/ramdp_vpg/"
+        "ff_ppo.py (PPO's clipped surrogate, several epochs of minibatch updates per rollout) "
+        "instead of a single REINFORCE/QAC gradient step per rollout - ff_ppo_fac/ff_ppo_naive "
+        "use the same Q-V advantage as ff_qac_fac/ff_qac_naive, ff_ppo_reinforce uses the same "
+        "G-V (REINFORCE-with-baseline) advantage as ff_reinforce. See --epochs/--num-minibatches/"
+        "--clip-eps (PPO-only; system.delightful is not supported by ff_ppo.py).",
     )
     parser.add_argument(
         "--architectures",
@@ -621,6 +725,26 @@ def main() -> None:
         "--delightful-eta",
         default="1.0",
         help="Comma-separated system.delightful_eta values, swept only for delightful=true jobs.",
+    )
+    parser.add_argument(
+        "--epochs",
+        default="4",
+        help="Comma-separated system.epochs values (PPO epochs per rollout), swept independently "
+        "of --num-minibatches/--clip-eps (full cross product). Only applies to PPO systems "
+        "(ff_ppo_fac, ff_ppo_naive, ff_ppo_reinforce) - ignored (forced to the first value) for "
+        "ff_reinforce/ff_qac_*, which take one gradient step per rollout.",
+    )
+    parser.add_argument(
+        "--num-minibatches",
+        default="16",
+        help="Comma-separated system.num_minibatches values (PPO minibatches per epoch), swept "
+        "independently of --epochs/--clip-eps. PPO systems only, see --epochs.",
+    )
+    parser.add_argument(
+        "--clip-eps",
+        default="0.2",
+        help="Comma-separated system.clip_eps values (PPO ratio/value clipping), swept "
+        "independently of --epochs/--num-minibatches. PPO systems only, see --epochs.",
     )
     parser.add_argument(
         "--use-layer-norm",
@@ -728,6 +852,9 @@ def main() -> None:
     args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
+    args.epochs = [int(x) for x in args.epochs.split(",")]
+    args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
+    args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
@@ -757,6 +884,12 @@ def main() -> None:
         assert n >= 1, f"num_layers must be >= 1, got {n}"
     for n in args.num_heads:
         assert n >= 1, f"num_heads must be >= 1, got {n}"
+    for e in args.epochs:
+        assert e >= 1, f"epochs must be >= 1, got {e}"
+    for m in args.num_minibatches:
+        assert m >= 1, f"num_minibatches must be >= 1, got {m}"
+    for c in args.clip_eps:
+        assert c > 0, f"clip_eps must be > 0, got {c}"
 
     if args.gpus == "auto":
         try:
@@ -792,7 +925,11 @@ def main() -> None:
         f"seeds=0..{args.seeds - 1}"
     )
     print(f"  lr={args.lr} critic_lr={args.critic_lr}")
-    print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta}")
+    print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
+    print(
+        f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
+        f"(PPO systems only: {PPO_SYSTEMS})"
+    )
     print(
         f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "
         f"use_input_layer_norm={args.use_input_layer_norm} (not transformer_explicit_cot)"
