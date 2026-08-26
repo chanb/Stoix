@@ -1,0 +1,49 @@
+# ---CNN(ResNet)+IRU Compute-Time-Aware REINFORCE Networks---
+# Same IRU-based Adaptive Computation Time torso as cnn_iru_compute.yaml (see
+# that file's comment), but with a ResNet-style input_layer
+# (stoix.networks.resnet.VisualResNetTorso, IMPALA-style residual blocks)
+# instead of the plain CNNTorso - matches the "Boxpick" architecture spec
+# (single IRU layer; ResNet input encoder of two residual blocks, four
+# hidden layers each, all dims 256; box_block/BoxMoving's own grid is small
+# (e.g. 6x6), so downsampling_strategies is "none" (stride-1 channel
+# projection only) to avoid pooling away per-cell resolution.
+actor_network:
+  input_layer:
+    _target_: stoix.networks.resnet.VisualResNetTorso
+    channels_per_group: [256]
+    blocks_per_group: [2]
+    layers_per_block: 4
+    downsampling_strategies: ["none"]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False # BoxMovingToStoa's grid observation is already (H, W, C).
+    hidden_sizes: [256]
+    normalize_inputs: False # observation is already a {0, 1} factored-channel encoding.
+  pre_torso:
+    _target_: stoix.networks.torso_compute.IRUAdaptiveComputationTimeTorso
+    hidden_dim: 256
+    max_steps: 10
+    min_steps: 1
+    use_input_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  input_layer:
+    _target_: stoix.networks.resnet.VisualResNetTorso
+    channels_per_group: [256]
+    blocks_per_group: [2]
+    layers_per_block: 4
+    downsampling_strategies: ["none"]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False
+    hidden_sizes: [256]
+    normalize_inputs: False
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead

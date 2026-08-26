@@ -19,29 +19,23 @@ class ResidualBlock(nn.Module):
     make_inner_op: MakeInnerOp
     non_linearity: NonLinearity = jax.nn.relu
     use_layer_norm: bool = False
+    layers_per_block: int = 2
 
     def setup(self) -> None:
-        self.inner_op1 = self.make_inner_op()
-        self.inner_op2 = self.make_inner_op()
-
+        self.inner_ops = [self.make_inner_op() for _ in range(self.layers_per_block)]
         if self.use_layer_norm:
-            self.layernorm1 = nn.LayerNorm(use_scale=True, use_bias=True, epsilon=1e-6)
-            self.layernorm2 = nn.LayerNorm(use_scale=True, use_bias=True, epsilon=1e-6)
+            self.layernorms = [
+                nn.LayerNorm(use_scale=True, use_bias=True, epsilon=1e-6)
+                for _ in range(self.layers_per_block)
+            ]
 
     def __call__(self, x: chex.Array) -> chex.Array:
         output = x
-
-        # First layer in residual block.
-        if self.use_layer_norm:
-            output = self.layernorm1(output)
-        output = self.non_linearity(output)
-        output = self.inner_op1(output)
-
-        # Second layer in residual block.
-        if self.use_layer_norm:
-            output = self.layernorm2(output)
-        output = self.non_linearity(output)
-        output = self.inner_op2(output)
+        for i, inner_op in enumerate(self.inner_ops):
+            if self.use_layer_norm:
+                output = self.layernorms[i](output)
+            output = self.non_linearity(output)
+            output = inner_op(output)
         return x + output
 
 
@@ -50,6 +44,7 @@ class DownsamplingStrategy(enum.Enum):
     CONV_MAX = "conv+max"  # Used in IMPALA
     LAYERNORM_RELU_CONV = "layernorm+relu+conv"  # Used in MuZero
     CONV = "conv"
+    NONE = "none"  # Stride-1 channel projection only - no spatial reduction.
 
 
 def make_downsampling_layer(
@@ -97,6 +92,21 @@ def make_downsampling_layer(
                 lambda x: nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME"),
             ]
         )
+    elif strategy is DownsamplingStrategy.NONE:
+        # Stride-1: only projects the channel dimension up to output_channels
+        # (needed so the following ResidualBlock's `x + output` residual add
+        # is shape-compatible) - for small grids where spatial resolution
+        # (e.g. individual cell identity) shouldn't be pooled away.
+        return nn.Sequential(
+            [
+                nn.Conv(
+                    features=output_channels,
+                    kernel_size=(3, 3),
+                    strides=(1, 1),
+                    kernel_init=nn.initializers.truncated_normal(1e-2),
+                ),
+            ]
+        )
     else:
         raise ValueError(
             "Unrecognized downsampling strategy. Expected one of"
@@ -110,6 +120,7 @@ class VisualResNetTorso(nn.Module):
 
     channels_per_group: Sequence[int] = (16, 32, 32)
     blocks_per_group: Sequence[int] = (2, 2, 2)
+    layers_per_block: int = 2
     downsampling_strategies: Sequence[DownsamplingStrategy] = (DownsamplingStrategy.CONV,) * 3
     hidden_sizes: Sequence[int] = (256,)
     use_layer_norm: bool = False
@@ -152,6 +163,7 @@ class VisualResNetTorso(nn.Module):
                     ),
                     use_layer_norm=self.use_layer_norm,
                     non_linearity=parse_activation_fn(self.activation),
+                    layers_per_block=self.layers_per_block,
                 )(output)
 
         output = output.reshape(*observation.shape[:-3], -1)
@@ -167,6 +179,7 @@ class ResNetTorso(nn.Module):
 
     hidden_units_per_group: Sequence[int] = (256, 256, 256)
     blocks_per_group: Sequence[int] = (2, 2, 2)
+    layers_per_block: int = 2
     use_layer_norm: bool = False
     activation: str = "relu"
 
@@ -183,6 +196,7 @@ class ResNetTorso(nn.Module):
                     make_inner_op=functools.partial(nn.Dense, features=num_hidden_units),
                     use_layer_norm=self.use_layer_norm,
                     non_linearity=parse_activation_fn(self.activation),
+                    layers_per_block=self.layers_per_block,
                 )(output)
 
         return output

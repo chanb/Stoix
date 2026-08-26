@@ -50,7 +50,14 @@ Grid axes:
                  cnn+transformer (CNNTorso input_layer feeding
                  TransformerChainOfThoughtTorso) |
                  cnn+gru (CNNTorso input_layer feeding GRUAdaptiveComputationTimeTorso) |
-                 cnn+iru (CNNTorso input_layer feeding IRUAdaptiveComputationTimeTorso)
+                 cnn+iru (VisualResNetTorso input_layer - IMPALA-style residual
+                 blocks, matching the "Boxpick" architecture spec: 2 blocks x 4
+                 hidden layers each, no spatial downsampling - feeding
+                 IRUAdaptiveComputationTimeTorso; see
+                 stoix/configs/network/cnn_resnet_iru_compute.yaml. This is the
+                 only *_fixed_budget_sweep.py script where cnn+iru uses this
+                 ResNet encoder instead of the plain CNNTorso the other cnn+*
+                 arches use)
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
   - lr:          system.actor_lr - has its own value list, independent of critic_lr's
@@ -137,7 +144,13 @@ ARCH_TO_NETWORK = {
         "cnn+mlp": "cnn_mlp_compute",
         "cnn+transformer": "cnn_transformer_compute",
         "cnn+gru": "cnn_gru_compute",
-        "cnn+iru": "cnn_iru_compute",
+        # ResNet-based input_layer (not the plain CNNTorso other cnn+* arches
+        # use here) - matches the "Boxpick" architecture spec, see
+        # cnn_resnet_iru_compute.yaml's comment. This is the only sweep
+        # script pointing "cnn+iru" at it - ARCH_TO_NETWORK is local to each
+        # *_fixed_budget_sweep.py script, so lightsout/sokoban/minatar's
+        # "cnn+iru" still uses the plain-CNNTorso cnn_iru_compute.yaml.
+        "cnn+iru": "cnn_resnet_iru_compute",
     },
     "ff_qac_fac": {
         "mlp": "mlp_compute_qac",
@@ -147,7 +160,7 @@ ARCH_TO_NETWORK = {
         "cnn+mlp": "cnn_mlp_compute_qac",
         "cnn+transformer": "cnn_transformer_compute_qac",
         "cnn+gru": "cnn_gru_compute_qac",
-        "cnn+iru": "cnn_iru_compute_qac",
+        "cnn+iru": "cnn_resnet_iru_compute_qac",
     },
     "ff_qac_naive": {
         "mlp": "mlp_compute_qac",
@@ -157,7 +170,7 @@ ARCH_TO_NETWORK = {
         "cnn+mlp": "cnn_mlp_compute_qac",
         "cnn+transformer": "cnn_transformer_compute_qac",
         "cnn+gru": "cnn_gru_compute_qac",
-        "cnn+iru": "cnn_iru_compute_qac",
+        "cnn+iru": "cnn_resnet_iru_compute_qac",
     },
 }
 # Architectures whose pre_torso has no `use_layer_norm` param - only
@@ -190,7 +203,7 @@ BOX_SETTINGS = {
         number_of_moving_boxes_max=3,
         grid_size=6,
         quarter_size=3,
-        episode_length=100,
+        episode_length=1000,
     ),
     "exact-4": dict(
         number_of_boxes_min=4,
@@ -198,7 +211,7 @@ BOX_SETTINGS = {
         number_of_moving_boxes_max=4,
         grid_size=6,
         quarter_size=3,
-        episode_length=100,
+        episode_length=1000,
     ),
 }
 
@@ -231,6 +244,8 @@ class Job:
     eval_generator_special: bool
     gamma: float
     output_dir: Path
+    wandb: bool
+    wandb_project: str
 
     @property
     def env(self) -> str:
@@ -306,6 +321,15 @@ class Job:
             f"system.delightful={self.delightful}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
+        if self.wandb:
+            # Fixed project name (not derived per-job) so every job in the
+            # sweep lands in the same W&B project. run_id is pinned to
+            # run_name (rather than left to WandBLogger's timestamp-based
+            # unique_token) so two jobs launched in the same second can't
+            # collide on the same W&B run.
+            cmd.append("logger.loggers.wandb.enabled=True")
+            cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
+            cmd.append(f"logger.loggers.wandb.run_id={self.run_name}")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         if self.arch == EXPLICIT_COT_ARCH:
@@ -330,6 +354,21 @@ class Job:
             # (see stoix/envs/block_moving/stoa_adapter.py) - flatten it to a
             # 4 * grid_size^2 vector for non-CNN torsos.
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
+        elif self.arch == "cnn+iru":
+            # cnn_resnet_iru_compute(_qac).yaml's VisualResNetTorso input_layer
+            # (see that file's comment) - tie its channel width/output width to
+            # hidden_dim, same as every other arch's pre_torso.hidden_dim/
+            # input_layer.hidden_sizes below. blocks_per_group/layers_per_block/
+            # downsampling_strategies are left at the yaml's fixed "Boxpick"
+            # spec values (2 blocks x 4 layers each, no spatial downsampling)
+            # rather than swept here; critic_network.pre_torso.layer_sizes is
+            # also left at the yaml default ([256, 256], not the [256] used
+            # below for the other cnn+* arches) to match that spec's "2 hidden
+            # linear layers" MLP.
+            cmd.append(f"network.actor_network.input_layer.channels_per_group=[{self.hidden_dim}]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
+            cmd.append(f"network.critic_network.input_layer.channels_per_group=[{self.hidden_dim}]")
+            cmd.append(f"network.critic_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
         else:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
@@ -433,6 +472,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 eval_generator_special=args.eval_generator_special,
                 gamma=args.gamma,
                 output_dir=args.output_dir,
+                wandb=args.wandb,
+                wandb_project=args.wandb_project,
             )
         )
     return jobs
@@ -578,8 +619,20 @@ def main() -> None:
     parser.add_argument(
         "--gamma",
         type=float,
-        default=0.99,
+        default=0.9999,
         help="system.gamma, applied to every job (not swept).",
+    )
+    parser.add_argument(
+        "--wandb",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="Enable W&B logging (logger.loggers.wandb.enabled) for every job. Default False.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default="box_block_fixed_budget_sweep",
+        help="W&B project name (logger.loggers.wandb.project), applied to every job so the whole "
+        "sweep lands in the same project. Only used when --wandb is set.",
     )
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
@@ -669,6 +722,8 @@ def main() -> None:
         f"eval_generator_special={args.eval_generator_special} gamma={args.gamma}"
     )
     print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
+    if args.wandb:
+        print(f"  wandb=True project={args.wandb_project}")
 
     if args.dry_run:
         for j in jobs:
