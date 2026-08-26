@@ -1,19 +1,24 @@
 #!/usr/bin/env python
-"""Fixed-computation-budget sweep for RAMDP systems on the Lights Out puzzle
-(env=lightsout/lightsout_3x3, see stoix/envs/lightsout/lightsout_env.py).
+"""Adaptive-computation-budget sweep for RAMDP systems on the Lights Out
+puzzle (env=lightsout/lightsout_3x3, see
+stoix/envs/lightsout/lightsout_env.py).
 
-Companion to minatar_fixed_budget_sweep.py: instead of letting the actor's
-compute torso adaptively halt (min_steps=1, sampled/learned halting), every
-job here pins `min_steps == max_steps == budget`, which - per the min_steps
-mechanism added to the compute torsos (see stoix/networks/torso_compute*.py)
-- forbids halting before `budget` steps and forces a halt at exactly
-`budget` steps. So every example always takes exactly `budget` steps of
-computation, with no adaptivity at all.
+Companion to lightsout_fixed_budget_sweep.py: that script pins
+`min_steps == max_steps == budget`, forbidding halting before `budget` steps
+and forcing a halt at exactly `budget` steps - a fixed, non-adaptive
+baseline. This script instead sweeps `min_steps` and `max_steps`
+*independently* (see the min_steps mechanism added to the compute torsos,
+stoix/networks/torso_compute*.py), so the actor's compute torso can
+genuinely halt adaptively (sampled/learned halting) anywhere in
+`[min_steps, max_steps]` per example, rather than always taking a fixed
+number of steps. `min_steps == max_steps` is still possible (as one point in
+this more general grid) but isn't the default.
 
-This answers "does more computation help on this task?" directly (sweeping
-`budget` at a fixed, non-adaptive cost) and is also a simpler system to debug
-against, since compute_time is deterministic (== budget) rather than a
-learned/sampled quantity.
+This answers "how much does adaptive halting help, and at what compute
+ceiling?" - sweeping both how early halting is allowed (`min_steps`) and how
+much compute is available (`max_steps`) - complementing
+lightsout_fixed_budget_sweep.py's "does more (fixed) computation help?"
+question.
 
 LightsOutEnv's observation is `(m, n, 2)` - the current grid and the goal
 grid, stacked as two channels (see the env's module docstring) - so, exactly
@@ -42,7 +47,13 @@ Grid axes:
                  TransformerChainOfThoughtTorso) |
                  cnn+gru (CNNTorso input_layer feeding GRUAdaptiveComputationTimeTorso) |
                  cnn+iru (CNNTorso input_layer feeding IRUAdaptiveComputationTimeTorso)
-  - budget:      fixed number of steps every example takes (max_steps == min_steps)
+  - min_steps:   forbids halting (voluntarily, in replay, or greedily) before
+                 this many pondering steps - see the compute torsos'
+                 min_steps mechanism, stoix/networks/torso_compute*.py.
+  - max_steps:   forces a halt at this many pondering steps if the example
+                 hasn't halted voluntarily already. Combos where
+                 min_steps > max_steps are invalid (the torsos assert
+                 `1 <= min_steps <= max_steps`) and are skipped, not errored.
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
   - lr:          system.actor_lr - has its own value list, independent of critic_lr's
                  (the full lr x critic_lr cross product is still swept)
@@ -83,22 +94,25 @@ GPU (a GPU "slot" queue + thread pool), each run pinned via
 CUDA_VISIBLE_DEVICES and logged to its own file under <output-dir>/logs/.
 
 Usage:
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --dry-run                # preview the grid
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py                          # run the full sweep (all grid sizes)
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --grid-sizes 3x3,5x5     # only these grid sizes
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
-      --grid-sizes 3x3 --budget 1,8 --hidden-dim 16 --lr 3e-4 --seeds 1  # small pilot / debug run
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --delightful true,false \\
+  python ramdp_experiments/lightsout_sweep.py --dry-run                # preview the grid
+  python ramdp_experiments/lightsout_sweep.py --limit 6 --dry-run       # preview a slice
+  python ramdp_experiments/lightsout_sweep.py                          # run the full sweep (all grid sizes)
+  python ramdp_experiments/lightsout_sweep.py --grid-sizes 3x3,5x5     # only these grid sizes
+  python ramdp_experiments/lightsout_sweep.py --systems ff_reinforce --architectures mlp \\
+      --grid-sizes 3x3 --min-steps 1 --max-steps 8 --hidden-dim 16 --lr 3e-4 --seeds 1  # small pilot / debug run
+  python ramdp_experiments/lightsout_sweep.py --min-steps 1,4 --max-steps 4,8,16 \\
+      # sweeps min_steps x max_steps (min_steps > max_steps combos skipped)
+  python ramdp_experiments/lightsout_sweep.py --min-steps 8 --max-steps 8  # min_steps == max_steps, the fixed-budget special case
+  python ramdp_experiments/lightsout_sweep.py --delightful true,false \\
       --delightful-eta 1.0,3.0                                    # sweep delightful PG on/off
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures mlp \\
+  python ramdp_experiments/lightsout_sweep.py --architectures mlp \\
       --use-layer-norm true,false --use-input-layer-norm true,false  # sweep LayerNorm options
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_reinforce \\
+  python ramdp_experiments/lightsout_sweep.py --systems ff_reinforce \\
       --architectures transformer_explicit_cot                       # explicit-CoT sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --difficulty-threshold 0.3  # easier training goals
+  python ramdp_experiments/lightsout_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
+  python ramdp_experiments/lightsout_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
+  python ramdp_experiments/lightsout_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
+  python ramdp_experiments/lightsout_sweep.py --difficulty-threshold 0.3  # easier training goals
 """
 
 from __future__ import annotations
@@ -190,7 +204,8 @@ class Job:
     grid_size: str  # e.g. "3x3" - env.scenario.name becomes "lightsout-3x3"
     system: str
     arch: str
-    budget: int
+    min_steps: int
+    max_steps: int
     hidden_dim: int
     lr: float
     critic_lr: float
@@ -219,7 +234,8 @@ class Job:
     @property
     def run_name(self) -> str:
         name = (
-            f"{self.env}-{self.system}-{self.arch}-budget_{self.budget}"
+            f"{self.env}-{self.system}-{self.arch}"
+            f"-min_steps_{self.min_steps}-max_steps_{self.max_steps}"
             f"-hidden_dim_{self.hidden_dim}-lr_{self.lr:g}-critic_lr_{self.critic_lr:g}"
         )
         # Not shown for transformer_explicit_cot - num_layers isn't swept for
@@ -257,10 +273,13 @@ class Job:
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
-            # min_steps == max_steps == budget: no adaptivity, every example always
-            # takes exactly `budget` steps (see stoix/networks/torso_compute*.py).
-            f"network.actor_network.pre_torso.max_steps={self.budget}",
-            f"network.actor_network.pre_torso.min_steps={self.budget}",
+            # Independently swept - see the compute torsos' min_steps mechanism
+            # (stoix/networks/torso_compute*.py): min_steps forbids halting
+            # before that many steps; max_steps forces a halt at that many.
+            # min_steps == max_steps (no adaptivity) is one point in this grid,
+            # not the default - contrast lightsout_fixed_budget_sweep.py.
+            f"network.actor_network.pre_torso.max_steps={self.max_steps}",
+            f"network.actor_network.pre_torso.min_steps={self.min_steps}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
             f"system.ent_coef=0.01",
@@ -383,11 +402,28 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             f"{EXPLICIT_COT_ARCH}, which is only implemented for {EXPLICIT_COT_SYSTEMS}."
         )
 
+    # (min_steps, max_steps) combos: independently swept (see --min-steps/
+    # --max-steps), but the compute torsos assert `1 <= min_steps <= max_steps`
+    # (stoix/networks/torso_compute*.py) - a requested min_steps > max_steps
+    # pairing is invalid, so it's skipped here rather than erroring at launch.
+    step_combos = [
+        (min_steps, max_steps)
+        for min_steps in args.min_steps
+        for max_steps in args.max_steps
+        if min_steps <= max_steps
+    ]
+    n_skipped_step_combos = len(args.min_steps) * len(args.max_steps) - len(step_combos)
+    if n_skipped_step_combos:
+        print(
+            f"Skipping {n_skipped_step_combos} (min_steps, max_steps) combo(s) with "
+            "min_steps > max_steps."
+        )
+
     jobs = []
     for (
         grid_size,
         (system, arch, use_layer_norm, use_input_layer_norm, num_layers),
-        budget,
+        (min_steps, max_steps),
         hidden_dim,
         lr,
         critic_lr,
@@ -396,7 +432,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     ) in itertools.product(
         args.grid_sizes,
         system_arch_ln_combos,
-        args.budget,
+        step_combos,
         args.hidden_dim,
         args.lr,
         args.critic_lr,
@@ -410,7 +446,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 grid_size=grid_size,
                 system=system,
                 arch=arch,
-                budget=budget,
+                min_steps=min_steps,
+                max_steps=max_steps,
                 hidden_dim=hidden_dim,
                 lr=lr,
                 critic_lr=critic_lr,
@@ -508,9 +545,19 @@ def main() -> None:
         "requesting it are skipped, not errored.",
     )
     parser.add_argument(
-        "--budget",
+        "--min-steps",
+        default="1",
+        help="Comma-separated network.actor_network.pre_torso.min_steps values, swept "
+        "independently of --max-steps (full cross product) - forbids halting before this many "
+        "pondering steps. Default 1 (no forced minimum - the usual adaptive-halting setting).",
+    )
+    parser.add_argument(
+        "--max-steps",
         default="1,2,4,8,16",
-        help="Comma-separated fixed compute budgets - each sets max_steps == min_steps to this value.",
+        help="Comma-separated network.actor_network.pre_torso.max_steps values, swept "
+        "independently of --min-steps (full cross product) - forces a halt at this many "
+        "pondering steps if not halted already. Combos where min_steps > max_steps are invalid "
+        "(skipped, not errored) - see build_grid.",
     )
     parser.add_argument("--hidden-dim", default="16,32", help="Comma-separated actor torso widths.")
     parser.add_argument(
@@ -596,7 +643,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--wandb-project",
-        default="lightsout_fixed_budget_sweep",
+        default="lightsout_sweep",
         help="W&B project name (logger.loggers.wandb.project), applied to every job so the whole "
         "sweep lands in the same project. Only used when --wandb is set.",
     )
@@ -607,7 +654,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results_lightsout_fixed_budget_sweep",
+        default=REPO_ROOT / "results_lightsout_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")
@@ -626,7 +673,8 @@ def main() -> None:
     args.grid_sizes = args.grid_sizes.split(",")
     args.systems = args.systems.split(",")
     args.architectures = args.architectures.split(",")
-    args.budget = [int(x) for x in args.budget.split(",")]
+    args.min_steps = [int(x) for x in args.min_steps.split(",")]
+    args.max_steps = [int(x) for x in args.max_steps.split(",")]
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
     args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
@@ -645,8 +693,10 @@ def main() -> None:
     valid_architectures = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
     for a in args.architectures:
         assert a in valid_architectures, f"unknown architecture {a!r}, expected one of {valid_architectures}"
-    for b in args.budget:
-        assert b >= 1, f"budget must be >= 1, got {b}"
+    for s in args.min_steps:
+        assert s >= 1, f"min_steps must be >= 1, got {s}"
+    for s in args.max_steps:
+        assert s >= 1, f"max_steps must be >= 1, got {s}"
     for n in args.num_layers:
         assert n >= 1, f"num_layers must be >= 1, got {n}"
 
@@ -679,7 +729,10 @@ def main() -> None:
     print(f"Grid: {len(jobs)} jobs to run" + (f" ({n_skipped} skipped as already-existing)" if n_skipped else ""))
     print(f"  grid_sizes={args.grid_sizes}")
     print(f"  systems={args.systems} architectures={args.architectures}")
-    print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
+    print(
+        f"  min_steps={args.min_steps} max_steps={args.max_steps} hidden_dim={args.hidden_dim} "
+        f"seeds=0..{args.seeds - 1}"
+    )
     print(f"  lr={args.lr} critic_lr={args.critic_lr}")
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta}")
     print(

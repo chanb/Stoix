@@ -11,8 +11,8 @@ actor_network:
   input_layer:
     _target_: stoix.networks.resnet.VisualResNetTorso
     channels_per_group: [256]
-    blocks_per_group: [2]
-    layers_per_block: 4
+    blocks_per_group: [1]
+    layers_per_block: 2
     downsampling_strategies: ["none"]
     use_layer_norm: False
     activation: relu
@@ -32,8 +32,8 @@ critic_network:
   input_layer:
     _target_: stoix.networks.resnet.VisualResNetTorso
     channels_per_group: [256]
-    blocks_per_group: [2]
-    layers_per_block: 4
+    blocks_per_group: [1]
+    layers_per_block: 2
     downsampling_strategies: ["none"]
     use_layer_norm: False
     activation: relu

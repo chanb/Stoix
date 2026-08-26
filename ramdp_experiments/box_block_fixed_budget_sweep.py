@@ -17,11 +17,13 @@ against, since compute_time is deterministic (== budget) rather than a
 learned/sampled quantity.
 
 Both box-count settings use `VariableQuarterGenerator` (level_generator=
-variable, quarter_size=3 on a 6x6 grid - i.e. four 3x3 quadrants) with
-`filtering=quarter` (stoix.envs.block_moving.wrappers.QuarterFilter), which
-truncates the episode if the agent strays outside the box/target quadrants -
-see stoix/envs/block_moving/generators.py's VariableQuarterGenerator and
-wrappers.py's QuarterFilter.
+variable, quarter_size=3 on a 6x6 grid - i.e. four 3x3 quadrants): the box(es)
+spawn in one quadrant corner and the target(s) in another (see
+stoix/envs/block_moving/generators.py's VariableQuarterGenerator), but no
+`filtering` is applied - the agent may move anywhere on the full grid;
+episodes aren't truncated for leaving the box/target quadrants (contrast
+stoix.envs.block_moving.wrappers.QuarterFilter, which does truncate on that,
+and isn't used here).
 
 BoxMovingToStoa's observation is the grid's factored-channel encoding,
 `(grid_size, grid_size, 4)` (see stoix/envs/block_moving/stoa_adapter.py) -
@@ -203,7 +205,7 @@ BOX_SETTINGS = {
         number_of_moving_boxes_max=3,
         grid_size=6,
         quarter_size=3,
-        episode_length=1000,
+        episode_length=100,
     ),
     "exact-4": dict(
         number_of_boxes_min=4,
@@ -211,7 +213,7 @@ BOX_SETTINGS = {
         number_of_moving_boxes_max=4,
         grid_size=6,
         quarter_size=3,
-        episode_length=1000,
+        episode_length=100,
     ),
 }
 
@@ -298,14 +300,11 @@ class Job:
             f"env.kwargs.number_of_moving_boxes_max={settings['number_of_moving_boxes_max']}",
             f"env.kwargs.episode_length={settings['episode_length']}",
             "env.kwargs.terminate_when_success=True",
-            "env.kwargs.filtering=quarter",
             f"env.kwargs.generator_special={self.generator_special}",
             # `+` since eval_generator_special isn't a key in the base yaml
             # (block_moving_variable.yaml) - see make_block_moving_env.
             f"+env.kwargs.eval_generator_special={self.eval_generator_special}",
             f"network={network}",
-            "logger.loggers.tensorboard.enabled=True",
-            "logger.loggers.json.enabled=True",
             f"system.gamma={self.gamma:g}",
             f"arch.total_timesteps={self.total_timesteps:g}",
             f"arch.seed={self.seed}",
@@ -329,7 +328,6 @@ class Job:
             # collide on the same W&B run.
             cmd.append("logger.loggers.wandb.enabled=True")
             cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
-            cmd.append(f"logger.loggers.wandb.run_id={self.run_name}")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         if self.arch == EXPLICIT_COT_ARCH:

@@ -48,9 +48,17 @@ _PROB_EPS = 1e-6
 
 class ACTStep(nn.Module):
     """A single shared computation step: updates the running state and
-    predicts a halting probability for that step."""
+    predicts a halting probability for that step.
+
+    `num_layers` stacks that many independently-parameterized
+    `Dense -> activation` transformations one after another *within* this one
+    step (each with its own weights - not shared across the stack, unlike the
+    step itself, which is shared/reused across every pondering step). The
+    optional pre-LN (`use_layer_norm`) is applied once, before the stack, not
+    between its layers."""
 
     hidden_dim: int
+    num_layers: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_layer_norm: bool = False
@@ -59,8 +67,11 @@ class ACTStep(nn.Module):
     def __call__(self, state: chex.Array) -> Tuple[chex.Array, chex.Array]:
         if self.use_layer_norm:
             state = nn.LayerNorm()(state)
-        state = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(state)
-        state = parse_activation_fn(self.activation)(state)
+        for i in range(self.num_layers):
+            state = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init, name=f"dense_{i}")(
+                state
+            )
+            state = parse_activation_fn(self.activation)(state)
         halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(state))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
         return state, halting_prob
@@ -91,6 +102,11 @@ class AdaptiveComputationTimeTorso(nn.Module):
     `ACTStep` before that step's Dense layer (pre-LN), reused across all
     `max_steps` applications since the step's parameters are shared.
 
+    `num_layers` stacks that many `Dense -> activation` transformations
+    inside each shared `ACTStep` (see that class) - i.e. how "deep" a single
+    pondering step is, independent of `max_steps`/`min_steps` (how many
+    pondering steps are taken).
+
     Also tracks, per example, how quickly the running `state` settles: the
     L2 distance between consecutive steps' states (step `t` vs `t - 1`,
     starting at `t = 2` since there's no step 0 to compare step 1 against) is
@@ -107,6 +123,7 @@ class AdaptiveComputationTimeTorso(nn.Module):
     hidden_dim: int
     max_steps: int = 10
     min_steps: int = 1
+    num_layers: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
@@ -166,7 +183,11 @@ class AdaptiveComputationTimeTorso(nn.Module):
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         )
         step_fn = ACTStep(
-            self.hidden_dim, self.activation, self.kernel_init, use_layer_norm=self.use_layer_norm
+            self.hidden_dim,
+            self.num_layers,
+            self.activation,
+            self.kernel_init,
+            use_layer_norm=self.use_layer_norm,
         )
 
         still_running = jnp.ones(batch_shape, dtype=bool)
@@ -248,21 +269,37 @@ class RecurrentACTStep(nn.Module):
     re-feeds the fixed, once-encoded input embedding into a GRU cell
     alongside the running recurrent state `carry` at every step - i.e. the
     step function is `carry_{t+1} = GRUCell(carry_t, input_embedding)` -
-    then predicts a halting probability for that step from the new carry."""
+    then predicts a halting probability for that step from the new carry.
+
+    `num_layers` stacks that many independently-parameterized GRU cells
+    within this one step - like a multi-layer GRU: layer 0 takes the fixed
+    `input_embedding`, layer `i > 0` takes layer `i - 1`'s output as its
+    input, and each layer keeps its *own* carry across pondering steps (so
+    `carry` here is `(num_layers, ..., hidden_dim)`, not `(..., hidden_dim)`).
+    The halting probability is predicted from the top (last) layer's new
+    carry, which is also what gets used as this step's "public" state (e.g.
+    for the latent-convergence diagnostics and the final returned
+    embedding) - see `GRUAdaptiveComputationTimeTorso`."""
 
     hidden_dim: int
+    num_layers: int = 1
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
 
     @nn.compact
     def __call__(
         self, carry: chex.Array, input_embedding: chex.Array
     ) -> Tuple[chex.Array, chex.Array]:
-        carry, _ = nn.GRUCell(features=self.hidden_dim, kernel_init=self.kernel_init)(
-            carry, input_embedding
-        )
-        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(carry))
+        x = input_embedding
+        new_carries = []
+        for i in range(self.num_layers):
+            layer_carry, x = nn.GRUCell(
+                features=self.hidden_dim, kernel_init=self.kernel_init, name=f"gru_{i}"
+            )(carry[i], x)
+            new_carries.append(layer_carry)
+        new_carry = jnp.stack(new_carries, axis=0)
+        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(new_carries[-1]))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
-        return carry, halting_prob
+        return new_carry, halting_prob
 
 
 class GRUAdaptiveComputationTimeTorso(nn.Module):
@@ -297,11 +334,19 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
     `Linear` projection, before it's fed into the recurrent block every
     step) - unlike the other torsos in this module, where `use_input_layer_norm`
     normalizes the *raw* observation before its projection.
+
+    `num_layers` stacks that many GRU cells inside each shared step (see
+    `RecurrentACTStep`) - a multi-layer GRU applied at every pondering step,
+    independent of `max_steps`/`min_steps`. Each stacked layer keeps its own
+    carry across pondering steps; the diagnostics/final embedding below use
+    only the top layer's carry, matching what `RecurrentACTStep` returns as
+    its halting-probability input.
     """
 
     hidden_dim: int
     max_steps: int = 10
     min_steps: int = 1
+    num_layers: int = 1
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
@@ -357,9 +402,16 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         input_embedding = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
             input_embedding = nn.LayerNorm()(input_embedding)
-        step_fn = RecurrentACTStep(self.hidden_dim, self.kernel_init)
+        step_fn = RecurrentACTStep(self.hidden_dim, self.num_layers, self.kernel_init)
 
-        state = jnp.zeros(batch_shape + (self.hidden_dim,))
+        # `carry` holds every stacked layer's own recurrent state
+        # (`(num_layers, *batch_shape, hidden_dim)`), threaded between
+        # pondering steps by `step_fn`. `state` (below) is just the top
+        # layer's carry - what everything else here (diagnostics, halting,
+        # the final returned embedding) actually uses, same as when
+        # `num_layers == 1`.
+        carry = jnp.zeros((self.num_layers,) + batch_shape + (self.hidden_dim,))
+        state = carry[-1]
 
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
@@ -370,7 +422,8 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
 
         for step in range(self.max_steps):
             prev_state = state
-            state, halting_prob = step_fn(state, input_embedding)
+            carry, halting_prob = step_fn(carry, input_embedding)
+            state = carry[-1]
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
@@ -436,41 +489,73 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
-class IRUStep(nn.Module):
-    """A single shared computation step for `IRUAdaptiveComputationTimeTorso`:
-    the "interpolation recurrent unit" (IRU). The running cell state `c_i` is
-    updated as an interpolation between its previous value and a fresh
-    candidate value, gated by a learned per-step "forget" probability - both
-    computed from the same concatenation of the fixed input embedding `x`
-    and `tanh(c_i)`:
+class IRUCell(nn.Module):
+    """The "interpolation recurrent unit" (IRU) cell math, factored out of
+    `IRUStep` so it can be stacked: the running cell state `c_i` is updated
+    as an interpolation between its previous value and a fresh candidate
+    value, gated by a learned per-step "forget" probability - both computed
+    from the same concatenation of the fixed input `x` and `tanh(c_i)`:
 
         f_i = sigmoid(FORGET_theta([x, tanh(c_i)]))
         I_i = tanh(INPUT_theta([x, tanh(c_i)]))
         c_{i+1} = f_i * c_i + (1 - f_i) * I_i
 
     where `FORGET_theta`/`INPUT_theta` are each a single learned `Dense`
-    layer. Also predicts a halting probability for that step, from the new
-    cell state."""
+    layer. No halting head here - see `IRUStep`, which wraps one or more of
+    these into a shared pondering step."""
 
     hidden_dim: int
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
 
     @nn.compact
-    def __call__(
-        self, carry: chex.Array, input_embedding: chex.Array
-    ) -> Tuple[chex.Array, chex.Array]:
-        gate_input = jnp.concatenate([input_embedding, jnp.tanh(carry)], axis=-1)
+    def __call__(self, carry: chex.Array, x: chex.Array) -> chex.Array:
+        gate_input = jnp.concatenate([x, jnp.tanh(carry)], axis=-1)
         forget_gate = nn.sigmoid(
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init, name="forget")(gate_input)
         )
         candidate = jnp.tanh(
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init, name="input")(gate_input)
         )
-        carry = forget_gate * carry + (1.0 - forget_gate) * candidate
+        return forget_gate * carry + (1.0 - forget_gate) * candidate
 
-        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(carry))
+
+class IRUStep(nn.Module):
+    """A single shared computation step for `IRUAdaptiveComputationTimeTorso`:
+    updates the running cell state via `IRUCell` and predicts a halting
+    probability for that step from the new cell state.
+
+    `num_layers` stacks that many independently-parameterized `IRUCell`s
+    within this one step - layer 0 takes the fixed `input_embedding`, layer
+    `i > 0` takes `tanh` of layer `i - 1`'s new cell state as its own `x`
+    (mirroring how `RecurrentACTStep`'s stacked GRU layers feed each other,
+    and matching what `IRUCell` itself already applies `tanh` to for its own
+    gate inputs). Each stacked layer keeps its own carry across pondering
+    steps (so `carry` here is `(num_layers, ..., hidden_dim)`, not
+    `(..., hidden_dim)`). The halting probability is predicted from the top
+    (last) layer's new carry, which is also what gets used as this step's
+    "public" state - see `IRUAdaptiveComputationTimeTorso`."""
+
+    hidden_dim: int
+    num_layers: int = 1
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+
+    @nn.compact
+    def __call__(
+        self, carry: chex.Array, input_embedding: chex.Array
+    ) -> Tuple[chex.Array, chex.Array]:
+        x = input_embedding
+        new_carries = []
+        for i in range(self.num_layers):
+            layer_carry = IRUCell(self.hidden_dim, self.kernel_init, name=f"cell_{i}")(
+                carry[i], x
+            )
+            new_carries.append(layer_carry)
+            x = jnp.tanh(layer_carry)
+        new_carry = jnp.stack(new_carries, axis=0)
+
+        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(new_carries[-1]))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
-        return carry, halting_prob
+        return new_carry, halting_prob
 
 
 class IRUAdaptiveComputationTimeTorso(nn.Module):
@@ -499,11 +584,18 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
     `use_input_layer_norm` normalizes the encoded input embedding (after its
     `Linear` projection, before it's fed into the recurrent block every
     step).
+
+    `num_layers` stacks that many `IRUCell`s inside each shared step (see
+    `IRUStep`) - independent of `max_steps`/`min_steps`. Each stacked layer
+    keeps its own carry across pondering steps; the diagnostics/final
+    embedding below use only the top layer's carry, matching what `IRUStep`
+    returns as its halting-probability input.
     """
 
     hidden_dim: int
     max_steps: int = 10
     min_steps: int = 1
+    num_layers: int = 1
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
@@ -559,9 +651,16 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         input_embedding = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
             input_embedding = nn.LayerNorm()(input_embedding)
-        step_fn = IRUStep(self.hidden_dim, self.kernel_init)
+        step_fn = IRUStep(self.hidden_dim, self.num_layers, self.kernel_init)
 
-        state = jnp.zeros(batch_shape + (self.hidden_dim,))
+        # `carry` holds every stacked layer's own cell state
+        # (`(num_layers, *batch_shape, hidden_dim)`), threaded between
+        # pondering steps by `step_fn`. `state` (below) is just the top
+        # layer's carry - what everything else here (diagnostics, halting,
+        # the final returned embedding) actually uses, same as when
+        # `num_layers == 1`.
+        carry = jnp.zeros((self.num_layers,) + batch_shape + (self.hidden_dim,))
+        state = carry[-1]
 
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
@@ -572,7 +671,8 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
 
         for step in range(self.max_steps):
             prev_state = state
-            state, halting_prob = step_fn(state, input_embedding)
+            carry, halting_prob = step_fn(carry, input_embedding)
+            state = carry[-1]
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
