@@ -1,0 +1,41 @@
+# ---MLP Unshared Compute-Time-Aware Q Actor-Critic Networks---
+# Same unshared-per-step actor as mlp_unshared_compute.yaml (see that file's
+# comment for the UnsharedAdaptiveComputationTimeTorso rationale). The
+# critic is stoix.networks.base_qac.ValueAndQCritic: one torso, a scalar
+# value_head V(s), and a q_head whose output shape depends on
+# system.qac_variant (see ff_qac.py's learner_setup and module docstring) -
+# a full (num_actions, max_steps) table for "naive", or just
+# (num_actions,) - Q(s,·,1) - for the runtime-factorized "fac" variant.
+# output_dim/pre_shape for both heads are injected in code, not set here.
+#
+# q_head uses stoix.networks.heads.MLPHead, which is a drop-in superset of
+# LinearHead: with hidden_sizes=[] (the default below) it's identical to a
+# plain LinearHead; set it to e.g. [128] or [128, 128] to give the Q-head its
+# own hidden MLP layers on top of the shared torso embedding, instead of a
+# single linear projection.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute.UnsharedAdaptiveComputationTimeTorso
+    hidden_dim: 256
+    max_steps: 10
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    activation: relu
+    use_input_layer_norm: False
+    use_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  value_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
+  q_head:
+    _target_: stoix.networks.heads.MLPHead
+    hidden_sizes: []
+    activation: relu
+    use_layer_norm: False

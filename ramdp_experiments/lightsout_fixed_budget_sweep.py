@@ -127,6 +127,7 @@ SYSTEM_TO_QAC_VARIANT = {"ff_qac_fac": "fac", "ff_qac_naive": "naive"}
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
+        "mlp_unshared": "mlp_unshared_compute",
         "transformer": "transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
@@ -137,6 +138,7 @@ ARCH_TO_NETWORK = {
     },
     "ff_qac_fac": {
         "mlp": "mlp_compute_qac",
+        "mlp_unshared": "mlp_unshared_compute_qac",
         "transformer": "transformer_compute_qac",
         "gru": "gru_compute_qac",
         "iru": "iru_compute_qac",
@@ -147,6 +149,7 @@ ARCH_TO_NETWORK = {
     },
     "ff_qac_naive": {
         "mlp": "mlp_compute_qac",
+        "mlp_unshared": "mlp_unshared_compute_qac",
         "transformer": "transformer_compute_qac",
         "gru": "gru_compute_qac",
         "iru": "iru_compute_qac",
@@ -299,14 +302,18 @@ class Job:
             # TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso, and
             # IRUAdaptiveComputationTimeTorso only have use_input_layer_norm, not
             # use_layer_norm (see stoix/networks/torso_compute_transformer.py and
-            # stoix/networks/torso_compute.py).
+            # stoix/networks/torso_compute.py). `++` (override-or-add), not `=`:
+            # not every yaml config declares this key explicitly (e.g.
+            # transformer_compute_qac.yaml was missing it), so a plain `=`
+            # override can fail with "Key not in struct" - see num_layers above
+            # for the same issue.
             cmd.append(
-                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+                f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         else:
-            cmd.append(f"network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
+            cmd.append(f"++network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
             cmd.append(
-                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+                f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")

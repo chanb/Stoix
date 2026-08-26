@@ -1,0 +1,30 @@
+# ---MLP Unshared Compute-Time-Aware REINFORCE Networks---
+# Same Adaptive Computation Time mechanism as mlp_compute.yaml (sampled
+# "halt now?" decision at each step, reported as `compute_time`), but each
+# pondering step is its own independently-parameterized layer - no weight
+# sharing across steps, unlike AdaptiveComputationTimeTorso's single shared
+# step reused at every iteration (see
+# stoix.networks.torso_compute.UnsharedAdaptiveComputationTimeTorso). So
+# increasing max_steps here adds a whole new layer's worth of parameters,
+# whereas for mlp_compute.yaml it's free.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute.UnsharedAdaptiveComputationTimeTorso
+    hidden_dim: 256
+    max_steps: 10
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    activation: relu
+    use_input_layer_norm: False
+    use_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead

@@ -336,14 +336,17 @@ class Job:
             # TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso, and
             # IRUAdaptiveComputationTimeTorso only have use_input_layer_norm, not
             # use_layer_norm (see stoix/networks/torso_compute_transformer.py and
-            # stoix/networks/torso_compute.py).
+            # stoix/networks/torso_compute.py). `++` (override-or-add), not `=`:
+            # not every yaml config declares this key explicitly (e.g.
+            # transformer_compute_qac.yaml was missing it until fixed), so a
+            # plain `=` override can fail with "Key not in struct".
             cmd.append(
-                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+                f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         else:
-            cmd.append(f"network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
+            cmd.append(f"++network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
             cmd.append(
-                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+                f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
