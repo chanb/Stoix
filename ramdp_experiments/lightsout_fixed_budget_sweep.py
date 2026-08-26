@@ -71,6 +71,12 @@ Grid axes:
                  stoix/networks/torso_compute*.py); not swept for
                  transformer_explicit_cot, which keeps its own yaml default
                  (2) instead. Default 1.
+  - num_heads:   attention head count (network.actor_network.pre_torso.num_heads);
+                 only applies to transformer/cnn+transformer
+                 (TransformerChainOfThoughtTorso) and transformer_explicit_cot
+                 (TransformerExplicitCoTTorso) - every other architecture has
+                 no such param, so this is forced to a single value for them.
+                 Default 4.
   - seed:        5 seeds per config by default
 
 `difficulty_threshold` (env.kwargs.difficulty_threshold) and `gamma`
@@ -180,6 +186,11 @@ NO_LAYER_NORM_ARCHES = (
 # Architectures whose input_layer is a CNNTorso (need the CNN-specific
 # overrides below instead of the flatten-observation wrapper).
 CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
+# Architectures whose pre_torso has a `num_heads` param (attention heads) -
+# TransformerChainOfThoughtTorso and TransformerExplicitCoTTorso; every other
+# torso has no such concept. Used to pick whether --num-heads is swept for a
+# given architecture in build_grid() and applied in Job.command().
+TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
@@ -207,6 +218,7 @@ class Job:
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
+    num_heads: int
     seed: int
     total_timesteps: float
     difficulty_threshold: float
@@ -234,6 +246,10 @@ class Job:
         # that arch (it keeps its own yaml default), see build_grid.
         if self.arch != EXPLICIT_COT_ARCH:
             name += f"-num_layers_{self.num_layers}"
+        # Only shown for architectures with a num_heads param - see
+        # TRANSFORMER_ARCHES/build_grid.
+        if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
+            name += f"-num_heads_{self.num_heads}"
         if self.delightful:
             name += f"-delightful_eta_{self.delightful_eta:g}"
         if self.use_layer_norm:
@@ -265,6 +281,7 @@ class Job:
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
+            f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # min_steps == max_steps == budget: no adaptivity, every example always
             # takes exactly `budget` steps (see stoix/networks/torso_compute*.py).
             f"network.actor_network.pre_torso.max_steps={self.budget}",
@@ -275,22 +292,10 @@ class Job:
             f"system.delightful={self.delightful}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
-        if self.arch != EXPLICIT_COT_ARCH:
-            # How many sub-layers are stacked inside each shared pondering
-            # step - AdaptiveComputationTimeTorso/GRUAdaptiveComputationTimeTorso/
-            # IRUAdaptiveComputationTimeTorso/TransformerChainOfThoughtTorso all
-            # support this (see stoix/networks/torso_compute*.py); the cnn+*
-            # variants reuse these same pre_torso classes (just a different
-            # input_layer), so this applies to them too. Not swept for
-            # transformer_explicit_cot (TransformerExplicitCoTTorso keeps its
-            # own yaml default instead).
-            # `++` (override-or-add), not `=`: only transformer_compute.yaml/
-            # cnn_transformer_compute.yaml declare num_layers already (it
-            # pre-existed there); mlp/gru/iru's yaml configs never had the key
-            # added (only the Python dataclass default), so a plain `=`
-            # override fails with "Key 'num_layers' is not in struct" for
-            # those architectures.
-            cmd.append(f"++network.actor_network.pre_torso.num_layers={self.num_layers}")
+        if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
+            # Attention head count - TransformerChainOfThoughtTorso/
+            # TransformerExplicitCoTTorso only (see TRANSFORMER_ARCHES).
+            cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -356,7 +361,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
-    # (system, arch, use_layer_norm, use_input_layer_norm, num_layers) combos:
+    # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads) combos:
     #  - transformer_explicit_cot only exists for ff_reinforce (see
     #    EXPLICIT_COT_SYSTEMS) - any other requested (system, architecture)
     #    pair is skipped rather than erroring, so e.g. the default
@@ -369,12 +374,17 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    see stoix/networks/torso_compute*.py) is swept for every arch except
     #    transformer_explicit_cot, which keeps its own yaml default instead
     #    (see --num-layers help).
+    #  - num_heads (attention heads) only exists on transformer/cnn+transformer/
+    #    transformer_explicit_cot (see TRANSFORMER_ARCHES) - swept only for
+    #    those, everything else forced to a single value.
     # Unsupported axes are forced to a single default value rather than
     # needlessly duplicated per requested setting.
     system_arch_ln_combos = []
     n_skipped_incompatible = 0
     for system in args.systems:
         for arch in args.architectures:
+            is_transformer_arch = arch in TRANSFORMER_ARCHES or arch == EXPLICIT_COT_ARCH
+            num_heads_options = args.num_heads if is_transformer_arch else [args.num_heads[0]]
             if arch == EXPLICIT_COT_ARCH:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
@@ -391,9 +401,17 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_layers_options = args.num_layers
             for use_layer_norm, use_input_layer_norm in ln_options:
                 for num_layers in num_layers_options:
-                    system_arch_ln_combos.append(
-                        (system, arch, use_layer_norm, use_input_layer_norm, num_layers)
-                    )
+                    for num_heads in num_heads_options:
+                        system_arch_ln_combos.append(
+                            (
+                                system,
+                                arch,
+                                use_layer_norm,
+                                use_input_layer_norm,
+                                num_layers,
+                                num_heads,
+                            )
+                        )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
     if n_skipped_incompatible:
         print(
@@ -404,7 +422,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     jobs = []
     for (
         grid_size,
-        (system, arch, use_layer_norm, use_input_layer_norm, num_layers),
+        (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads),
         budget,
         hidden_dim,
         lr,
@@ -437,6 +455,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
                 num_layers=num_layers,
+                num_heads=num_heads,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 difficulty_threshold=args.difficulty_threshold,
@@ -585,6 +604,15 @@ def main() -> None:
         "transformer_explicit_cot (TransformerExplicitCoTTorso keeps its own yaml default of 2).",
     )
     parser.add_argument(
+        "--num-heads",
+        default="4",
+        help="Comma-separated ints - attention head count "
+        "(network.actor_network.pre_torso.num_heads). Only applies to architecture in "
+        "{transformer, cnn+transformer, transformer_explicit_cot} (TransformerChainOfThoughtTorso/"
+        "TransformerExplicitCoTTorso); ignored (forced to the first value) for every other "
+        "architecture, since those torsos have no such param. Default 4.",
+    )
+    parser.add_argument(
         "--difficulty-threshold",
         type=float,
         default=0.5,
@@ -657,6 +685,7 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
     ]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
+    args.num_heads = [int(x) for x in args.num_heads.split(",")]
 
     for g in args.grid_sizes:
         assert GRID_SIZE_RE.match(g), f"invalid grid size {g!r}, expected 'MxN' (e.g. '3x3')"
@@ -676,6 +705,8 @@ def main() -> None:
         assert b >= 1, f"budget must be >= 1, got {b}"
     for n in args.num_layers:
         assert n >= 1, f"num_layers must be >= 1, got {n}"
+    for n in args.num_heads:
+        assert n >= 1, f"num_heads must be >= 1, got {n}"
 
     if args.gpus == "auto":
         try:
@@ -714,6 +745,7 @@ def main() -> None:
         f"use_input_layer_norm={args.use_input_layer_norm} (not transformer_explicit_cot)"
     )
     print(f"  num_layers={args.num_layers} (not swept for transformer_explicit_cot)")
+    print(f"  num_heads={args.num_heads} (transformer/cnn+transformer/transformer_explicit_cot only)")
     print(
         f"  difficulty_threshold={args.difficulty_threshold} "
         f"episode_length={args.episode_length if args.episode_length is not None else 'grid_size (default)'} "
