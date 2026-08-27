@@ -22,7 +22,13 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
   # controls both the usual reward horizon and the cost of pondering longer, and
   # (for "fac") the Q(s,a,1) -> Q(s,a,c) scaling.
-clip_eps: 0.2 # Clipping value for the PPO actor ratio and the critic's value/Q loss.
+clip_eps: 0.2 # Clipping value for the PPO actor ratio, and for the critic's value/Q loss
+  # when clip_value_loss=True.
+clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"/"fac") uses
+  # PPO-style clipping against the old value/Q estimate recorded at rollout time
+  # (stoix.utils.loss.clipped_value_loss), or plain L2 regression to the target instead
+  # (rlax.l2_loss, as in ff_reinforce.py/ff_qac.py). Only affects the critic - the actor's
+  # ratio is always clipped regardless of this setting.
 ent_coef: 0.01 # Entropy regularisation term for loss function.
 vf_coef: 0.5 # Critic weight.
 standardize_advantages: False # Whether to standardize the advantages.

@@ -34,10 +34,12 @@ applied to the *joint* log-probability, mirroring how the un-clipped
 REINFORCE weight in `ff_reinforce.py`/`ff_qac.py` multiplies that same joint
 log_prob: `ratio = exp((env_log_prob + halting_log_prob) - old_log_prob)`,
 one clipped surrogate term, not separate ratios for the action and the
-halting decisions. The critic (V, and Q for "naive") is trained with PPO's
-own clipped value loss (`stoix.utils.loss.clipped_value_loss`) against the
-same `old` value/Q estimate recorded at rollout time, rather than plain L2 -
-consistent with this being a genuine multi-epoch PPO system.
+halting decisions. The critic (V, and Q for "naive"/"fac") is trained with
+PPO's own clipped value loss (`stoix.utils.loss.clipped_value_loss`) against
+the same `old` value/Q estimate recorded at rollout time by default -
+consistent with this being a genuine multi-epoch PPO system - or with plain
+L2 regression (`rlax.l2_loss`), as in `ff_reinforce.py`/`ff_qac.py`, when
+`config.system.clip_value_loss=False`.
 
 Because PPO needs a fixed "old" log-probability to compute the ratio against
 across every epoch (unlike `ff_reinforce.py`/`ff_qac.py`, which only ever
@@ -77,6 +79,7 @@ import hydra
 import jax
 import jax.numpy as jnp
 import optax
+import rlax
 from colorama import Fore, Style
 from flax.core.frozen_dict import FrozenDict
 from omegaconf import DictConfig, OmegaConf
@@ -145,6 +148,17 @@ def get_learner_fn(
         else:  # "fac"
             q1_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
             return config.system.gamma ** (compute_time - 1) * q1_sa
+
+    def _value_loss_fn(
+        pred: chex.Array, behavior: chex.Array, targets: chex.Array
+    ) -> chex.Array:
+        """The critic's (V, and Q for "naive") regression loss - either PPO's
+        clipped value loss (clipping `pred` against the `behavior` estimate
+        recorded at rollout time) or plain L2 to `targets`, per
+        `config.system.clip_value_loss` - see module docstring."""
+        if config.system.clip_value_loss:
+            return clipped_value_loss(pred, behavior, targets, config.system.clip_eps)
+        return rlax.l2_loss(pred, targets).mean()
 
     def _update_step(
         learner_state: RamdpOnPolicyLearnerState, _: Any
@@ -354,9 +368,7 @@ def get_learner_fn(
                     if is_qac:
                         # RERUN NETWORK
                         value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
-                        value_loss = clipped_value_loss(
-                            value, traj_batch.value, targets, config.system.clip_eps
-                        )
+                        value_loss = _value_loss_fn(value, traj_batch.value, targets)
 
                         # "naive" and "fac" are regressed to the same
                         # `targets`, divided back down to a `c=1`-equivalent
@@ -374,9 +386,7 @@ def get_learner_fn(
                             q_targets = targets / config.system.gamma ** (
                                 traj_batch.compute_time - 1
                             )
-                        q_loss = clipped_value_loss(
-                            q_pred, traj_batch.q_value, q_targets, config.system.clip_eps
-                        )
+                        q_loss = _value_loss_fn(q_pred, traj_batch.q_value, q_targets)
 
                         critic_total_loss = config.system.vf_coef * (value_loss + q_loss)
                         loss_info = {
@@ -388,9 +398,7 @@ def get_learner_fn(
                         value = critic_apply_fn(critic_params, traj_batch.obs)
 
                         # CALCULATE VALUE LOSS
-                        value_loss = clipped_value_loss(
-                            value, traj_batch.value, targets, config.system.clip_eps
-                        )
+                        value_loss = _value_loss_fn(value, traj_batch.value, targets)
 
                         critic_total_loss = config.system.vf_coef * value_loss
                         loss_info = {

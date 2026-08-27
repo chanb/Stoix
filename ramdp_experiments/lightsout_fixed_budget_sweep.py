@@ -33,7 +33,7 @@ Grid axes:
                  systems train stoix/systems/ramdp_vpg/ff_ppo.py - PPO's clipped
                  surrogate over several epochs of minibatch updates per rollout,
                  vs. one REINFORCE/QAC gradient step per rollout for the others -
-                 see --epochs/--num-minibatches/--clip-eps.
+                 see --epochs/--num-minibatches/--clip-eps/--clip-value-loss.
   - architecture: mlp (AdaptiveComputationTimeTorso) | transformer
                  (TransformerChainOfThoughtTorso, latent CoT) |
                  gru (GRUAdaptiveComputationTimeTorso, GRU-based recurrent block
@@ -69,6 +69,11 @@ Grid axes:
                  systems only, see epochs.
   - clip_eps:    system.clip_eps - PPO ratio/value clipping; ff_ppo_* systems only,
                  see epochs.
+  - clip_value_loss: system.clip_value_loss - whether the critic's value/Q loss uses
+                 PPO-style clipping (True, default) against the old value/Q estimate,
+                 or plain L2 regression instead (False, as in ff_reinforce.py/
+                 ff_qac.py) - see stoix/systems/ramdp_vpg/ff_ppo.py's module
+                 docstring. ff_ppo_* systems only, see epochs.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
                  cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
@@ -126,6 +131,8 @@ Usage:
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --difficulty-threshold 0.3  # easier training goals
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
+  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
+      --clip-value-loss true,false                       # PPO clipped vs. L2 critic loss
 """
 
 from __future__ import annotations
@@ -262,6 +269,7 @@ class Job:
     epochs: int
     num_minibatches: int
     clip_eps: float
+    clip_value_loss: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -302,6 +310,8 @@ class Job:
         # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
         if self.system in PPO_SYSTEMS:
             name += f"-epochs_{self.epochs}-minibatches_{self.num_minibatches}-clip_{self.clip_eps:g}"
+            if not self.clip_value_loss:
+                name += "-l2_critic"
         if self.delightful:
             name += f"-delightful_eta_{self.delightful_eta:g}"
         if self.use_layer_norm:
@@ -351,6 +361,7 @@ class Job:
             cmd.append(f"system.epochs={self.epochs}")
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
+            cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
@@ -422,11 +433,14 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
-    # (epochs, num_minibatches, clip_eps) combos: only meaningful for PPO_SYSTEMS
-    # (ff_ppo.py) - forced to the first requested value for every other system
-    # in the main product loop below, then deduplicated by run_name, mirroring
-    # how delightful_combos/num_heads_options collapse axes that don't apply.
-    ppo_combos = list(itertools.product(args.epochs, args.num_minibatches, args.clip_eps))
+    # (epochs, num_minibatches, clip_eps, clip_value_loss) combos: only meaningful
+    # for PPO_SYSTEMS (ff_ppo.py) - forced to the first requested value for every
+    # other system in the main product loop below, then deduplicated by run_name,
+    # mirroring how delightful_combos/num_heads_options collapse axes that don't
+    # apply.
+    ppo_combos = list(
+        itertools.product(args.epochs, args.num_minibatches, args.clip_eps, args.clip_value_loss)
+    )
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads) combos:
     #  - transformer_explicit_cot only exists for ff_reinforce (see
@@ -495,7 +509,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         lr,
         critic_lr,
         (delightful, delightful_eta),
-        (epochs, num_minibatches, clip_eps),
+        (epochs, num_minibatches, clip_eps, clip_value_loss),
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -514,7 +528,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         if system in PPO_SYSTEMS:
             delightful, delightful_eta = False, args.delightful_eta[0]
         else:
-            epochs, num_minibatches, clip_eps = ppo_combos[0]
+            epochs, num_minibatches, clip_eps, clip_value_loss = ppo_combos[0]
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         jobs.append(
@@ -531,6 +545,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 epochs=epochs,
                 num_minibatches=num_minibatches,
                 clip_eps=clip_eps,
+                clip_value_loss=clip_value_loss,
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
                 num_layers=num_layers,
@@ -700,6 +715,14 @@ def main() -> None:
         "independently of --epochs/--num-minibatches. PPO systems only, see --epochs.",
     )
     parser.add_argument(
+        "--clip-value-loss",
+        default="true",
+        help="Comma-separated bools (true/false) - system.clip_value_loss: whether the critic's "
+        "value/Q loss uses PPO-style clipping (True, default) against the old value/Q estimate, "
+        "or plain L2 regression instead (False, as in ff_reinforce.py/ff_qac.py). Swept "
+        "independently of --epochs/--num-minibatches/--clip-eps. PPO systems only, see --epochs.",
+    )
+    parser.add_argument(
         "--use-layer-norm",
         default="false",
         help="Comma-separated bools (true/false) - LayerNorm inside AdaptiveComputationTimeTorso's "
@@ -807,6 +830,9 @@ def main() -> None:
     args.epochs = [int(x) for x in args.epochs.split(",")]
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
+    args.clip_value_loss = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")
+    ]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
@@ -875,7 +901,7 @@ def main() -> None:
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
-        f"(PPO systems only: {PPO_SYSTEMS})"
+        f"clip_value_loss={args.clip_value_loss} (PPO systems only: {PPO_SYSTEMS})"
     )
     print(
         f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "
