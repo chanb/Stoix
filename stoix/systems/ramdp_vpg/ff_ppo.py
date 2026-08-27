@@ -13,21 +13,34 @@ jointly with the environment action from one combined log-probability
 `log_prob = env_log_prob + halting_log_prob`.
 
 `config.system.qac_variant` selects how the advantage used to train the
-actor is computed - the same knob `ff_qac.py` uses, extended with a third
-value:
+actor is computed - the same knob `ff_qac.py` uses, extended with three more
+values:
 
   - "fac" / "naive": Q - V, exactly as in `ff_qac.py` (see that file's module
     docstring for the runtime-factorization identity "fac" relies on, and
     what "naive" learns instead). Advantage = Q(s_t, a_t, c_t) - V(s_t), with
-    no n-step return or bootstrapping in the advantage itself. Uses
-    `stoix.networks.base_qac.ValueAndQCritic` (a shared torso with a V head
-    and a Q head).
+    no n-step return or bootstrapping in the advantage itself.
+  - "cond_naive" / "cond_fac": Q - V too, but with `compute_time` fed into
+    the critic as an *input* - a single learned linear feature of `c` (see
+    `stoix.networks.base_qac.ValueAndQCritic._q_input`) concatenated onto
+    the shared embedding - rather than encoded in the output shape
+    ("naive"'s `(num_actions, max_steps)` table) or assumed via an analytic
+    scaling ("fac"'s `gamma ** (c - 1)`). Both use the exact same conditioned
+    architecture and so have identical parameter counts, unlike "naive" vs
+    "fac" - "cond_naive" reads the conditioned output directly as Q(s,·,c);
+    "cond_fac" additionally scales it by `gamma ** (c - 1)`. Comparing the
+    two isolates whether that analytic prior helps, holding capacity fixed,
+    rather than conflating the prior with a parameter-count difference the
+    way plain "naive" vs "fac" do.
   - "reinforce": G - V, REINFORCE-with-baseline exactly as in
     `ff_reinforce.py` - advantage = compute-discounted n-step Monte-Carlo
     return `G_h` minus V(s_t), with no GAE(lambda) term (this file does not
     reintroduce `stoix.systems.vpg.ff_ppo`'s GAE machinery; `G_h` is the same
     plain multistep return `ff_reinforce.py` computes). Uses
     `stoix.networks.base.FeedForwardCritic` (a plain V-only critic).
+
+The four Q-V variants all use `stoix.networks.base_qac.ValueAndQCritic` (a
+shared torso with a V head and a Q head).
 
 Whichever variant, PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is
 applied to the *joint* log-probability, mirroring how the un-clipped
@@ -130,24 +143,61 @@ def get_learner_fn(
     actor_update_fn, critic_update_fn = update_fns
 
     qac_variant = config.system.qac_variant
-    assert qac_variant in ("naive", "fac", "reinforce"), f"Unknown qac_variant: {qac_variant}"
-    is_qac = qac_variant in ("naive", "fac")
+    assert qac_variant in (
+        "naive",
+        "fac",
+        "cond_naive",
+        "cond_fac",
+        "reinforce",
+    ), f"Unknown qac_variant: {qac_variant}"
+    is_qac = qac_variant in ("naive", "fac", "cond_naive", "cond_fac")
+    # "cond_naive"/"cond_fac" condition the critic's q_value on compute_time
+    # as an extra input (see `ValueAndQCritic._q_input`), rather than
+    # applying compute_time afterwards via table-indexing ("naive") or an
+    # analytic scaling ("fac").
+    condition_q_on_compute_time = qac_variant in ("cond_naive", "cond_fac")
+
+    def _q_output(
+        critic_params: FrozenDict, obs: chex.Array, compute_time: chex.Array
+    ) -> chex.Array:
+        """Get the critic's raw `q_value` output. "cond_naive"/"cond_fac"
+        condition the network on `compute_time` as an extra input;
+        "naive"/"fac" don't - `compute_time` is applied afterwards instead,
+        by indexing a table ("naive") or an analytic scaling ("fac"), see
+        `_q_at_action_and_compute_time`."""
+        if condition_q_on_compute_time:
+            return critic_apply_fn(
+                critic_params, obs, method="q_value", compute_time=compute_time
+            )
+        return critic_apply_fn(critic_params, obs, method="q_value")
 
     def _q_at_action_and_compute_time(
         q_output: chex.Array, action: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
-        """Read Q(s, a, c) off the critic's raw `q_value` output, however it's
-        parameterised - see `ff_qac.py`'s identically-named helper for the
-        full explanation of the "naive" vs "fac" indexing/scaling."""
+        """Read Q(s, a, c) off `_q_output`'s raw output, however it's
+        parameterised:
+
+          - "naive": `q_output` is a `(..., num_actions, max_steps)` table -
+            index by both `action` and `compute_time`.
+          - "fac": `q_output` is `(..., num_actions)`, representing Q(s,·,1) -
+            index by `action` only, then scale by `gamma ** (compute_time - 1)`
+            to recover Q(s,a,c), per the runtime-factorization identity.
+          - "cond_naive": `q_output` (from `_q_output`, already conditioned
+            on `compute_time`) is `(..., num_actions)`, representing Q(s,·,c)
+            directly - index by `action` only, no further scaling.
+          - "cond_fac": same conditioned shape as "cond_naive", but also
+            scaled by `gamma ** (compute_time - 1)` - see module docstring.
+        """
         if qac_variant == "naive":
             compute_time_idx = (compute_time - 1).astype(jnp.int32)
             q_at_c = jnp.take_along_axis(
                 q_output, compute_time_idx[..., jnp.newaxis, jnp.newaxis], axis=-1
             ).squeeze(-1)
             return jnp.take_along_axis(q_at_c, action[..., jnp.newaxis], axis=-1).squeeze(-1)
-        else:  # "fac"
-            q1_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
-            return config.system.gamma ** (compute_time - 1) * q1_sa
+        q_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
+        if qac_variant in ("fac", "cond_fac"):
+            return config.system.gamma ** (compute_time - 1) * q_sa
+        return q_sa  # "cond_naive"
 
     def _value_loss_fn(
         pred: chex.Array, behavior: chex.Array, targets: chex.Array
@@ -204,8 +254,8 @@ def get_learner_fn(
                 value = critic_apply_fn(
                     params.critic_params, last_timestep.observation, method="value"
                 )
-                q_output = critic_apply_fn(
-                    params.critic_params, last_timestep.observation, method="q_value"
+                q_output = _q_output(
+                    params.critic_params, last_timestep.observation, compute_time
                 )
                 q_value = _q_at_action_and_compute_time(q_output, action, compute_time)
             else:  # "reinforce"
@@ -233,6 +283,7 @@ def get_learner_fn(
             info = {
                 **timestep.extras["episode_metrics"],
                 "episode_discounted_return": episode_discounted_return,
+                "compute_time": compute_time,
             }
 
             transition = PPOTransition(
@@ -370,22 +421,34 @@ def get_learner_fn(
                         value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
                         value_loss = _value_loss_fn(value, traj_batch.value, targets)
 
-                        # "naive" and "fac" are regressed to the same
-                        # `targets`, divided back down to a `c=1`-equivalent
-                        # target for "fac" - see `ff_qac.py`'s critic loss.
-                        q_output = critic_apply_fn(critic_params, traj_batch.obs, method="q_value")
-                        if qac_variant == "naive":
-                            q_pred = _q_at_action_and_compute_time(
-                                q_output, traj_batch.action, traj_batch.compute_time
-                            )
-                            q_targets = targets
-                        else:  # "fac"
+                        q_output = _q_output(
+                            critic_params, traj_batch.obs, traj_batch.compute_time
+                        )
+                        if qac_variant == "fac":
+                            # Regress the raw (unscaled) Q(s,·,1) prediction
+                            # against a rescaled target, rather than scaling
+                            # the prediction up to the target's natural scale
+                            # - keeps the critic's gradient in the same
+                            # (small, c=1) space regardless of the realised
+                            # compute time, avoiding a gamma^(2(c-1))
+                            # implicit down-weighting of large-c samples that
+                            # scaling the prediction instead would introduce.
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
                             ).squeeze(-1)
                             q_targets = targets / config.system.gamma ** (
                                 traj_batch.compute_time - 1
                             )
+                        else:  # "naive", "cond_naive", "cond_fac"
+                            # Already in the true Q(s,a,c) scale (table
+                            # lookup, or a c-conditioned prediction possibly
+                            # scaled by `_q_at_action_and_compute_time`) - no
+                            # prediction/target scale mismatch, so regress
+                            # directly against `targets`.
+                            q_pred = _q_at_action_and_compute_time(
+                                q_output, traj_batch.action, traj_batch.compute_time
+                            )
+                            q_targets = targets
                         q_loss = _value_loss_fn(q_pred, traj_batch.q_value, q_targets)
 
                         critic_total_loss = config.system.vf_coef * (value_loss + q_loss)
@@ -560,7 +623,13 @@ def learner_setup(
     key, actor_net_key, critic_net_key = keys
 
     qac_variant = config.system.qac_variant
-    assert qac_variant in ("naive", "fac", "reinforce"), f"Unknown qac_variant: {qac_variant}"
+    assert qac_variant in (
+        "naive",
+        "fac",
+        "cond_naive",
+        "cond_fac",
+        "reinforce",
+    ), f"Unknown qac_variant: {qac_variant}"
 
     # Define network and optimiser.
     actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
@@ -585,13 +654,16 @@ def learner_setup(
 
     actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
 
-    if qac_variant in ("naive", "fac"):
+    if qac_variant in ("naive", "fac", "cond_naive", "cond_fac"):
         value_head = hydra.utils.instantiate(config.network.critic_network.value_head)
-        # The Q head's output shape depends on `qac_variant` (see `ff_qac.py`'s
-        # module docstring): "naive" learns a full (action, compute_time)
-        # table, so needs `max_steps` (read off the actor's compute-aware
-        # torso config, which bounds the range of compute times the actor can
-        # ever realise); "fac" only ever needs Q(s,·,1), one value per action.
+        # The Q head's output shape depends on `qac_variant` (see module
+        # docstring): "naive" learns a full (action, compute_time) table, so
+        # needs `max_steps` (read off the actor's compute-aware torso
+        # config, which bounds the range of compute times the actor can ever
+        # realise); "fac"/"cond_naive"/"cond_fac" only ever need one value
+        # per action - "cond_naive"/"cond_fac" get their compute_time
+        # dependence from an extra input instead (see
+        # `ValueAndQCritic._q_input`), not the output shape.
         if qac_variant == "naive":
             max_steps = config.network.actor_network.pre_torso.max_steps
             q_head = hydra.utils.instantiate(
@@ -599,7 +671,7 @@ def learner_setup(
                 output_dim=max_steps,
                 pre_shape=(num_actions,),
             )
-        else:  # "fac"
+        else:  # "fac", "cond_naive", "cond_fac"
             q_head = hydra.utils.instantiate(
                 config.network.critic_network.q_head, output_dim=num_actions
             )
@@ -638,8 +710,17 @@ def learner_setup(
     )
     actor_opt_state = actor_optim.init(actor_params)
 
-    # Initialise critic params and optimiser state.
-    critic_params = critic_network.init(critic_net_key, init_x)
+    # Initialise critic params and optimiser state. "cond_naive"/"cond_fac"
+    # need a representative `compute_time` at init time too, so `q_head`'s
+    # input layer is sized to include the conditioning feature from the
+    # start (see `ValueAndQCritic._q_input`).
+    if qac_variant in ("cond_naive", "cond_fac"):
+        dummy_compute_time = jnp.ones((1,), dtype=jnp.int32)
+        critic_params = critic_network.init(
+            critic_net_key, init_x, compute_time=dummy_compute_time
+        )
+    else:
+        critic_params = critic_network.init(critic_net_key, init_x)
     critic_opt_state = critic_optim.init(critic_params)
 
     # Pack params.

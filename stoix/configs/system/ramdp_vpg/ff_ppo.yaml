@@ -4,14 +4,23 @@ system_name: ramdp_ff_ppo # Name of the system.
 
 # --- RL hyperparameters ---
 qac_variant: fac # How the actor's advantage is computed:
-  #   "fac"       - runtime-factorized Q-V: critic learns Q(s,·,1) only, and
-  #                 Q(s,a,c) = gamma^(c-1) * Q(s,a,1) is recovered by scaling
-  #                 (see ff_qac.py). Advantage = Q(s,a,c) - V(s).
-  #   "naive"     - Q-V with a full (num_actions, max_steps) Q table, read off
-  #                 directly with no scaling assumption (see ff_qac.py).
-  #   "reinforce" - G-V: advantage = compute-discounted n-step Monte-Carlo
-  #                 return - V(s), REINFORCE-with-baseline style (see
-  #                 ff_reinforce.py). Uses a plain V-only critic, no Q head.
+  #   "fac"        - runtime-factorized Q-V: critic learns Q(s,·,1) only, and
+  #                  Q(s,a,c) = gamma^(c-1) * Q(s,a,1) is recovered by scaling
+  #                  (see ff_qac.py). Advantage = Q(s,a,c) - V(s).
+  #   "naive"      - Q-V with a full (num_actions, max_steps) Q table, read off
+  #                  directly with no scaling assumption (see ff_qac.py).
+  #   "cond_naive" - Q-V with compute_time fed into the critic as an input (a
+  #                  learned linear feature, see ValueAndQCritic._q_input)
+  #                  instead of the output shape/an analytic scaling; the
+  #                  conditioned output is used directly as Q(s,a,c).
+  #   "cond_fac"   - same conditioned architecture (and so the same parameter
+  #                  count) as "cond_naive", but the conditioned output is
+  #                  still scaled by gamma^(c-1) - compares against
+  #                  "cond_naive" to isolate whether that analytic prior
+  #                  helps, holding capacity fixed.
+  #   "reinforce"  - G-V: advantage = compute-discounted n-step Monte-Carlo
+  #                  return - V(s), REINFORCE-with-baseline style (see
+  #                  ff_reinforce.py). Uses a plain V-only critic, no Q head.
 actor_lr: 3e-4 # Learning rate for actor network
 critic_lr: 3e-4 # Learning rate for critic network
 rollout_length: 32 # Number of environment steps per vectorised environment.

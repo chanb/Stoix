@@ -34,11 +34,19 @@ Grid axes:
   - system:      ff_reinforce (PonderNet-style REINFORCE, G - V) | ff_qac_fac (Q - V,
                  runtime-factorized) | ff_qac_naive (Q - V, full table) | ff_ppo_fac
                  (PPO, Q - V runtime-factorized) | ff_ppo_naive (PPO, Q - V full table) |
-                 ff_ppo_reinforce (PPO, G - V REINFORCE-with-baseline). The ff_ppo_*
-                 systems train stoix/systems/ramdp_vpg/ff_ppo.py - PPO's clipped
-                 surrogate over several epochs of minibatch updates per rollout,
-                 vs. one REINFORCE/QAC gradient step per rollout for the others -
-                 see --epochs/--num-minibatches/--clip-eps/--clip-value-loss.
+                 ff_ppo_cond_naive (PPO, Q - V with compute_time fed into the critic as
+                 an input instead of the output shape) | ff_ppo_cond_fac (PPO, same
+                 c-conditioned architecture/parameter count as ff_ppo_cond_naive, but
+                 the conditioned output is additionally scaled by gamma^(c-1) - compare
+                 the two to isolate whether that analytic prior helps, holding capacity
+                 fixed) | ff_ppo_reinforce (PPO, G - V REINFORCE-with-baseline). The
+                 ff_ppo_* systems train stoix/systems/ramdp_vpg/ff_ppo.py - PPO's
+                 clipped surrogate over several epochs of minibatch updates per
+                 rollout, vs. one REINFORCE/QAC gradient step per rollout for the
+                 others - see --epochs/--num-minibatches/--clip-eps/--clip-value-loss.
+                 ff_ppo_cond_naive/ff_ppo_cond_fac have no ff_qac.py equivalent (see
+                 stoix/systems/ramdp_vpg/ff_ppo.py's module docstring) - they only
+                 exist as ff_ppo_* systems.
   - architecture: mlp (AdaptiveComputationTimeTorso) | transformer
                  (TransformerChainOfThoughtTorso, latent CoT) |
                  gru (GRUAdaptiveComputationTimeTorso, GRU-based recurrent block
@@ -150,6 +158,8 @@ Usage:
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac \\
       --clip-value-loss true,false                       # PPO clipped vs. L2 critic loss
+  python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
+      --architectures mlp                          # compare conditioned Q-V variants, same capacity
 """
 
 from __future__ import annotations
@@ -179,6 +189,13 @@ SYSTEM_TO_SCRIPT = {
     # module docstring.
     "ff_ppo_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
+    # cond_naive/cond_fac have no ff_qac.py equivalent - they condition the
+    # critic's q_value on compute_time as an extra input (a learned linear
+    # feature, see stoix.networks.base_qac.ValueAndQCritic._q_input) instead
+    # of "naive"'s output-shaped table or "fac"'s analytic scaling, and only
+    # exist for ff_ppo.py (see its module docstring).
+    "ff_ppo_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
+    "ff_ppo_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
 }
 SYSTEM_TO_QAC_VARIANT = {
@@ -186,6 +203,8 @@ SYSTEM_TO_QAC_VARIANT = {
     "ff_qac_naive": "naive",
     "ff_ppo_fac": "fac",
     "ff_ppo_naive": "naive",
+    "ff_ppo_cond_naive": "cond_naive",
+    "ff_ppo_cond_fac": "cond_fac",
     "ff_ppo_reinforce": "reinforce",
 }
 # Systems trained by ff_ppo.py (PPO's clipped surrogate, several epochs of
@@ -194,7 +213,13 @@ SYSTEM_TO_QAC_VARIANT = {
 # epochs/num_minibatches/clip_eps axes (see Job.command()) and don't support
 # system.delightful (ff_ppo.py doesn't have that knob - see its module
 # docstring for why).
-PPO_SYSTEMS = ("ff_ppo_fac", "ff_ppo_naive", "ff_ppo_reinforce")
+PPO_SYSTEMS = (
+    "ff_ppo_fac",
+    "ff_ppo_naive",
+    "ff_ppo_cond_naive",
+    "ff_ppo_cond_fac",
+    "ff_ppo_reinforce",
+)
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
@@ -231,11 +256,16 @@ ARCH_TO_NETWORK = {
     },
 }
 # ff_ppo_fac/ff_ppo_naive use the same Q-V critic (ValueAndQCritic) as
-# ff_qac_fac/ff_qac_naive; ff_ppo_reinforce uses the same plain V-only critic
-# as ff_reinforce - so they reuse those networks' (arch -> network) mappings
-# rather than duplicating them.
+# ff_qac_fac/ff_qac_naive; ff_ppo_cond_naive/ff_ppo_cond_fac condition that
+# same critic on compute_time in code (see ValueAndQCritic._q_input) rather
+# than via a different network yaml, so they reuse ff_ppo_fac's network too;
+# ff_ppo_reinforce uses the same plain V-only critic as ff_reinforce - so
+# they all reuse those networks' (arch -> network) mappings rather than
+# duplicating them.
 ARCH_TO_NETWORK["ff_ppo_fac"] = ARCH_TO_NETWORK["ff_qac_fac"]
 ARCH_TO_NETWORK["ff_ppo_naive"] = ARCH_TO_NETWORK["ff_qac_naive"]
+ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_fac"]
+ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
@@ -696,12 +726,16 @@ def main() -> None:
         "--systems",
         default="ff_reinforce,ff_qac_fac,ff_qac_naive",
         help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive, ff_ppo_fac, "
-        "ff_ppo_naive, ff_ppo_reinforce}. The ff_ppo_* systems train stoix/systems/ramdp_vpg/"
-        "ff_ppo.py (PPO's clipped surrogate, several epochs of minibatch updates per rollout) "
-        "instead of a single REINFORCE/QAC gradient step per rollout - ff_ppo_fac/ff_ppo_naive "
-        "use the same Q-V advantage as ff_qac_fac/ff_qac_naive, ff_ppo_reinforce uses the same "
-        "G-V (REINFORCE-with-baseline) advantage as ff_reinforce. See --epochs/--num-minibatches/"
-        "--clip-eps (PPO-only; system.delightful is not supported by ff_ppo.py).",
+        "ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce}. The ff_ppo_* "
+        "systems train stoix/systems/ramdp_vpg/ff_ppo.py (PPO's clipped surrogate, several "
+        "epochs of minibatch updates per rollout) instead of a single REINFORCE/QAC gradient "
+        "step per rollout - ff_ppo_fac/ff_ppo_naive use the same Q-V advantage as "
+        "ff_qac_fac/ff_qac_naive; ff_ppo_cond_naive/ff_ppo_cond_fac condition the critic's "
+        "Q on compute_time as an input instead (same architecture/parameter count for both, "
+        "differing only in whether the conditioned output is also scaled by gamma^(c-1) - "
+        "no ff_qac.py equivalent); ff_ppo_reinforce uses the same G-V (REINFORCE-with-baseline) "
+        "advantage as ff_reinforce. See --epochs/--num-minibatches/--clip-eps (PPO-only; "
+        "system.delightful is not supported by ff_ppo.py).",
     )
     parser.add_argument(
         "--architectures",
@@ -758,8 +792,9 @@ def main() -> None:
         default="4",
         help="Comma-separated system.epochs values (PPO epochs per rollout), swept independently "
         "of --num-minibatches/--clip-eps (full cross product). Only applies to PPO systems "
-        "(ff_ppo_fac, ff_ppo_naive, ff_ppo_reinforce) - ignored (forced to the first value) for "
-        "ff_reinforce/ff_qac_*, which take one gradient step per rollout.",
+        "(ff_ppo_fac, ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce) - "
+        "ignored (forced to the first value) for ff_reinforce/ff_qac_*, which take one "
+        "gradient step per rollout.",
     )
     parser.add_argument(
         "--num-minibatches",

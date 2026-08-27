@@ -137,20 +137,39 @@ python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_reinforce --
 
 
 # PPO Only
+## Lightsout env
 ```
-# Lightsout env
 # IRU & Unshared IRU
 ## Fixed budget
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4,8,16 --seeds 10 --runs-per-gpu 2 --yes --architectures iru_unshared,iru --hidden-dim 16 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0,1,2,3 --wandb true --wandb-project lightsout_sweep-ppo_only
 
 ## Adaptive budget
+Learning `Q(s, c)` because it's more robust to general `c`, also more fair as it has same number of parameters regardless of `c`
+### Learn Q(s)
 python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce --max-steps 16 --seeds 10 --runs-per-gpu 2 --yes --architectures iru_unshared,iru --hidden-dim=16 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 4,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only
+
+### Learn Q(s, c)
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 10 --runs-per-gpu 2 --yes --architectures iru_unshared,iru --hidden-dim=16 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0,4,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only
 
 # Transformer
 
 ```
 
-## TF architecture search
+### TF architecture search
 ```
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4 --seeds 1 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8,16 --num-layers 1,2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 5 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8,16 --seeds 1 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 2,3 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch
+
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 1 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 4,5,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch
+```
+
+## box_block env
+```
+python ramdp_experiments/box_block_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4 --seeds 1 --runs-per-gpu 1 --yes --architectures cnn+iru --hidden-dim 256 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --box-settings exact-3 --use-input-layer-norm true --gpus 6,7 --wandb true --wandb-project box_block_sweep-ppo_only-tf_arch
+```
+
+## minatar env
+```
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 2 --yes --architectures cnn+transformer --hidden-dim 16 --mlp-dim 16 --num-layers 2 --num-heads 2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs seaquest --use-input-layer-norm true --gpus 0 --wandb true --wandb-project seaquest_sweep-ppo_only-tf_arch
+
+python ramdp_experiments/minatar_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 8 --seeds 1 --runs-per-gpu 2 --yes --architectures cnn+transformer --hidden-dim 16 --mlp-dim 16 --num-layers 2 --num-heads 2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs seaquest --use-input-layer-norm true --gpus 1 --wandb true --wandb-project seaquest_sweep-ppo_only-tf_arch
 ```

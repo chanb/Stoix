@@ -1,31 +1,26 @@
 #!/usr/bin/env python
-"""Fixed-computation-budget sweep for RAMDP systems on the Lights Out puzzle
-(env=lightsout/lightsout_3x3, see stoix/envs/lightsout/lightsout_env.py).
+"""Adaptive-computation-budget sweep for RAMDP systems on MinAtar environments
+(gymnax/<env>, e.g. gymnax/seaquest).
 
-Companion to minatar_fixed_budget_sweep.py: instead of letting the actor's
-compute torso adaptively halt (min_steps=1, sampled/learned halting), every
-job here pins `min_steps == max_steps == budget`, which - per the min_steps
-mechanism added to the compute torsos (see stoix/networks/torso_compute*.py)
-- forbids halting before `budget` steps and forces a halt at exactly
-`budget` steps. So every example always takes exactly `budget` steps of
-computation, with no adaptivity at all.
+Companion to minatar_fixed_budget_sweep.py: that script pins
+`min_steps == max_steps == budget`, forbidding halting before `budget` steps
+and forcing a halt at exactly `budget` steps - a fixed, non-adaptive
+baseline. This script instead sweeps `min_steps` and `max_steps`
+*independently* (see the min_steps mechanism added to the compute torsos,
+stoix/networks/torso_compute*.py), so the actor's compute torso can
+genuinely halt adaptively (sampled/learned halting) anywhere in
+`[min_steps, max_steps]` per example, rather than always taking a fixed
+number of steps. `min_steps == max_steps` is still possible (as one point in
+this more general grid) but isn't the default.
 
-This answers "does more computation help on this task?" directly (sweeping
-`budget` at a fixed, non-adaptive cost) and is also a simpler system to debug
-against, since compute_time is deterministic (== budget) rather than a
-learned/sampled quantity.
-
-LightsOutEnv's observation is `(m, n, 2)` - the current grid and the goal
-grid, stacked as two channels (see the env's module docstring) - so, exactly
-like minatar_fixed_budget_sweep.py's MinAtar grids, CNN architectures
-(cnn+mlp, cnn+transformer, cnn+gru, cnn+iru) consume it directly via a
-CNNTorso input_layer, while non-CNN architectures flatten it to a
-`2 * grid_size`-length vector via `stoa.FlattenObservationWrapper`.
+This answers "how much does adaptive halting help, and at what compute
+ceiling?" - sweeping both how early halting is allowed (`min_steps`) and how
+much compute is available (`max_steps`) - complementing
+minatar_fixed_budget_sweep.py's "does more (fixed) computation help?"
+question.
 
 Grid axes:
-  - grid_size:   Lights Out puzzle grid, e.g. "3x3" - sets env.scenario.name=
-                 lightsout-<grid_size> and env.kwargs.episode_length=m*n
-                 (overridable via --episode-length)
+  - env:         MinAtar game (env=gymnax/<env>) - subset of MINATAR_GAMES
   - system:      ff_reinforce (PonderNet-style REINFORCE, G - V) | ff_qac_fac (Q - V,
                  runtime-factorized) | ff_qac_naive (Q - V, full table) | ff_ppo_fac
                  (PPO, Q - V runtime-factorized) | ff_ppo_naive (PPO, Q - V full table) |
@@ -48,10 +43,6 @@ Grid axes:
                  that re-feeds the encoded observation every pondering step) |
                  iru (IRUAdaptiveComputationTimeTorso, interpolation-recurrent-
                  unit-based recurrent block, same re-feeding) |
-                 iru_unshared (UnsharedIRUAdaptiveComputationTimeTorso - like
-                 iru, but each pondering step is its own independently-
-                 parameterized IRU layer instead of one shared step reused at
-                 every iteration, so max_steps grows the parameter count) |
                  transformer_explicit_cot (TransformerExplicitCoTTorso, explicit
                  token CoT - only implemented for system=ff_reinforce, via
                  stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py; requested
@@ -61,7 +52,13 @@ Grid axes:
                  TransformerChainOfThoughtTorso) |
                  cnn+gru (CNNTorso input_layer feeding GRUAdaptiveComputationTimeTorso) |
                  cnn+iru (CNNTorso input_layer feeding IRUAdaptiveComputationTimeTorso)
-  - budget:      fixed number of steps every example takes (max_steps == min_steps)
+  - min_steps:   forbids halting (voluntarily, in replay, or greedily) before
+                 this many pondering steps - see the compute torsos'
+                 min_steps mechanism, stoix/networks/torso_compute*.py.
+  - max_steps:   forces a halt at this many pondering steps if the example
+                 hasn't halted voluntarily already. Combos where
+                 min_steps > max_steps are invalid (the torsos assert
+                 `1 <= min_steps <= max_steps`) and are skipped, not errored.
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
   - lr:          system.actor_lr - has its own value list, independent of critic_lr's
                  (the full lr x critic_lr cross product is still swept)
@@ -110,41 +107,40 @@ Grid axes:
                  transformer_explicit_cot only). Default 256.
   - seed:        5 seeds per config by default
 
-`difficulty_threshold` (env.kwargs.difficulty_threshold) and `gamma`
-(system.gamma) are fixed CLI-level values applied to every job, not swept -
-see --difficulty-threshold/--gamma. Lights Out episodes are short
-(episode_length defaults to grid_size), so gamma defaults to 0.99 rather than
-minatar_fixed_budget_sweep.py's 0.9999 (chosen there for MinAtar's much
-longer horizons). total_timesteps defaults to 2e7 (a reduced sweep budget)
-rather than the 1e8 used for full runs - re-run the winning config(s) at full
-budget afterwards.
+gamma defaults to 0.9999 (system.gamma), applied to every job (not swept),
+matching minatar_fixed_budget_sweep.py's default for MinAtar's long horizons
+- override via --gamma if needed. total_timesteps defaults to 2e7 (a reduced
+sweep budget) rather than the 1e8 used for full runs -- re-run the winning
+config(s) at full budget afterwards.
 
 Jobs are scheduled across GPUs with a fixed number of concurrent runs per
 GPU (a GPU "slot" queue + thread pool), each run pinned via
 CUDA_VISIBLE_DEVICES and logged to its own file under <output-dir>/logs/.
 
 Usage:
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --dry-run                # preview the grid
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py                          # run the full sweep (all grid sizes)
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --grid-sizes 3x3,5x5     # only these grid sizes
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_reinforce --architectures mlp \\
-      --grid-sizes 3x3 --budget 1,8 --hidden-dim 16 --lr 3e-4 --seeds 1  # small pilot / debug run
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --delightful true,false \\
+  python ramdp_experiments/minatar_sweep.py --dry-run                # preview the grid
+  python ramdp_experiments/minatar_sweep.py --limit 6 --dry-run       # preview a slice
+  python ramdp_experiments/minatar_sweep.py                          # run the full sweep (all MinAtar games)
+  python ramdp_experiments/minatar_sweep.py --envs seaquest,breakout  # only these games
+  python ramdp_experiments/minatar_sweep.py --systems ff_reinforce --architectures mlp \\
+      --envs seaquest --min-steps 1 --max-steps 8 --hidden-dim 16 --lr 3e-4 --seeds 1  # small pilot / debug run
+  python ramdp_experiments/minatar_sweep.py --min-steps 1,4 --max-steps 4,8,16 \\
+      # sweeps min_steps x max_steps (min_steps > max_steps combos skipped)
+  python ramdp_experiments/minatar_sweep.py --min-steps 8 --max-steps 8  # min_steps == max_steps, the fixed-budget special case
+  python ramdp_experiments/minatar_sweep.py --delightful true,false \\
       --delightful-eta 1.0,3.0                                    # sweep delightful PG on/off
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures mlp \\
+  python ramdp_experiments/minatar_sweep.py --architectures mlp \\
       --use-layer-norm true,false --use-input-layer-norm true,false  # sweep LayerNorm options
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_reinforce \\
+  python ramdp_experiments/minatar_sweep.py --systems ff_reinforce \\
       --architectures transformer_explicit_cot                       # explicit-CoT sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --difficulty-threshold 0.3  # easier training goals
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
+  python ramdp_experiments/minatar_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
+  python ramdp_experiments/minatar_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
+  python ramdp_experiments/minatar_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
+  python ramdp_experiments/minatar_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
+  python ramdp_experiments/minatar_sweep.py --systems ff_ppo_fac \\
       --clip-value-loss true,false                       # PPO clipped vs. L2 critic loss
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
+  python ramdp_experiments/minatar_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
       --architectures mlp                          # compare conditioned Q-V variants, same capacity
 """
 
@@ -154,7 +150,6 @@ import argparse
 import itertools
 import json
 import queue
-import re
 import subprocess
 import sys
 import time
@@ -209,7 +204,6 @@ PPO_SYSTEMS = (
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
-        "iru_unshared": "iru_unshared_compute",
         "transformer": "transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
@@ -220,7 +214,6 @@ ARCH_TO_NETWORK = {
     },
     "ff_qac_fac": {
         "mlp": "mlp_compute_qac",
-        "iru_unshared": "iru_unshared_compute_qac",
         "transformer": "transformer_compute_qac",
         "gru": "gru_compute_qac",
         "iru": "iru_compute_qac",
@@ -231,7 +224,6 @@ ARCH_TO_NETWORK = {
     },
     "ff_qac_naive": {
         "mlp": "mlp_compute_qac",
-        "iru_unshared": "iru_unshared_compute_qac",
         "transformer": "transformer_compute_qac",
         "gru": "gru_compute_qac",
         "iru": "iru_compute_qac",
@@ -255,9 +247,9 @@ ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
-# both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso,
-# IRUAdaptiveComputationTimeTorso, and UnsharedIRUAdaptiveComputationTimeTorso.
-# Used to pick the right LayerNorm overrides in Job.command().
+# both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso, and
+# IRUAdaptiveComputationTimeTorso. Used to pick the right LayerNorm overrides
+# in Job.command().
 NO_LAYER_NORM_ARCHES = (
     "transformer",
     "cnn+transformer",
@@ -265,7 +257,6 @@ NO_LAYER_NORM_ARCHES = (
     "cnn+gru",
     "iru",
     "cnn+iru",
-    "iru_unshared",
 )
 # Architectures whose input_layer is a CNNTorso (need the CNN-specific
 # overrides below instead of the flatten-observation wrapper).
@@ -276,8 +267,13 @@ CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
 # pick whether --num-heads/--mlp-dim are swept for a given architecture in
 # build_grid() and applied in Job.command().
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
-DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
-GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
+MINATAR_GAMES = (
+    "asterix",
+    "breakout",
+    "freeway",
+    "seaquest",
+    "space_invaders",
+)
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
 # doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
@@ -291,10 +287,11 @@ EXPLICIT_COT_SYSTEMS = ("ff_reinforce",)
 
 @dataclass
 class Job:
-    grid_size: str  # e.g. "3x3" - env.scenario.name becomes "lightsout-3x3"
+    env: str
     system: str
     arch: str
-    budget: int
+    min_steps: int
+    max_steps: int
     hidden_dim: int
     lr: float
     critic_lr: float
@@ -311,25 +308,16 @@ class Job:
     mlp_dim: int
     seed: int
     total_timesteps: float
-    difficulty_threshold: float
-    episode_length: int
     gamma: float
     output_dir: Path
     wandb: bool
     wandb_project: str
 
     @property
-    def env(self) -> str:
-        """Lightsout scenario identifier (e.g. "lightsout-3x3") - recorded in
-        the manifest as the "env" field, matching every other
-        *_fixed_budget_sweep.py script, for plot_fixed_budget_sweep.py's
-        per-env grouping."""
-        return f"lightsout-{self.grid_size}"
-
-    @property
     def run_name(self) -> str:
         name = (
-            f"{self.env}-{self.system}-{self.arch}-budget_{self.budget}"
+            f"{self.env}-{self.system}-{self.arch}"
+            f"-min_steps_{self.min_steps}-max_steps_{self.max_steps}"
             f"-hidden_dim_{self.hidden_dim}-lr_{self.lr:g}-critic_lr_{self.critic_lr:g}"
         )
         # Not shown for transformer_explicit_cot - num_layers isn't swept for
@@ -365,13 +353,7 @@ class Job:
         cmd = [
             python_bin,
             script,
-            # Base config is a fixed 3x3 example (only one exists), with the
-            # actual grid size, task name, and episode length overridden below.
-            "env=lightsout/lightsout_3x3",
-            f"env.scenario.name={self.env}",
-            f"env.scenario.task_name=lightsout_{self.grid_size}",
-            f"env.kwargs.episode_length={self.episode_length}",
-            f"env.kwargs.difficulty_threshold={self.difficulty_threshold:g}",
+            f"env=gymnax/{self.env}",
             f"network={network}",
             f"system.gamma={self.gamma:g}",
             f"arch.total_timesteps={self.total_timesteps:g}",
@@ -379,10 +361,13 @@ class Job:
             "arch.num_evaluation=50",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
-            # min_steps == max_steps == budget: no adaptivity, every example always
-            # takes exactly `budget` steps (see stoix/networks/torso_compute*.py).
-            f"network.actor_network.pre_torso.max_steps={self.budget}",
-            f"network.actor_network.pre_torso.min_steps={self.budget}",
+            # Independently swept - see the compute torsos' min_steps mechanism
+            # (stoix/networks/torso_compute*.py): min_steps forbids halting
+            # before that many steps; max_steps forces a halt at that many.
+            # min_steps == max_steps (no adaptivity) is one point in this grid,
+            # not the default - contrast minatar_fixed_budget_sweep.py.
+            f"network.actor_network.pre_torso.max_steps={self.max_steps}",
+            f"network.actor_network.pre_torso.min_steps={self.min_steps}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
             f"system.ent_coef=0.01",
@@ -420,25 +405,18 @@ class Job:
             # TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso, and
             # IRUAdaptiveComputationTimeTorso only have use_input_layer_norm, not
             # use_layer_norm (see stoix/networks/torso_compute_transformer.py and
-            # stoix/networks/torso_compute.py). `++` (override-or-add), not `=`:
-            # not every yaml config declares this key explicitly (e.g.
-            # transformer_compute_qac.yaml was missing it), so a plain `=`
-            # override can fail with "Key not in struct" - see num_layers above
-            # for the same issue.
+            # stoix/networks/torso_compute.py).
             cmd.append(
-                f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         else:
-            cmd.append(f"++network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
+            cmd.append(f"network.actor_network.pre_torso.use_layer_norm={self.use_layer_norm}")
             cmd.append(
-                f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
+                f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch not in CNN_ARCHES:
-            # LightsOutEnv's native observation is (m, n, 2) (see
-            # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
-            # 2 * grid_size vector for non-CNN torsos.
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         else:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
@@ -541,11 +519,28 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             f"{EXPLICIT_COT_ARCH}, which is only implemented for {EXPLICIT_COT_SYSTEMS}."
         )
 
+    # (min_steps, max_steps) combos: independently swept (see --min-steps/
+    # --max-steps), but the compute torsos assert `1 <= min_steps <= max_steps`
+    # (stoix/networks/torso_compute*.py) - a requested min_steps > max_steps
+    # pairing is invalid, so it's skipped here rather than erroring at launch.
+    step_combos = [
+        (min_steps, max_steps)
+        for min_steps in args.min_steps
+        for max_steps in args.max_steps
+        if min_steps <= max_steps
+    ]
+    n_skipped_step_combos = len(args.min_steps) * len(args.max_steps) - len(step_combos)
+    if n_skipped_step_combos:
+        print(
+            f"Skipping {n_skipped_step_combos} (min_steps, max_steps) combo(s) with "
+            "min_steps > max_steps."
+        )
+
     jobs = []
     for (
-        grid_size,
+        env,
         (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim),
-        budget,
+        (min_steps, max_steps),
         hidden_dim,
         lr,
         critic_lr,
@@ -553,9 +548,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         (epochs, num_minibatches, clip_eps, clip_value_loss),
         seed,
     ) in itertools.product(
-        args.grid_sizes,
+        args.envs,
         system_arch_ln_combos,
-        args.budget,
+        step_combos,
         args.hidden_dim,
         args.lr,
         args.critic_lr,
@@ -570,14 +565,13 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful, delightful_eta = False, args.delightful_eta[0]
         else:
             epochs, num_minibatches, clip_eps, clip_value_loss = ppo_combos[0]
-        m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
-        episode_length = args.episode_length if args.episode_length is not None else m * n
         jobs.append(
             Job(
-                grid_size=grid_size,
+                env=env,
                 system=system,
                 arch=arch,
-                budget=budget,
+                min_steps=min_steps,
+                max_steps=max_steps,
                 hidden_dim=hidden_dim,
                 lr=lr,
                 critic_lr=critic_lr,
@@ -594,8 +588,6 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 mlp_dim=mlp_dim,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
-                difficulty_threshold=args.difficulty_threshold,
-                episode_length=episode_length,
                 gamma=args.gamma,
                 output_dir=args.output_dir,
                 wandb=args.wandb,
@@ -661,7 +653,6 @@ def run_job(
 
     result = {
         **asdict(job),
-        "env": job.env,
         "run_name": job.run_name,
         "output_dir": str(job.output_dir),
         "gpu": gpu,
@@ -680,10 +671,9 @@ def run_job(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--grid-sizes",
-        default=",".join(DEFAULT_GRID_SIZES),
-        help="Comma-separated Lights Out grid sizes, each 'MxN' (e.g. '3x3'). Sets "
-        "env.scenario.name=lightsout-<grid_size>.",
+        "--envs",
+        default=",".join(MINATAR_GAMES),
+        help=f"Comma-separated subset of {{{','.join(MINATAR_GAMES)}}} (env=gymnax/<env>).",
     )
     parser.add_argument(
         "--systems",
@@ -703,18 +693,26 @@ def main() -> None:
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
-        help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, "
-        "transformer_explicit_cot, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}. iru_unshared "
-        "(UnsharedIRUAdaptiveComputationTimeTorso) is like iru but with no weight sharing across "
-        "pondering steps - each step is its own independently-parameterized IRU layer. "
-        "transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
+        help="Comma-separated subset of {mlp, transformer, gru, iru, transformer_explicit_cot, "
+        "cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}. transformer_explicit_cot "
+        "(TransformerExplicitCoTTorso) is only "
         f"implemented for system in {EXPLICIT_COT_SYSTEMS} - other (system, architecture) combos "
         "requesting it are skipped, not errored.",
     )
     parser.add_argument(
-        "--budget",
+        "--min-steps",
+        default="1",
+        help="Comma-separated network.actor_network.pre_torso.min_steps values, swept "
+        "independently of --max-steps (full cross product) - forbids halting before this many "
+        "pondering steps. Default 1 (no forced minimum - the usual adaptive-halting setting).",
+    )
+    parser.add_argument(
+        "--max-steps",
         default="1,2,4,8,16",
-        help="Comma-separated fixed compute budgets - each sets max_steps == min_steps to this value.",
+        help="Comma-separated network.actor_network.pre_torso.max_steps values, swept "
+        "independently of --min-steps (full cross product) - forces a halt at this many "
+        "pondering steps if not halted already. Combos where min_steps > max_steps are invalid "
+        "(skipped, not errored) - see build_grid.",
     )
     parser.add_argument("--hidden-dim", default="16,32", help="Comma-separated actor torso widths.")
     parser.add_argument(
@@ -780,10 +778,9 @@ def main() -> None:
     parser.add_argument(
         "--use-input-layer-norm",
         default="false",
-        help="Comma-separated bools (true/false) - LayerNorm on the encoded observation before the "
-        "initial token/state/recurrent-input projection "
-        "(network.actor_network.pre_torso.use_input_layer_norm). Supported by architecture in "
-        "{mlp, transformer, gru, iru, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}; ignored "
+        help="Comma-separated bools (true/false) - LayerNorm on the raw observation before the "
+        "initial token/state projection (network.actor_network.pre_torso.use_input_layer_norm). "
+        "Supported by architecture in {mlp, transformer, cnn+mlp, cnn+transformer}; ignored "
         "(forced off) for transformer_explicit_cot.",
     )
     parser.add_argument(
@@ -815,28 +812,11 @@ def main() -> None:
         "(forced to the first value) for every other architecture. Default 256.",
     )
     parser.add_argument(
-        "--difficulty-threshold",
-        type=float,
-        default=0.5,
-        help="env.kwargs.difficulty_threshold, applied to every job (not swept): goals reachable "
-        "in fewer than difficulty_threshold * grid_size presses are sampled during training "
-        "('easy'); the eval environment samples harder goals instead - see "
-        "stoix/envs/lightsout/lightsout_env.py.",
-    )
-    parser.add_argument(
-        "--episode-length",
-        type=int,
-        default=None,
-        help="env.kwargs.episode_length, applied to every job (not swept). Defaults to grid_size "
-        "(m * n) per grid size if omitted.",
-    )
-    parser.add_argument(
         "--gamma",
         type=float,
-        default=0.99,
-        help="system.gamma, applied to every job (not swept). Lower than "
-        "minatar_fixed_budget_sweep.py's 0.9999 default, since Lights Out episodes are much "
-        "shorter (episode_length defaults to grid_size).",
+        default=0.9999,
+        help="system.gamma, applied to every job (not swept). Matches "
+        "minatar_fixed_budget_sweep.py's default for MinAtar's long horizons.",
     )
     parser.add_argument(
         "--wandb",
@@ -846,7 +826,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--wandb-project",
-        default="lightsout_fixed_budget_sweep",
+        default="minatar_sweep",
         help="W&B project name (logger.loggers.wandb.project), applied to every job so the whole "
         "sweep lands in the same project. Only used when --wandb is set.",
     )
@@ -857,7 +837,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results_lightsout_fixed_budget_sweep",
+        default=REPO_ROOT / "results_minatar_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")
@@ -873,10 +853,11 @@ def main() -> None:
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt before launching.")
     args = parser.parse_args()
 
-    args.grid_sizes = args.grid_sizes.split(",")
+    args.envs = args.envs.split(",")
     args.systems = args.systems.split(",")
     args.architectures = args.architectures.split(",")
-    args.budget = [int(x) for x in args.budget.split(",")]
+    args.min_steps = [int(x) for x in args.min_steps.split(",")]
+    args.max_steps = [int(x) for x in args.max_steps.split(",")]
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
     args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
@@ -896,22 +877,17 @@ def main() -> None:
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
 
-    for g in args.grid_sizes:
-        assert GRID_SIZE_RE.match(g), f"invalid grid size {g!r}, expected 'MxN' (e.g. '3x3')"
+    for e in args.envs:
+        assert e in MINATAR_GAMES, f"unknown env {e!r}, expected one of {list(MINATAR_GAMES)}"
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
-    valid_architectures = (
-        "mlp",
-        "iru_unshared",
-        "transformer",
-        "gru",
-        "iru",
-        EXPLICIT_COT_ARCH,
-    ) + CNN_ARCHES
+    valid_architectures = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
     for a in args.architectures:
         assert a in valid_architectures, f"unknown architecture {a!r}, expected one of {valid_architectures}"
-    for b in args.budget:
-        assert b >= 1, f"budget must be >= 1, got {b}"
+    for s in args.min_steps:
+        assert s >= 1, f"min_steps must be >= 1, got {s}"
+    for s in args.max_steps:
+        assert s >= 1, f"max_steps must be >= 1, got {s}"
     for n in args.num_layers:
         assert n >= 1, f"num_layers must be >= 1, got {n}"
     for n in args.num_heads:
@@ -952,9 +928,12 @@ def main() -> None:
         f"(XLA_PYTHON_CLIENT_MEM_FRACTION={mem_fraction:g} per process)"
     )
     print(f"Grid: {len(jobs)} jobs to run" + (f" ({n_skipped} skipped as already-existing)" if n_skipped else ""))
-    print(f"  grid_sizes={args.grid_sizes}")
+    print(f"  envs={args.envs}")
     print(f"  systems={args.systems} architectures={args.architectures}")
-    print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
+    print(
+        f"  min_steps={args.min_steps} max_steps={args.max_steps} hidden_dim={args.hidden_dim} "
+        f"seeds=0..{args.seeds - 1}"
+    )
     print(f"  lr={args.lr} critic_lr={args.critic_lr}")
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
@@ -970,11 +949,7 @@ def main() -> None:
         f"  num_heads={args.num_heads} mlp_dim={args.mlp_dim} "
         f"(transformer/cnn+transformer/transformer_explicit_cot only)"
     )
-    print(
-        f"  difficulty_threshold={args.difficulty_threshold} "
-        f"episode_length={args.episode_length if args.episode_length is not None else 'grid_size (default)'} "
-        f"gamma={args.gamma}"
-    )
+    print(f"  gamma={args.gamma}")
     print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
     if args.wandb:
         print(f"  wandb=True project={args.wandb_project}")
