@@ -137,14 +137,20 @@ python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_reinforce --
 
 
 # PPO Only
-## Fixed budget
 ```
+# Lightsout env
+# IRU & Unshared IRU
+## Fixed budget
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4,8,16 --seeds 10 --runs-per-gpu 2 --yes --architectures iru_unshared,iru --hidden-dim 16 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0,1,2,3 --wandb true --wandb-project lightsout_sweep-ppo_only
 
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4,8,16 --seeds 10 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8 --num-layers 2 --num-heads 2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 4,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only
+## Adaptive budget
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce --max-steps 16 --seeds 10 --runs-per-gpu 2 --yes --architectures iru_unshared,iru --hidden-dim=16 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 4,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only
+
+# Transformer
+
 ```
 
-## Adaptive budget
+## TF architecture search
 ```
-python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce --max-steps 16 --seeds 10 --runs-per-gpu 2 --yes --architectures iru_unshared,iru --hidden-dim=16 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 4,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4 --seeds 1 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8,16 --num-layers 1,2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 5 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch
 ```

@@ -108,6 +108,9 @@ Grid axes:
                  (TransformerExplicitCoTTorso) - every other architecture has
                  no such param, so this is forced to a single value for them.
                  Default 4.
+  - mlp_dim:     transformer feedforward width (network.actor_network.pre_torso.mlp_dim);
+                 same applicability as num_heads (transformer/cnn+transformer/
+                 transformer_explicit_cot only). Default 256.
   - seed:        5 seeds per config by default
 
 `difficulty_threshold` (env.kwargs.difficulty_threshold) and `gamma`
@@ -251,10 +254,11 @@ NO_LAYER_NORM_ARCHES = (
 # Architectures whose input_layer is a CNNTorso (need the CNN-specific
 # overrides below instead of the flatten-observation wrapper).
 CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
-# Architectures whose pre_torso has a `num_heads` param (attention heads) -
-# TransformerChainOfThoughtTorso and TransformerExplicitCoTTorso; every other
-# torso has no such concept. Used to pick whether --num-heads is swept for a
-# given architecture in build_grid() and applied in Job.command().
+# Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention
+# heads / transformer feedforward width) - TransformerChainOfThoughtTorso and
+# TransformerExplicitCoTTorso; every other torso has no such concept. Used to
+# pick whether --num-heads/--mlp-dim are swept for a given architecture in
+# build_grid() and applied in Job.command().
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
@@ -289,6 +293,7 @@ class Job:
     use_input_layer_norm: bool
     num_layers: int
     num_heads: int
+    mlp_dim: int
     seed: int
     total_timesteps: float
     difficulty_threshold: float
@@ -317,10 +322,10 @@ class Job:
         # that arch (it keeps its own yaml default), see build_grid.
         if self.arch != EXPLICIT_COT_ARCH:
             name += f"-num_layers_{self.num_layers}"
-        # Only shown for architectures with a num_heads param - see
+        # Only shown for architectures with num_heads/mlp_dim params - see
         # TRANSFORMER_ARCHES/build_grid.
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
-            name += f"-num_heads_{self.num_heads}"
+            name += f"-num_heads_{self.num_heads}-mlp_dim_{self.mlp_dim}"
         # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
         # exist for ff_reinforce.py/ff_qac.py (single gradient step per
         # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
@@ -384,9 +389,10 @@ class Job:
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
-            # Attention head count - TransformerChainOfThoughtTorso/
+            # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
             # TransformerExplicitCoTTorso only (see TRANSFORMER_ARCHES).
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
+            cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -461,7 +467,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         itertools.product(args.epochs, args.num_minibatches, args.clip_eps, args.clip_value_loss)
     )
 
-    # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads) combos:
+    # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
+    # mlp_dim) combos:
     #  - transformer_explicit_cot only exists for ff_reinforce (see
     #    EXPLICIT_COT_SYSTEMS) - any other requested (system, architecture)
     #    pair is skipped rather than erroring, so e.g. the default
@@ -474,9 +481,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    see stoix/networks/torso_compute*.py) is swept for every arch except
     #    transformer_explicit_cot, which keeps its own yaml default instead
     #    (see --num-layers help).
-    #  - num_heads (attention heads) only exists on transformer/cnn+transformer/
-    #    transformer_explicit_cot (see TRANSFORMER_ARCHES) - swept only for
-    #    those, everything else forced to a single value.
+    #  - num_heads (attention heads) and mlp_dim (transformer feedforward width)
+    #    only exist on transformer/cnn+transformer/transformer_explicit_cot (see
+    #    TRANSFORMER_ARCHES) - swept only for those, everything else forced to a
+    #    single value.
     # Unsupported axes are forced to a single default value rather than
     # needlessly duplicated per requested setting.
     system_arch_ln_combos = []
@@ -485,6 +493,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         for arch in args.architectures:
             is_transformer_arch = arch in TRANSFORMER_ARCHES or arch == EXPLICIT_COT_ARCH
             num_heads_options = args.num_heads if is_transformer_arch else [args.num_heads[0]]
+            mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
             if arch == EXPLICIT_COT_ARCH:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
@@ -502,16 +511,18 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             for use_layer_norm, use_input_layer_norm in ln_options:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
-                        system_arch_ln_combos.append(
-                            (
-                                system,
-                                arch,
-                                use_layer_norm,
-                                use_input_layer_norm,
-                                num_layers,
-                                num_heads,
+                        for mlp_dim in mlp_dim_options:
+                            system_arch_ln_combos.append(
+                                (
+                                    system,
+                                    arch,
+                                    use_layer_norm,
+                                    use_input_layer_norm,
+                                    num_layers,
+                                    num_heads,
+                                    mlp_dim,
+                                )
                             )
-                        )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
     if n_skipped_incompatible:
         print(
@@ -539,7 +550,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     jobs = []
     for (
         grid_size,
-        (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads),
+        (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim),
         (min_steps, max_steps),
         hidden_dim,
         lr,
@@ -587,6 +598,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 use_input_layer_norm=use_input_layer_norm,
                 num_layers=num_layers,
                 num_heads=num_heads,
+                mlp_dim=mlp_dim,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 difficulty_threshold=args.difficulty_threshold,
@@ -807,6 +819,14 @@ def main() -> None:
         "architecture, since those torsos have no such param. Default 4.",
     )
     parser.add_argument(
+        "--mlp-dim",
+        default="256",
+        help="Comma-separated ints - transformer feedforward width "
+        "(network.actor_network.pre_torso.mlp_dim). Same applicability as --num-heads: only "
+        "architecture in {transformer, cnn+transformer, transformer_explicit_cot}; ignored "
+        "(forced to the first value) for every other architecture. Default 256.",
+    )
+    parser.add_argument(
         "--difficulty-threshold",
         type=float,
         default=0.5,
@@ -887,6 +907,7 @@ def main() -> None:
     ]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
+    args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
 
     for g in args.grid_sizes:
         assert GRID_SIZE_RE.match(g), f"invalid grid size {g!r}, expected 'MxN' (e.g. '3x3')"
@@ -910,6 +931,8 @@ def main() -> None:
         assert n >= 1, f"num_layers must be >= 1, got {n}"
     for n in args.num_heads:
         assert n >= 1, f"num_heads must be >= 1, got {n}"
+    for d in args.mlp_dim:
+        assert d >= 1, f"mlp_dim must be >= 1, got {d}"
     for e in args.epochs:
         assert e >= 1, f"epochs must be >= 1, got {e}"
     for m in args.num_minibatches:
@@ -961,7 +984,10 @@ def main() -> None:
         f"use_input_layer_norm={args.use_input_layer_norm} (not transformer_explicit_cot)"
     )
     print(f"  num_layers={args.num_layers} (not swept for transformer_explicit_cot)")
-    print(f"  num_heads={args.num_heads} (transformer/cnn+transformer/transformer_explicit_cot only)")
+    print(
+        f"  num_heads={args.num_heads} mlp_dim={args.mlp_dim} "
+        f"(transformer/cnn+transformer/transformer_explicit_cot only)"
+    )
     print(
         f"  difficulty_threshold={args.difficulty_threshold} "
         f"episode_length={args.episode_length if args.episode_length is not None else 'grid_size (default)'} "
