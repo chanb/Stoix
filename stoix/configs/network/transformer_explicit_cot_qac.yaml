@@ -1,0 +1,39 @@
+# ---Explicit Chain-of-Thought Compute-Time-Aware Q Actor-Critic Networks---
+# Same TransformerExplicitCoTTorso actor as transformer_explicit_cot.yaml. The
+# critic is stoix.networks.base_qac.ValueAndQCritic, matching
+# transformer_compute_qac.yaml/mlp_compute_qac.yaml: one torso, a scalar
+# value_head V(s), and a q_head whose output shape depends on
+# system.qac_variant (see ff_ppo.py's/ff_qac.py's learner_setup and module
+# docstrings) - a full (num_actions, max_steps) table for "naive"/
+# "cond_naive"/"cond_fac" (well, only "naive" needs the table shape;
+# "cond_naive"/"cond_fac" instead condition on compute_time as an input), or
+# just (num_actions,) - Q(s,·,1) - for the runtime-factorized "fac" variant.
+# output_dim/pre_shape for both heads are injected in code, not set here.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso
+    hidden_dim: 128
+    vocab_size: 32
+    num_heads: 4
+    num_layers: 2
+    mlp_dim: 256
+    max_steps: 8
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    activation: relu
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  value_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
+  q_head:
+    _target_: stoix.networks.heads.MLPHead
+    hidden_sizes: []
+    activation: relu
+    use_layer_norm: False

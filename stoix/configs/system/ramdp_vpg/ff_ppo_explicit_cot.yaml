@@ -1,0 +1,45 @@
+# --- Defaults Explicit-CoT Compute-Time-Aware FF-PPO (RAMDP-PPO, explicit CoT) ---
+
+system_name: ramdp_ff_ppo_explicit_cot # Name of the system.
+
+# --- RL hyperparameters ---
+qac_variant: fac # How the actor's advantage is computed:
+  #   "fac"        - runtime-factorized Q-V: critic learns Q(s,·,1) only, and
+  #                  Q(s,a,c) = gamma^(c-1) * Q(s,a,1) is recovered by scaling
+  #                  (see ff_qac.py). Advantage = Q(s,a,c) - V(s).
+  #   "naive"      - Q-V with a full (num_actions, max_steps) Q table, read off
+  #                  directly with no scaling assumption (see ff_qac.py).
+  #   "cond_naive" - Q-V with compute_time fed into the critic as an input (a
+  #                  learned linear feature, see ValueAndQCritic._q_input)
+  #                  instead of the output shape/an analytic scaling; the
+  #                  conditioned output is used directly as Q(s,a,c).
+  #   "cond_fac"   - same conditioned architecture (and so the same parameter
+  #                  count) as "cond_naive", but the conditioned output is
+  #                  still scaled by gamma^(c-1) - compares against
+  #                  "cond_naive" to isolate whether that analytic prior
+  #                  helps, holding capacity fixed.
+  #   "reinforce"  - G-V: advantage = compute-discounted n-step Monte-Carlo
+  #                  return - V(s), REINFORCE-with-baseline style (see
+  #                  ff_reinforce.py). Uses a plain V-only critic, no Q head.
+actor_lr: 3e-4 # Learning rate for actor network
+critic_lr: 3e-4 # Learning rate for critic network
+rollout_length: 32 # Number of environment steps per vectorised environment.
+epochs: 4 # Number of PPO epochs per training data batch.
+num_minibatches: 16 # Number of minibatches per PPO epoch.
+gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition that
+  # took `compute_time` pondering steps discounts through `gamma ** compute_time`
+  # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
+  # controls both the usual reward horizon and the cost of pondering longer, and
+  # (for "fac") the Q(s,a,1) -> Q(s,a,c) scaling.
+clip_eps: 0.2 # Clipping value for the PPO actor ratio, and for the critic's value/Q loss
+  # when clip_value_loss=True.
+clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"/"fac") uses
+  # PPO-style clipping against the old value/Q estimate recorded at rollout time
+  # (stoix.utils.loss.clipped_value_loss), or plain L2 regression to the target instead
+  # (rlax.l2_loss, as in ff_reinforce.py/ff_qac.py). Only affects the critic - the actor's
+  # ratio is always clipped regardless of this setting.
+ent_coef: 0.01 # Entropy regularisation term for loss function.
+vf_coef: 0.5 # Critic weight.
+standardize_advantages: False # Whether to standardize the advantages.
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: False # Whether learning rates should be linearly decayed during training.

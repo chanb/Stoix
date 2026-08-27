@@ -1,0 +1,11 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ramdp_vpg/ff_ppo_explicit_cot
+  - network: transformer_explicit_cot_qac
+  - env: gymnax/cartpole
+  - _self_
+
+hydra:
+  searchpath:
+    - file://stoix/configs
