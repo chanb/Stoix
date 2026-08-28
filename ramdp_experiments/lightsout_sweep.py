@@ -93,6 +93,10 @@ Grid axes:
                  or plain L2 regression instead (False, as in ff_reinforce.py/
                  ff_qac.py) - see stoix/systems/ramdp_vpg/ff_ppo.py's module
                  docstring. ff_ppo_* systems only, see epochs.
+  - standardize_advantages: system.standardize_advantages - whether the advantage
+                 (Q - V or G - V, depending on qac_variant) is standardized
+                 (zero mean, unit variance) across the rollout before being used
+                 in the PPO clipped surrogate. ff_ppo_* systems only, see epochs.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
                  cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
@@ -158,6 +162,8 @@ Usage:
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac \\
       --clip-value-loss true,false                       # PPO clipped vs. L2 critic loss
+  python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac \\
+      --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
       --architectures mlp                          # compare conditioned Q-V variants, same capacity
 """
@@ -319,6 +325,7 @@ class Job:
     num_minibatches: int
     clip_eps: float
     clip_value_loss: bool
+    standardize_advantages: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -363,6 +370,8 @@ class Job:
             name += f"-epochs_{self.epochs}-minibatches_{self.num_minibatches}-clip_{self.clip_eps:g}"
             if not self.clip_value_loss:
                 name += "-l2_critic"
+            if self.standardize_advantages:
+                name += "-std_adv"
         if self.delightful:
             name += f"-delightful_eta_{self.delightful_eta:g}"
         if self.use_layer_norm:
@@ -416,6 +425,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
@@ -488,13 +498,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
-    # (epochs, num_minibatches, clip_eps, clip_value_loss) combos: only meaningful
-    # for PPO_SYSTEMS (ff_ppo.py) - forced to the first requested value for every
-    # other system in the main product loop below, then deduplicated by run_name,
-    # mirroring how delightful_combos/num_heads_options collapse axes that don't
-    # apply.
+    # (epochs, num_minibatches, clip_eps, clip_value_loss, standardize_advantages)
+    # combos: only meaningful for PPO_SYSTEMS (ff_ppo.py) - forced to the first
+    # requested value for every other system in the main product loop below, then
+    # deduplicated by run_name, mirroring how delightful_combos/num_heads_options
+    # collapse axes that don't apply.
     ppo_combos = list(
-        itertools.product(args.epochs, args.num_minibatches, args.clip_eps, args.clip_value_loss)
+        itertools.product(
+            args.epochs,
+            args.num_minibatches,
+            args.clip_eps,
+            args.clip_value_loss,
+            args.standardize_advantages,
+        )
     )
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
@@ -586,7 +602,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         lr,
         critic_lr,
         (delightful, delightful_eta),
-        (epochs, num_minibatches, clip_eps, clip_value_loss),
+        (epochs, num_minibatches, clip_eps, clip_value_loss, standardize_advantages),
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -605,7 +621,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         if system in PPO_SYSTEMS:
             delightful, delightful_eta = False, args.delightful_eta[0]
         else:
-            epochs, num_minibatches, clip_eps, clip_value_loss = ppo_combos[0]
+            epochs, num_minibatches, clip_eps, clip_value_loss, standardize_advantages = (
+                ppo_combos[0]
+            )
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         jobs.append(
@@ -624,6 +642,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches=num_minibatches,
                 clip_eps=clip_eps,
                 clip_value_loss=clip_value_loss,
+                standardize_advantages=standardize_advantages,
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
                 num_layers=num_layers,
@@ -817,6 +836,14 @@ def main() -> None:
         "independently of --epochs/--num-minibatches/--clip-eps. PPO systems only, see --epochs.",
     )
     parser.add_argument(
+        "--standardize-advantages",
+        default="false",
+        help="Comma-separated bools (true/false) - system.standardize_advantages: whether the "
+        "advantage is standardized (zero mean, unit variance) across the rollout before being "
+        "used in the PPO clipped surrogate. Swept independently of --epochs/--num-minibatches/"
+        "--clip-eps/--clip-value-loss. PPO systems only, see --epochs.",
+    )
+    parser.add_argument(
         "--use-layer-norm",
         default="false",
         help="Comma-separated bools (true/false) - LayerNorm inside AdaptiveComputationTimeTorso's "
@@ -936,6 +963,9 @@ def main() -> None:
     args.clip_value_loss = [
         x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")
     ]
+    args.standardize_advantages = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
+    ]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
@@ -1012,7 +1042,8 @@ def main() -> None:
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
-        f"clip_value_loss={args.clip_value_loss} (PPO systems only: {PPO_SYSTEMS})"
+        f"clip_value_loss={args.clip_value_loss} standardize_advantages={args.standardize_advantages} "
+        f"(PPO systems only: {PPO_SYSTEMS})"
     )
     print(
         f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "

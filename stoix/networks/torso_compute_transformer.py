@@ -176,17 +176,17 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
         # The first scratchpad token is the observation projected into the
         # model width.
-        if self.use_input_layer_norm:
-            observation = nn.LayerNorm()(observation)
         initial_token = parse_activation_fn(self.activation)(
             nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         )
+        if self.use_input_layer_norm:
+            observation = nn.LayerNorm()(observation)
 
-        pos_embedding = self.param(
-            "pos_embedding",
-            normal(stddev=0.02),
-            (self.max_steps + 1, self.hidden_dim),
-        )
+        # pos_embedding = self.param(
+        #     "pos_embedding",
+        #     normal(stddev=0.02),
+        #     (self.max_steps + 1, self.hidden_dim),
+        # )
 
         # Pre-allocate the CoT scratchpad; unwritten positions are never read
         # since we always slice to the valid prefix.
@@ -211,7 +211,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
         for step in range(self.max_steps):
             seq_len = step + 1
-            tokens = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
+            # tokens = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
+            tokens = scratchpad[..., :seq_len, :]
             for block in blocks:
                 tokens = block(tokens)
             state = tokens[..., -1, :]
