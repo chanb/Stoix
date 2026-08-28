@@ -321,6 +321,7 @@ class Job:
     seed: int
     total_timesteps: float
     total_num_envs: int
+    rollout_length: int
     difficulty_threshold: float
     episode_length: int
     gamma: float
@@ -397,6 +398,7 @@ class Job:
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
             f"system.ent_coef=0.01",
+            f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
         if self.system in PPO_SYSTEMS:
@@ -606,6 +608,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 total_num_envs=args.total_num_envs,
+                rollout_length=args.rollout_length,
                 difficulty_threshold=args.difficulty_threshold,
                 episode_length=episode_length,
                 gamma=args.gamma,
@@ -884,6 +887,13 @@ def main() -> None:
         help="arch.total_num_envs, applied to every job (not swept). Total number of vectorised "
         "environments across all devices and batched updates.",
     )
+    parser.add_argument(
+        "--rollout-length",
+        type=int,
+        default=32,
+        help="system.rollout_length, applied to every job (not swept). Number of environment "
+        "steps per vectorised environment collected per rollout.",
+    )
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids, or 'auto' to detect via nvidia-smi.")
     parser.add_argument("--runs-per-gpu", type=int, default=2, help="Concurrent runs per GPU.")
     parser.add_argument(
@@ -1018,7 +1028,7 @@ def main() -> None:
     )
     print(
         f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "
-        f"output_dir={args.output_dir}"
+        f"rollout_length={args.rollout_length} output_dir={args.output_dir}"
     )
     if args.server is not None:
         print(f"  server={args.server} -> module load {SERVER_MODULES[args.server]}")

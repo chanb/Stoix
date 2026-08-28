@@ -171,7 +171,7 @@ python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_co
 ######### Vulcan
 python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 1 --runs-per-gpu 4 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 3,4,5 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope
 
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 8,16,32 --mlp-dim 32 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 8,16 --mlp-dim 32 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 1e-4 --critic-lr 1e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 2048 --epochs 8 --num_minibatches 32 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan
 
 ```
 
