@@ -72,6 +72,7 @@ from stoix.base_types import (
     LearnerFn,
 )
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
+from stoix.networks.base_qac import SeparateValueAndQCritic
 from stoix.networks.base_qac import ValueAndQCritic as Critic
 from stoix.systems.ramdp_vpg.evaluator import evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ff_reinforce import get_distribution_act_fn_with_compute_time
@@ -441,7 +442,17 @@ def learner_setup(
     actor_action_head = hydra.utils.instantiate(
         config.network.actor_network.action_head, action_dim=num_actions
     )
-    critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
+    # A `value_pre_torso`/`q_pre_torso` pair (instead of a single shared
+    # `pre_torso`) selects `SeparateValueAndQCritic`: V and Q each get their
+    # own torso, so the two heads share no parameters at all (see
+    # `base_qac.py`'s module docstring for the shared- vs separate-torso
+    # tradeoff).
+    separate_qv_torsos = "value_pre_torso" in config.network.critic_network
+    if separate_qv_torsos:
+        value_torso = hydra.utils.instantiate(config.network.critic_network.value_pre_torso)
+        q_torso = hydra.utils.instantiate(config.network.critic_network.q_pre_torso)
+    else:
+        critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
     value_head = hydra.utils.instantiate(config.network.critic_network.value_head)
     # The Q head's output shape depends on `qac_variant` (see module docstring):
     # "naive" learns a full (action, compute_time) table, so needs `max_steps`
@@ -471,15 +482,33 @@ def learner_setup(
             config.network.actor_network.input_layer
         )
     critic_kwargs = {}
-    if "input_layer" in config.network.critic_network:
+    if separate_qv_torsos:
+        if "value_input_layer" in config.network.critic_network:
+            critic_kwargs["value_input_layer"] = hydra.utils.instantiate(
+                config.network.critic_network.value_input_layer
+            )
+        if "q_input_layer" in config.network.critic_network:
+            critic_kwargs["q_input_layer"] = hydra.utils.instantiate(
+                config.network.critic_network.q_input_layer
+            )
+    elif "input_layer" in config.network.critic_network:
         critic_kwargs["input_layer"] = hydra.utils.instantiate(
             config.network.critic_network.input_layer
         )
 
     actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
-    critic_network = Critic(
-        torso=critic_torso, value_head=value_head, q_head=q_head, **critic_kwargs
-    )
+    if separate_qv_torsos:
+        critic_network = SeparateValueAndQCritic(
+            value_torso=value_torso,
+            q_torso=q_torso,
+            value_head=value_head,
+            q_head=q_head,
+            **critic_kwargs,
+        )
+    else:
+        critic_network = Critic(
+            torso=critic_torso, value_head=value_head, q_head=q_head, **critic_kwargs
+        )
 
     actor_lr = make_learning_rate(config.system.actor_lr, config, 1, 1)
     critic_lr = make_learning_rate(config.system.critic_lr, config, 1, 1)

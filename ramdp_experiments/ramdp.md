@@ -171,18 +171,45 @@ python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_co
 ######### Vulcan
 python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 1 --runs-per-gpu 4 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 3,4,5 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope
 
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 8,16 --mlp-dim 32 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 1e-4 --critic-lr 1e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 2048 --epochs 8 --num_minibatches 32 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 2 --architectures transformer --hidden-dim 8,16 --mlp-dim 32 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 1e-4 --critic-lr 1e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 2048 --rollout-length 160 --epochs 4 --num-minibatches 8 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_lightsout_fixed_budget_sweep
+
+
+
+#### CURRENT
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 8,16 --mlp-dim 16,256 --num-layers 2 --num-heads 1,2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 1024 --rollout-length 6 --epochs 8 --num-minibatches 8 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_lightsout_fixed_budget_sweep --yes
+
+
+### CHOSEN ARCHITECTURE
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8,16 --seeds 10 --runs-per-gpu 4 --architectures transformer --hidden-dim 8 --mlp-dim 16 --num-layers 2 --num-heads 1 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 1024 --rollout-length 6 --epochs 8 --num-minibatches 8 --wandb true --wandb-project lightsout-main-ppo_only-tf_arch-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_lightsout_fixed_budget_sweep --yes
+
+### Check best hyperparam with different PPO setting
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 8 --mlp-dim 16 --num-layers 2 --num-heads 1 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 512 --rollout-length 6 --epochs 8 --num-minibatches 4 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_lightsout_fixed_budget_sweep --yes
+
+
+### Q variants
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 1 --runs-per-gpu 3 --architectures transformer --hidden-dim 8 --mlp-dim 16 --num-layers 2 --num-heads 1 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 1024 --rollout-length 6 --epochs 8 --num-minibatches 8 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_lightsout_fixed_budget_sweep --yes
 
 ```
 
-## box_block env
-```
-python ramdp_experiments/box_block_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4 --seeds 1 --runs-per-gpu 1 --yes --architectures cnn+iru --hidden-dim 256 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --box-settings exact-3 --use-input-layer-norm true --gpus 6,7 --wandb true --wandb-project box_block_sweep-ppo_only-tf_arch
-```
 
 ## minatar env
 ```
 python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 2 --yes --architectures cnn+transformer --hidden-dim 16 --mlp-dim 16 --num-layers 2 --num-heads 2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs seaquest --use-input-layer-norm true --gpus 0 --wandb true --wandb-project seaquest_sweep-ppo_only-tf_arch
 
 python ramdp_experiments/minatar_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 8 --seeds 1 --runs-per-gpu 2 --yes --architectures cnn+transformer --hidden-dim 16 --mlp-dim 16 --num-layers 2 --num-heads 2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs seaquest --use-input-layer-norm true --gpus 1 --wandb true --wandb-project seaquest_sweep-ppo_only-tf_arch
+```
+
+
+```
+# FLATTEN OBS
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 16,32 --mlp-dim 32,256 --num-layers 2 --num-heads 2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs asterix,breakout,freeway,seaquest,space_invaders --use-input-layer-norm true --gpus 0 --total-num-envs 128 --rollout-length 128 --epochs 8 --num-minibatches 16 --wandb true --wandb-project minatar_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_minatar_fixed_budget_sweep --yes
+
+# IMG OBS
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures cnn+transformer --hidden-dim 16,32 --mlp-dim 32 --num-layers 2 --num-heads 2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs asterix --use-input-layer-norm true --gpus 0 --total-num-envs 128 --rollout-length 128 --epochs 8 --num-minibatches 16 --wandb true --wandb-project minatar_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_minatar_fixed_budget_sweep --yes
+
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures cnn+transformer --hidden-dim 16,32 --mlp-dim 32 --num-layers 2 --num-heads 2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs freeway --use-input-layer-norm true --gpus 0 --total-num-envs 128 --rollout-length 128 --epochs 8 --num-minibatches 16 --wandb true --wandb-project minatar_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_minatar_fixed_budget_sweep --yes
+
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures cnn+transformer --hidden-dim 16,32 --mlp-dim 32 --num-layers 2 --num-heads 2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs seaquest --use-input-layer-norm true --gpus 0 --total-num-envs 128 --rollout-length 128 --epochs 8 --num-minibatches 16 --wandb true --wandb-project minatar_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_minatar_fixed_budget_sweep --yes
+
+python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures cnn+transformer --hidden-dim 16,32 --mlp-dim 32 --num-layers 2 --num-heads 2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs space_invaders --use-input-layer-norm true --gpus 0 --total-num-envs 128 --rollout-length 128 --epochs 8 --num-minibatches 16 --wandb true --wandb-project minatar_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_minatar_fixed_budget_sweep --yes
 ```

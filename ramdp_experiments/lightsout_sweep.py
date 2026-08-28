@@ -263,16 +263,24 @@ ARCH_TO_NETWORK = {
     },
 }
 # ff_ppo_fac/ff_ppo_naive use the same Q-V critic (ValueAndQCritic) as
-# ff_qac_fac/ff_qac_naive; ff_ppo_cond_naive/ff_ppo_cond_fac condition that
-# same critic on compute_time in code (see ValueAndQCritic._q_input) rather
-# than via a different network yaml, so they reuse ff_ppo_fac's network too;
-# ff_ppo_reinforce uses the same plain V-only critic as ff_reinforce - so
-# they all reuse those networks' (arch -> network) mappings rather than
-# duplicating them.
+# ff_qac_fac/ff_qac_naive, so they reuse ff_qac_fac's/ff_qac_naive's
+# (arch -> network) mappings rather than duplicating them.
+# ff_ppo_cond_naive/ff_ppo_cond_fac condition that critic's q_value on
+# compute_time in code (see ValueAndQCritic._q_input), and use the
+# "<network>_separate_qv" variant of each network - V and Q each get their
+# own torso (stoix.networks.base_qac.SeparateValueAndQCritic) rather than
+# sharing one, since sharing a torso between compute_time-conditioned Q and
+# unconditioned V here would otherwise let the Q head's compute_time
+# dependence leak into V's shared embedding.
+# ff_ppo_reinforce uses the same plain V-only critic as ff_reinforce, so it
+# reuses that network mapping too.
 ARCH_TO_NETWORK["ff_ppo_fac"] = ARCH_TO_NETWORK["ff_qac_fac"]
 ARCH_TO_NETWORK["ff_ppo_naive"] = ARCH_TO_NETWORK["ff_qac_naive"]
-ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_fac"]
-ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
+ARCH_TO_NETWORK["ff_ppo_cond_qv"] = {
+    arch: f"{network}_separate_qv" for arch, network in ARCH_TO_NETWORK["ff_qac_fac"].items()
+}
+ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_cond_qv"]
+ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_cond_qv"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has

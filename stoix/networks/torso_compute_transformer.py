@@ -182,11 +182,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
         if self.use_input_layer_norm:
             observation = nn.LayerNorm()(observation)
 
-        # pos_embedding = self.param(
-        #     "pos_embedding",
-        #     normal(stddev=0.02),
-        #     (self.max_steps + 1, self.hidden_dim),
-        # )
+        pos_embedding = self.param(
+            "pos_embedding",
+            normal(stddev=0.02),
+            (self.max_steps + 1, self.hidden_dim),
+        )
 
         # Pre-allocate the CoT scratchpad; unwritten positions are never read
         # since we always slice to the valid prefix.
@@ -211,8 +211,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
         for step in range(self.max_steps):
             seq_len = step + 1
-            # tokens = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
-            tokens = scratchpad[..., :seq_len, :]
+            tokens = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
+            # tokens = scratchpad[..., :seq_len, :]
             for block in blocks:
                 tokens = block(tokens)
             state = tokens[..., -1, :]

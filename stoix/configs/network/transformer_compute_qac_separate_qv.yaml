@@ -1,0 +1,42 @@
+# ---Transformer Chain-of-Thought Compute-Time-Aware Q Actor-Critic Networks (separate V/Q torsos)---
+# Same TransformerChainOfThoughtTorso actor as transformer_compute_qac.yaml.
+# The critic is stoix.networks.base_qac.SeparateValueAndQCritic instead of
+# transformer_compute_qac.yaml's shared-torso ValueAndQCritic: V and Q each
+# get their own MLPTorso (independently initialised, no shared parameters at
+# all) - selected in code by the presence of `value_pre_torso`/`q_pre_torso`
+# here instead of a single `pre_torso` (see ff_ppo.py's/ff_qac.py's
+# learner_setup). q_head's output shape still depends on
+# system.qac_variant, exactly as in transformer_compute_qac.yaml.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso
+    hidden_dim: 128
+    num_heads: 4
+    num_layers: 2
+    mlp_dim: 256
+    max_steps: 8
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    activation: relu
+    use_input_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  value_pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  q_pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  value_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
+  q_head:
+    _target_: stoix.networks.heads.MLPHead
+    hidden_sizes: []
+    activation: relu
+    use_layer_norm: False
