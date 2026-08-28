@@ -320,6 +320,7 @@ class Job:
     mlp_dim: int
     seed: int
     total_timesteps: float
+    total_num_envs: int
     difficulty_threshold: float
     episode_length: int
     gamma: float
@@ -384,6 +385,7 @@ class Job:
             f"network={network}",
             f"system.gamma={self.gamma:g}",
             f"arch.total_timesteps={self.total_timesteps:g}",
+            f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
@@ -603,6 +605,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 mlp_dim=mlp_dim,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
+                total_num_envs=args.total_num_envs,
                 difficulty_threshold=args.difficulty_threshold,
                 episode_length=episode_length,
                 gamma=args.gamma,
@@ -874,6 +877,13 @@ def main() -> None:
     )
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
+    parser.add_argument(
+        "--total-num-envs",
+        type=int,
+        default=1024,
+        help="arch.total_num_envs, applied to every job (not swept). Total number of vectorised "
+        "environments across all devices and batched updates.",
+    )
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids, or 'auto' to detect via nvidia-smi.")
     parser.add_argument("--runs-per-gpu", type=int, default=2, help="Concurrent runs per GPU.")
     parser.add_argument(
@@ -1006,7 +1016,10 @@ def main() -> None:
         f"episode_length={args.episode_length if args.episode_length is not None else 'grid_size (default)'} "
         f"gamma={args.gamma}"
     )
-    print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
+    print(
+        f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "
+        f"output_dir={args.output_dir}"
+    )
     if args.server is not None:
         print(f"  server={args.server} -> module load {SERVER_MODULES[args.server]}")
     if args.wandb:

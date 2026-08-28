@@ -138,6 +138,7 @@ import argparse
 import itertools
 import json
 import queue
+import shlex
 import subprocess
 import sys
 import time
@@ -272,6 +273,14 @@ EXPLICIT_COT_SCRIPT = "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"
 EXPLICIT_COT_NETWORK = "transformer_explicit_cot"
 EXPLICIT_COT_SYSTEMS = ("ff_reinforce",)
 
+# --server <key> -> modules to `module load` (in order) before each job's python
+# process. `module` is a shell function, not a binary, so jobs run under this
+# option are launched via `bash -lc "module load ... && exec <cmd>"` instead of
+# the normal argv-list subprocess.run (see run_job()).
+SERVER_MODULES = {
+    "vulcan": ["StdEnv/2023", "cuda/12.2"],
+}
+
 @dataclass
 class Job:
     env: str
@@ -294,6 +303,7 @@ class Job:
     mlp_dim: int
     seed: int
     total_timesteps: float
+    total_num_envs: int
     gamma: float
     output_dir: Path
     wandb: bool
@@ -342,6 +352,7 @@ class Job:
             f"network={network}",
             f"system.gamma={self.gamma:g}",
             f"arch.total_timesteps={self.total_timesteps:g}",
+            f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
@@ -552,6 +563,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 mlp_dim=mlp_dim,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
+                total_num_envs=args.total_num_envs,
                 gamma=args.gamma,
                 output_dir=args.output_dir,
                 wandb=args.wandb,
@@ -588,6 +600,7 @@ def run_job(
     manifest_lock,
     manifest_path: Path,
     mem_fraction: float,
+    server: str = None,
 ) -> dict:
     log_path = log_dir / f"{job.run_name}.log"
     cmd = job.command(python_bin)
@@ -604,14 +617,26 @@ def run_job(
     full_env = os.environ.copy()
     full_env.update(env)
 
+    if server is not None:
+        # `module` is a shell function (from Lmod's profile.d init scripts), not
+        # a binary, so it can't be exec'd directly via an argv list - run it
+        # through a login shell instead, which sources the init scripts that
+        # define it. `exec` replaces the shell with the python process so
+        # `proc.returncode` still reflects the actual job, not bash's.
+        module_preamble = " && ".join(f"module load {m}" for m in SERVER_MODULES[server])
+        run_cmd = ["bash", "-lc", f"{module_preamble} && exec {shlex.join(cmd)}"]
+    else:
+        run_cmd = cmd
+
     start = time.time()
     with open(log_path, "w") as log_file:
         log_file.write(
-            f"# GPU={gpu} XLA_PYTHON_CLIENT_MEM_FRACTION={mem_fraction:g}\n# CMD={' '.join(cmd)}\n\n"
+            f"# GPU={gpu} XLA_PYTHON_CLIENT_MEM_FRACTION={mem_fraction:g} server={server}\n"
+            f"# CMD={' '.join(cmd)}\n\n"
         )
         log_file.flush()
         proc = subprocess.run(
-            cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
+            run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
         )
     elapsed = time.time() - start
 
@@ -786,6 +811,13 @@ def main() -> None:
     )
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
+    parser.add_argument(
+        "--total-num-envs",
+        type=int,
+        default=1024,
+        help="arch.total_num_envs, applied to every job (not swept). Total number of vectorised "
+        "environments across all devices and batched updates.",
+    )
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids, or 'auto' to detect via nvidia-smi.")
     parser.add_argument("--runs-per-gpu", type=int, default=2, help="Concurrent runs per GPU.")
     parser.add_argument(
@@ -795,6 +827,15 @@ def main() -> None:
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")
+    parser.add_argument(
+        "--server",
+        default=None,
+        choices=sorted(SERVER_MODULES),
+        help="If set, `module load` this server's required environment modules (see "
+        "SERVER_MODULES) before each job's python process, e.g. --server vulcan loads "
+        f"{SERVER_MODULES['vulcan']}. Jobs are then launched via `bash -lc` instead of "
+        "directly, since `module` is a shell function, not a binary.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Only run the first N jobs (for a pilot / sanity check).")
     parser.add_argument(
         "--skip-existing",
@@ -898,7 +939,12 @@ def main() -> None:
         f"(transformer/cnn+transformer/transformer_explicit_cot only)"
     )
     print(f"  gamma={args.gamma}")
-    print(f"  total_timesteps={args.total_timesteps:g} output_dir={args.output_dir}")
+    print(
+        f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "
+        f"output_dir={args.output_dir}"
+    )
+    if args.server is not None:
+        print(f"  server={args.server} -> module load {SERVER_MODULES[args.server]}")
     if args.wandb:
         print(f"  wandb=True project={args.wandb_project}")
 
@@ -933,7 +979,9 @@ def main() -> None:
     def worker(job: Job) -> dict:
         gpu = gpu_slots.get()
         try:
-            return run_job(job, gpu, args.python, log_dir, manifest_lock, manifest_path, mem_fraction)
+            return run_job(
+                job, gpu, args.python, log_dir, manifest_lock, manifest_path, mem_fraction, args.server
+            )
         finally:
             gpu_slots.put(gpu)
 
