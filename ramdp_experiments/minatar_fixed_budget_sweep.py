@@ -414,11 +414,11 @@ class Job:
         if self.arch not in CNN_ARCHES:
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         else:
-            cmd.append(f"network.actor_network.input_layer.channel_sizes=[3]")
+            cmd.append(f"network.actor_network.input_layer.channel_sizes=[8]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
             cmd.append(f"network.actor_network.input_layer.strides=[1]")
             cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
-            cmd.append(f"network.critic_network.input_layer.channel_sizes=[3]")
+            cmd.append(f"network.critic_network.input_layer.channel_sizes=[16]")
             cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
             cmd.append(f"network.critic_network.input_layer.strides=[1]")
             cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
