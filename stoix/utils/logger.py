@@ -522,7 +522,7 @@ class WandBLogger(BaseLogger):
             init_kwargs.update(id=run_id, resume="allow")
 
         # Initialize the run
-        self.run = wandb.init(**init_kwargs)
+        self.init_kwargs = init_kwargs
 
         self.detailed_logging = detailed_logging
         self.upload_json_data = upload_json_data
@@ -553,7 +553,8 @@ class WandBLogger(BaseLogger):
         # Update the run config with a JSON-serializable version (same helper as Neptune)
         safe_cfg = stringify_unsupported(config)
         # Use allow_val_change=True so late updates don't error
-        wandb.config.update(safe_cfg, allow_val_change=True)
+        # self.run.config.update(safe_cfg, allow_val_change=True)
+        self.run = wandb.init(**self.init_kwargs, config=safe_cfg)
 
     def stop(self) -> None:
         if self.upload_json_data:

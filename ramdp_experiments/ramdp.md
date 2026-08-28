@@ -4,6 +4,12 @@ Gymnax 1.0.0 supports seaquest
 uv pip install --no-deps "gymnax==1.0.0"
 ```
 
+## Vulcan
+```
+module load StdEnv/2023
+module load cuda/12.2
+```
+
 ## Transformer with implicit CoT
 ```
 c_max=8
@@ -160,6 +166,13 @@ python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_con
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8,16 --seeds 1 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 2,3 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch
 
 python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 1 --runs-per-gpu 2 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 4,5,6,7 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch
+
+
+######### Vulcan
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 16 --seeds 1 --runs-per-gpu 4 --yes --architectures transformer --hidden-dim 8 --mlp-dim 256 --num-layers 2 --num-heads 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 3,4,5 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4,8 --seeds 1 --runs-per-gpu 4 --architectures transformer --hidden-dim 8,16,32 --mlp-dim 32 --num-layers 2 --num-heads 1,2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan
+
 ```
 
 ## box_block env
