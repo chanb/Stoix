@@ -948,7 +948,10 @@ def main() -> None:
         "--skip-existing",
         action="store_true",
         default=True,
-        help="Skip jobs whose run directory already exists (default: on; use --no-skip-existing to force rerun).",
+        help=(
+            "Skip jobs that already have a successful (returncode 0) entry in "
+            "manifest.jsonl (default: on; use --no-skip-existing to force rerun)."
+        ),
     )
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     parser.add_argument("--dry-run", action="store_true", help="Print the planned jobs and exit without running anything.")
@@ -1020,7 +1023,18 @@ def main() -> None:
         jobs = jobs[: args.limit]
 
     if args.skip_existing:
-        remaining = [j for j in jobs if not j.run_dir().exists()]
+        completed_run_names = set()
+        manifest_path = args.output_dir / "manifest.jsonl"
+        if manifest_path.exists():
+            with open(manifest_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if entry.get("returncode") == 0:
+                        completed_run_names.add(entry["run_name"])
+        remaining = [j for j in jobs if j.run_name not in completed_run_names]
         n_skipped = len(jobs) - len(remaining)
         jobs = remaining
     else:
