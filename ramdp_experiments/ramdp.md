@@ -215,3 +215,10 @@ python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforc
 
 python ramdp_experiments/minatar_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,1,2,8 --seeds 1 --runs-per-gpu 4 --architectures cnn+transformer --hidden-dim 16,32 --mlp-dim 32 --num-layers 2 --num-heads 2 --total-timesteps 1e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --envs space_invaders --use-input-layer-norm true --gpus 0 --total-num-envs 128 --rollout-length 128 --epochs 16 --num-minibatches 2 --wandb true --wandb-project minatar_sweep-ppo_only-tf_arch-nope-vulcan --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_minatar_fixed_budget_sweep --yes
 ```
+
+
+
+
+```
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,4 --seeds 3 --runs-per-gpu 4 --architectures transformer --hidden-dim 8 --mlp-dim 32 --num-layers 2 --num-heads 2 --total-timesteps 5e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --delightful false --grid-sizes 3x3 --use-input-layer-norm true --episode-length 6 --gpus 0 --total-num-envs 1024 --rollout-length 6 --epochs 2,8 --num-minibatches 8,16 --wandb true --wandb-project lightsout-main-ppo_only-tf_arch-vulcan-5e7 --server vulcan --output-dir /home/chanb/scratch/logs/Stoix/results_lightsout_fixed_budget_sweep --yes
+```

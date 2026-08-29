@@ -368,36 +368,47 @@ class Job:
         return f"lightsout-{self.grid_size}"
 
     @property
-    def run_name(self) -> str:
+    def group_tag(self) -> str:
+        """Abbreviated form of run_name with the seed suffix omitted -
+        identifies the hyperparameter setting shared by every seed of a
+        config, for W&B grouping (logger.loggers.wandb.group_tag) and
+        manifest.jsonl. Uses short axis prefixes (mn/mx/hd/lr/clr/nl/nh/md/
+        ep/mb/clip/deta/ln/iln/stdadv) rather than run_name's full field
+        names, since W&B's group field gets unwieldy at run_name's length."""
+        system_short = self.system.removeprefix("ff_")
         name = (
-            f"{self.env}-{self.system}-{self.arch}"
-            f"-min_steps_{self.min_steps}-max_steps_{self.max_steps}"
-            f"-hidden_dim_{self.hidden_dim}-lr_{self.lr:g}-critic_lr_{self.critic_lr:g}"
+            f"{self.env}-{system_short}-{self.arch}"
+            f"-mn{self.min_steps}-mx{self.max_steps}"
+            f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}"
         )
         # Not shown for transformer_explicit_cot - num_layers isn't swept for
         # that arch (it keeps its own yaml default), see build_grid.
         if self.arch != EXPLICIT_COT_ARCH:
-            name += f"-num_layers_{self.num_layers}"
+            name += f"-nl{self.num_layers}"
         # Only shown for architectures with num_heads/mlp_dim params - see
         # TRANSFORMER_ARCHES/build_grid.
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
-            name += f"-num_heads_{self.num_heads}-mlp_dim_{self.mlp_dim}"
+            name += f"-nh{self.num_heads}-md{self.mlp_dim}"
         # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
         # exist for ff_reinforce.py/ff_qac.py (single gradient step per
         # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
         if self.system in PPO_SYSTEMS:
-            name += f"-epochs_{self.epochs}-minibatches_{self.num_minibatches}-clip_{self.clip_eps:g}"
+            name += f"-ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
             if not self.clip_value_loss:
-                name += "-l2_critic"
+                name += "-l2c"
             if self.standardize_advantages:
-                name += "-std_adv"
+                name += "-stdadv"
         if self.delightful:
-            name += f"-delightful_eta_{self.delightful_eta:g}"
+            name += f"-deta{self.delightful_eta:g}"
         if self.use_layer_norm:
             name += "-ln"
         if self.use_input_layer_norm:
-            name += "-input_ln"
-        return name + f"-seed_{self.seed}"
+            name += "-iln"
+        return name
+
+    @property
+    def run_name(self) -> str:
+        return f"{self.group_tag}-seed_{self.seed}"
 
     def command(self, python_bin: str) -> List[str]:
         if self.arch == EXPLICIT_COT_ARCH:
@@ -462,6 +473,10 @@ class Job:
             # collide on the same W&B run.
             cmd.append("logger.loggers.wandb.enabled=True")
             cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
+            # Single-element list: WandBLogger joins group_tag with "_" into
+            # W&B's group field (see stoix/utils/logger.py), so every seed of
+            # this hyperparameter setting groups together in the W&B UI.
+            cmd.append(f"logger.loggers.wandb.group_tag=[{self.group_tag}]")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         if self.arch == EXPLICIT_COT_ARCH:
@@ -755,6 +770,7 @@ def run_job(
         **asdict(job),
         "env": job.env,
         "run_name": job.run_name,
+        "group_tag": job.group_tag,
         "output_dir": str(job.output_dir),
         "gpu": gpu,
         "returncode": proc.returncode,
