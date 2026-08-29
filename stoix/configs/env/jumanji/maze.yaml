@@ -1,0 +1,37 @@
+# ---Environment Configs---
+# Maze: navigate a randomly-generated maze from a start cell to a target
+# cell. Difficulty scales continuously with maze size.
+#
+# Difficulty knobs (env.kwargs.generator):
+#   - num_rows, num_cols: maze dimensions (time_limit defaults to
+#     num_rows * num_cols in the underlying jumanji env).
+#
+# Reward is sparse (1.0 on reaching the target, 0.0 otherwise - see
+# jumanji.environments.routing.maze.env.Maze).
+#
+# Like Knapsack, Maze's Observation has no single field that alone determines
+# the right decision - `agent_position`, `target_position`, and `walls` are
+# all needed together (walls alone doesn't say where the agent or target
+# are) - so `observation_attribute` is intentionally omitted and
+# ConcatObservationWrapper flattens every field (including the nested
+# `Position(row, col)` NamedTuples) into one vector instead (see
+# stoix/utils/make_env.py and stoix/wrappers/concat_observation.py).
+env_name: jumanji
+multi_agent: False
+
+scenario:
+  name: Maze-v0
+  task_name: maze
+
+kwargs:
+  generator:
+    _target_: jumanji.environments.routing.maze.generator.RandomGenerator
+    num_rows: 5
+    num_cols: 5
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
+
+wrapper:
+  _target_: stoix.wrappers.concat_observation.ConcatObservationWrapper

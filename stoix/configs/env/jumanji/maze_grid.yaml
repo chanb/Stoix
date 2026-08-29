@@ -1,0 +1,32 @@
+# ---Environment Configs---
+# Same as jumanji/maze.yaml but instead of ConcatObservationWrapper (which
+# flattens agent_position/target_position/walls/action_mask/step_count into
+# one vector), this uses MazeGridObservationWrapper to keep the (num_rows,
+# num_cols) spatial structure: walls, plus one-hot agent/target positions,
+# stacked as three channels - (num_rows, num_cols, 3) - so a CNN-based
+# network (network=cnn_mlp_compute / cnn_mlp_compute_qac /
+# cnn_transformer_compute / cnn_transformer_compute_qac) can operate on the
+# real maze layout. Walls alone (a plain single-channel grid) wouldn't be
+# enough - it doesn't say where the agent or target are - so this wrapper
+# bakes their positions in as extra channels instead of dropping them (see
+# stoix/wrappers/maze_grid.py). Plain MLP-based networks (mlp_compute etc.)
+# should keep using env=jumanji/maze.
+env_name: jumanji
+multi_agent: False
+
+scenario:
+  name: Maze-v0
+  task_name: maze
+
+kwargs:
+  generator:
+    _target_: jumanji.environments.routing.maze.generator.RandomGenerator
+    num_rows: 5
+    num_cols: 5
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
+
+wrapper:
+  _target_: stoix.wrappers.maze_grid.MazeGridObservationWrapper

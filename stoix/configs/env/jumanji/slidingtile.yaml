@@ -1,0 +1,39 @@
+# ---Environment Configs---
+# Sliding Tile Puzzle (8-/15-puzzle): a permutation puzzle in the same family
+# as Lights Out (stoix/envs/lightsout/lightsout_env.py), but with a *dense*
+# reward by default (DenseRewardFn: +1/-1 per tile that becomes newly
+# correct/incorrect each step) rather than Lights Out's sparse terminal-only
+# reward - see jumanji.environments.logic.sliding_tile_puzzle.reward.
+#
+# Difficulty knobs (env.kwargs.generator):
+#   - grid_size: N -> an NxN puzzle (3 = 8-puzzle, 4 = 15-puzzle, ...).
+#   - num_random_moves: scramble depth (RandomWalkGenerator does `this many`
+#     random valid moves from the solved state before handing control to the
+#     agent) - directly analogous to Lights Out's `dist`.
+#
+# The `puzzle` observation attribute alone is sufficient: it's an (N, N) grid
+# of tile values with EMPTY_TILE (0) marking the blank, so the blank's
+# position is always recoverable from `puzzle` itself - no information is
+# lost by dropping the `empty_tile_position`/`action_mask` fields the way it
+# would be for Knapsack/Maze (see knapsack.yaml/maze.yaml).
+env_name: jumanji
+observation_attribute: puzzle
+multi_agent: False
+
+scenario:
+  name: SlidingTilePuzzle-v0
+  task_name: slidingtile
+
+kwargs:
+  generator:
+    _target_: jumanji.environments.logic.sliding_tile_puzzle.generator.RandomWalkGenerator
+    grid_size: 3
+    num_random_moves: 10
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
+
+# Optional wrapper to flatten the observation space.
+# wrapper:
+#   _target_: stoa.FlattenObservationWrapper

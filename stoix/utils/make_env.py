@@ -88,11 +88,13 @@ def make_jumanji_env(scenario_name: str, config: DictConfig) -> Tuple[Environmen
     import jumanji.wrappers as jumanji_wrappers
     from stoa.env_adapters.jumanji import JumanjiToStoa
 
-    env_kwargs = dict(copy.deepcopy(config.env.kwargs))
-    if "generator" in env_kwargs:
-        generator = env_kwargs.pop("generator")
-        generator = hydra.utils.instantiate(generator)
-        env_kwargs["generator"] = generator
+    # hydra.utils.instantiate recurses through the whole kwargs tree,
+    # instantiating any nested `_target_` entry (e.g. `generator`, or a
+    # `reward_fn` override such as jumanji/sokoban.yaml's
+    # stoix.envs.sokoban.reward.DenseRewardNoStepPenalty) into a real object,
+    # leaving plain values (ints, floats, bools) untouched - see
+    # stoix/envs/sokoban/reward.py.
+    env_kwargs = dict(hydra.utils.instantiate(copy.deepcopy(config.env.kwargs)))
 
     env = jumanji.make(scenario_name, **env_kwargs)
     eval_env = jumanji.make(scenario_name, **env_kwargs)
@@ -102,9 +104,21 @@ def make_jumanji_env(scenario_name: str, config: DictConfig) -> Tuple[Environmen
         eval_env = jumanji_wrappers.MultiToSingleWrapper(eval_env)
 
     env = JumanjiToStoa(env)
-    env = ObservationExtractWrapper(env, config.env.observation_attribute)
     eval_env = JumanjiToStoa(eval_env)
-    eval_env = ObservationExtractWrapper(eval_env, config.env.observation_attribute)
+    # observation_attribute is optional: environments whose native observation
+    # already bundles everything needed into one array (e.g. Sokoban's `grid`,
+    # SlidingTilePuzzle's `puzzle`) extract that one field here. Environments
+    # whose observation is a structured NamedTuple of several *all*-necessary
+    # fields (e.g. Knapsack's weights/values/packed_items, Maze's
+    # agent_position/target_position/walls) omit it and instead keep the full
+    # structured observation for a subsequent config.env.wrapper (e.g.
+    # stoix.wrappers.concat_observation.ConcatObservationWrapper) to flatten -
+    # extracting just one such field would silently drop information the
+    # network needs.
+    observation_attribute = config.env.get("observation_attribute", None)
+    if observation_attribute:
+        env = ObservationExtractWrapper(env, observation_attribute)
+        eval_env = ObservationExtractWrapper(eval_env, observation_attribute)
 
     if isinstance(env.action_space(), MultiDiscreteSpace):
         env = MultiDiscreteToDiscreteWrapper(env)

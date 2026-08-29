@@ -1,0 +1,40 @@
+# ---Environment Configs---
+# Knapsack: pick items (one per step) to pack into a fixed-budget bag,
+# maximizing total value without exceeding the weight budget - a classic
+# combinatorial-construction task with a *continuous* difficulty knob
+# (num_items), unlike Lights Out's threshold-hack difficulty.
+#
+# Difficulty knobs (env.kwargs.generator):
+#   - num_items:    number of items to choose from.
+#   - total_budget: bag weight capacity.
+#
+# Reward is dense by default (DenseReward: the value of the item packed at
+# the current timestep - see
+# jumanji.environments.packing.knapsack.reward.DenseReward).
+#
+# Unlike Sokoban/SlidingTilePuzzle, Knapsack's Observation has no single field
+# that alone determines the right decision - `weights`, `values`,
+# `packed_items`, and `action_mask` are all needed together (e.g. `values`
+# without `weights` makes packing unsolvable) - so `observation_attribute` is
+# intentionally omitted here and ConcatObservationWrapper flattens every
+# field into one vector instead (see stoix/utils/make_env.py and
+# stoix/wrappers/concat_observation.py).
+env_name: jumanji
+multi_agent: False
+
+scenario:
+  name: Knapsack-v1
+  task_name: knapsack
+
+kwargs:
+  generator:
+    _target_: jumanji.environments.packing.knapsack.generator.RandomGenerator
+    num_items: 10
+    total_budget: 2.5
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
+
+wrapper:
+  _target_: stoix.wrappers.concat_observation.ConcatObservationWrapper
