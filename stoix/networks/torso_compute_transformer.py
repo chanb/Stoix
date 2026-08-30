@@ -13,9 +13,10 @@ taken before the model chose to stop and act - the interface is identical to
 actor's `pre_torso` (see `stoix.networks.base_compute.FeedForwardActorWithComputeTime`).
 
 Concretely, per CoT step `t` (0-indexed):
-  1. Run `num_layers` shared transformer blocks over the scratchpad tokens
-     produced so far (`t + 1` of them, including the initial token derived
-     from the observation), with learned positional embeddings.
+  1. Run `num_layers` shared transformer blocks, *causally masked*, over the
+     scratchpad tokens produced so far (`t + 1` of them, including the
+     initial token derived from the observation), with learned positional
+     embeddings.
   2. Take the representation at the last (most recent) position as this
      step's "thought" - this is what the halting unit and, if halting, the
      action head see.
@@ -23,10 +24,14 @@ Concretely, per CoT step `t` (0-indexed):
      `AdaptiveComputationTimeTorso`). If not halting, append the thought to
      the scratchpad and continue.
 
-Because the whole scratchpad is visible via self-attention, a step's thought
-can depend on every earlier thought, not just the immediately preceding one -
-the natural inductive bias for a chain of thought, as opposed to the
-Markovian single-hidden-state recurrence of the MLP ACT torso.
+The causal mask means each position's representation is a function only of
+its own past, at every layer - so, although the scratchpad is recomputed
+from scratch each step (no KV-cache), re-deriving it never changes a
+position's earlier output. Because the whole (causal) scratchpad is visible
+via self-attention, a step's thought can depend on every earlier thought, not
+just the immediately preceding one - the natural inductive bias for a chain
+of thought, as opposed to the Markovian single-hidden-state recurrence of the
+MLP ACT torso.
 
 Since `max_steps` must be static for JAX, the scratchpad is a pre-allocated
 buffer and the CoT loop is unrolled; each step re-attends over a growing
@@ -51,10 +56,11 @@ _PROB_EPS = 1e-6
 class TransformerBlock(nn.Module):
     """A single pre-norm transformer block: self-attention + MLP.
 
-    Operates on `(*batch, seq_len, hidden_dim)`. Since callers only ever read
-    off the representation at the last sequence position, no causal mask is
-    applied - full self-attention over whatever prefix is passed in is
-    equivalent, and simpler.
+    Operates on `(*batch, seq_len, hidden_dim)`. `mask` should be a causal
+    mask (e.g. from `nn.make_causal_mask`) so that each position's output is
+    a function only of its own past - required for the CoT torsos' per-step
+    recompute-from-scratch loop to be a true (KV-cache-free) reimplementation
+    of causal decoding rather than a bidirectional re-encode of the prefix.
     """
 
     hidden_dim: int
@@ -64,14 +70,14 @@ class TransformerBlock(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
 
     @nn.compact
-    def __call__(self, tokens: chex.Array) -> chex.Array:
+    def __call__(self, tokens: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
         y = nn.LayerNorm()(tokens)
         y = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             qkv_features=self.hidden_dim,
             out_features=self.hidden_dim,
             kernel_init=self.kernel_init,
-        )(y, y)
+        )(y, y, mask=mask)
         tokens = tokens + y
 
         y = nn.LayerNorm()(tokens)
@@ -210,9 +216,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
         for step in range(self.max_steps):
             seq_len = step + 1
             tokens = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
-            # tokens = scratchpad[..., :seq_len, :]
+            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
             for block in blocks:
-                tokens = block(tokens)
+                tokens = block(tokens, mask=causal_mask)
             state = tokens[..., -1, :]
 
             halting_prob = nn.sigmoid(halting_head(nn.LayerNorm()(state)))

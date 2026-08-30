@@ -33,7 +33,16 @@ different at the next step:
   - Replay mode (`target_tokens=<array>`): deterministically replays exactly
     that token trajectory (no rng) and returns `(embedding, log_prob)`: the
     log-probability, under the current parameters, of the whole trajectory
-    (thought choices and the halting choice together).
+    (thought choices and the halting choice together). Attention within a
+    step is causally masked (see `TransformerBlock`), so - unlike the
+    latent-CoT torso, where the scratchpad entry fed back in is the model's
+    own hidden state and therefore only knowable by actually running the
+    steps - every scratchpad entry here is just the embedding of an
+    already-known token. That means replay doesn't need the unrolled
+    step-by-step loop at all: the whole scratchpad can be built up front and
+    scored in one causal-masked pass, reading every step's logits off in
+    parallel instead of recomputing the growing prefix from scratch
+    `max_steps` times.
   - Deterministic mode (`deterministic=True`): at every step, picks the
     highest-probability class - a thought token or "act now" - instead of
     sampling, for greedy evaluation.
@@ -135,9 +144,6 @@ class TransformerExplicitCoTTorso(nn.Module):
         token_embed = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_dim)
         token_head = nn.Dense(num_classes, kernel_init=self.kernel_init)
 
-        scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
-        scratchpad = scratchpad.at[..., 0, :].set(initial_token)
-
         blocks = [
             TransformerBlock(
                 self.hidden_dim, self.num_heads, self.mlp_dim, self.activation, self.kernel_init
@@ -145,63 +151,103 @@ class TransformerExplicitCoTTorso(nn.Module):
             for _ in range(self.num_layers)
         ]
 
+        # Per-step "act now" legality, precomputed once as a constant additive
+        # mask over the step axis (shape `(max_steps, num_classes)`) instead
+        # of as a Python-level `if` per loop iteration - used by both the
+        # rollout loop below and the parallel replay path.
+        step_counts = np.arange(1, self.max_steps + 1)
+        is_final_step = step_counts == self.max_steps
+        can_halt = step_counts >= self.min_steps
+        step_mask = np.zeros((self.max_steps, num_classes), dtype=np.float32)
+        # A halt is forced at the final step regardless of the policy: mask
+        # out every thought class so "act now" is the only one left. Its
+        # log-probability under that mask is an inputs-independent constant
+        # (zero), so no gradient flows through a step that was never really a
+        # choice.
+        step_mask[is_final_step, :] = _NEG_INF
+        step_mask[is_final_step, act_token_id] = 0.0
+        # Before min_steps, "act now" isn't a legal choice yet.
+        step_mask[~can_halt, act_token_id] = _NEG_INF
+        step_mask = jnp.asarray(step_mask)
+
+        if replaying:
+            # Attention is causally masked (see `TransformerBlock`), so every
+            # scratchpad entry is determined by the known `target_tokens`
+            # alone - the whole trajectory can be built and scored in one
+            # pass instead of an unrolled loop. Scratchpad position `step` is
+            # the embedding of `target_tokens[..., step - 1]` (position 0 is
+            # the observation); `act_token_id` has no embedding, so substitute
+            # a dummy id where it was emitted - those entries are never read
+            # since nothing attends past its own (causally masked) position.
+            thought_id = jnp.where(target_tokens == act_token_id, 0, target_tokens)
+            token_embeds = token_embed(thought_id)
+            scratchpad = jnp.concatenate(
+                [initial_token[..., None, :], token_embeds[..., :-1, :]], axis=-2
+            )
+            tokens_in = scratchpad + pos_embedding[: self.max_steps]
+
+            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (self.max_steps,)))
+            for block in blocks:
+                tokens_in = block(tokens_in, mask=causal_mask)
+            states = tokens_in  # (*batch, max_steps, hidden_dim); one state per step.
+
+            token_logits = token_head(states) + step_mask
+            log_token_probs = jax.nn.log_softmax(token_logits, axis=-1)
+            token_log_prob = jnp.take_along_axis(
+                log_token_probs, target_tokens[..., None], axis=-1
+            ).squeeze(axis=-1)
+
+            # A step only counts if no earlier step already halted - i.e. its
+            # exclusive running count of "act now" tokens so far is zero.
+            halted = target_tokens == act_token_id
+            earlier_halts = jnp.cumsum(halted.astype(jnp.int32), axis=-1) - halted.astype(
+                jnp.int32
+            )
+            still_running = earlier_halts == 0
+            log_prob = jnp.sum(jnp.where(still_running, token_log_prob, 0.0), axis=-1)
+
+            # The final state is read off at the first "act now" token (the
+            # forced halt at max_steps guarantees there always is one).
+            halt_step = jnp.argmax(halted, axis=-1)
+            final_state = jnp.take_along_axis(
+                states, halt_step[..., None, None], axis=-2
+            ).squeeze(axis=-2)
+
+            return final_state, log_prob
+
+        scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
+        scratchpad = scratchpad.at[..., 0, :].set(initial_token)
+
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
-        log_prob = jnp.zeros(batch_shape)
         final_state = initial_token
         emitted_tokens = jnp.zeros(batch_shape + (self.max_steps,), dtype=jnp.int32)
 
         for step in range(self.max_steps):
             seq_len = step + 1
             tokens_in = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
+            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
             for block in blocks:
-                tokens_in = block(tokens_in)
+                tokens_in = block(tokens_in, mask=causal_mask)
             state = tokens_in[..., -1, :]
 
-            step_count = step + 1
-            is_final_step = step_count == self.max_steps
-            can_halt = step_count >= self.min_steps
+            token_logits = token_head(state) + step_mask[step]
 
-            token_logits = token_head(state)
-            # `step`/`is_final_step`/`can_halt` are Python-level (the loop is
-            # unrolled), so this masking is static per iteration - no need to
-            # broadcast over the batch.
-            if is_final_step:
-                # A halt is forced here regardless of the policy: mask out
-                # every thought class so "act now" is the only one left. Its
-                # log-probability under that mask is an inputs-independent
-                # constant (zero), so no gradient flows through a step that
-                # was never really a choice.
-                mask = jnp.full((num_classes,), _NEG_INF).at[act_token_id].set(0.0)
-                token_logits = token_logits + mask
-            elif not can_halt:
-                # Before min_steps, "act now" isn't a legal choice yet.
-                token_logits = token_logits.at[..., act_token_id].set(_NEG_INF)
-
-            log_token_probs = jax.nn.log_softmax(token_logits)
-
-            if replaying:
-                token_id = target_tokens[..., step]
-            elif deterministic:
+            if deterministic:
                 token_id = jnp.argmax(token_logits, axis=-1)
             else:
                 rng, token_rng = jax.random.split(rng)
                 token_id = jax.random.categorical(token_rng, token_logits)
 
-            token_log_prob = jnp.take_along_axis(
-                log_token_probs, token_id[..., None], axis=-1
-            ).squeeze(axis=-1)
-
             halts_this_step = still_running & (token_id == act_token_id)
 
-            log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
             emitted_tokens = emitted_tokens.at[..., step].set(token_id)
 
             still_running = still_running & (~halts_this_step)
 
-            if not is_final_step:
+            if step_counts[step] != self.max_steps:
                 # `act_token_id` is out of range for `token_embed` (which only
                 # knows the `vocab_size` thought tokens); substitute a dummy
                 # id where it was chosen - those entries are never read back,
@@ -210,6 +256,4 @@ class TransformerExplicitCoTTorso(nn.Module):
                 thought_id = jnp.where(token_id == act_token_id, 0, token_id)
                 scratchpad = scratchpad.at[..., step + 1, :].set(token_embed(thought_id))
 
-        if replaying:
-            return final_state, log_prob
         return final_state, num_steps_taken, emitted_tokens
