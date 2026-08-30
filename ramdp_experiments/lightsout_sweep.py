@@ -39,14 +39,21 @@ Grid axes:
                  c-conditioned architecture/parameter count as ff_ppo_cond_naive, but
                  the conditioned output is additionally scaled by gamma^(c-1) - compare
                  the two to isolate whether that analytic prior helps, holding capacity
-                 fixed) | ff_ppo_reinforce (PPO, G - V REINFORCE-with-baseline). The
-                 ff_ppo_* systems train stoix/systems/ramdp_vpg/ff_ppo.py - PPO's
-                 clipped surrogate over several epochs of minibatch updates per
-                 rollout, vs. one REINFORCE/QAC gradient step per rollout for the
-                 others - see --epochs/--num-minibatches/--clip-eps/--clip-value-loss.
-                 ff_ppo_cond_naive/ff_ppo_cond_fac have no ff_qac.py equivalent (see
-                 stoix/systems/ramdp_vpg/ff_ppo.py's module docstring) - they only
-                 exist as ff_ppo_* systems.
+                 fixed) | ff_ppo_reinforce (PPO, G - V REINFORCE-with-baseline) |
+                 ff_ppo_explicit_fac/ff_ppo_explicit_naive/ff_ppo_explicit_cond_naive/
+                 ff_ppo_explicit_cond_fac/ff_ppo_explicit_reinforce (PPO with an
+                 *explicit* chain of thought - TransformerExplicitCoTTorso instead of a
+                 latent-CoT torso, one system per qac_variant mirroring the five ff_ppo_*
+                 systems above; trains stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py.
+                 Their architecture is implied, always transformer_explicit_cot,
+                 regardless of --architectures - see EXPLICIT_COT_PPO_SYSTEMS). The
+                 ff_ppo_* systems train stoix/systems/ramdp_vpg/ff_ppo.py - PPO's clipped
+                 surrogate over several epochs of minibatch updates per rollout, vs. one
+                 REINFORCE/QAC gradient step per rollout for the others - see --epochs/
+                 --num-minibatches/--clip-eps/--clip-value-loss. ff_ppo_cond_naive/
+                 ff_ppo_cond_fac (and their ff_ppo_explicit_* counterparts) have no
+                 ff_qac.py equivalent (see stoix/systems/ramdp_vpg/ff_ppo.py's module
+                 docstring) - they only exist as ff_ppo_*/ff_ppo_explicit_* systems.
   - architecture: mlp (AdaptiveComputationTimeTorso) | transformer
                  (TransformerChainOfThoughtTorso, latent CoT) |
                  gru (GRUAdaptiveComputationTimeTorso, GRU-based recurrent block
@@ -166,6 +173,8 @@ Usage:
       --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
       --architectures mlp                          # compare conditioned Q-V variants, same capacity
+  python ramdp_experiments/lightsout_sweep.py \\
+      --systems ff_ppo_explicit_fac,ff_ppo_explicit_reinforce   # explicit-CoT PPO sweep
 """
 
 from __future__ import annotations
@@ -204,6 +213,16 @@ SYSTEM_TO_SCRIPT = {
     "ff_ppo_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
+    # Explicit-CoT PPO (TransformerExplicitCoTTorso instead of a latent-CoT
+    # torso) - one system per qac_variant, mirroring ff_ppo_fac/ff_ppo_naive/
+    # ff_ppo_cond_naive/ff_ppo_cond_fac/ff_ppo_reinforce above. Architecture is
+    # implied (always transformer_explicit_cot, see EXPLICIT_COT_ARCH/
+    # build_grid), not selected via --architectures.
+    "ff_ppo_explicit_fac": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_naive": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_reinforce": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
 }
 SYSTEM_TO_QAC_VARIANT = {
     "ff_qac_fac": "fac",
@@ -213,19 +232,46 @@ SYSTEM_TO_QAC_VARIANT = {
     "ff_ppo_cond_naive": "cond_naive",
     "ff_ppo_cond_fac": "cond_fac",
     "ff_ppo_reinforce": "reinforce",
+    "ff_ppo_explicit_fac": "fac",
+    "ff_ppo_explicit_naive": "naive",
+    "ff_ppo_explicit_cond_naive": "cond_naive",
+    "ff_ppo_explicit_cond_fac": "cond_fac",
+    "ff_ppo_explicit_reinforce": "reinforce",
 }
-# Systems trained by ff_ppo.py (PPO's clipped surrogate, several epochs of
-# minibatch updates per rollout) rather than ff_reinforce.py/ff_qac.py (a
-# single REINFORCE/QAC gradient step per rollout) - these get the
-# epochs/num_minibatches/clip_eps axes (see Job.command()) and don't support
-# system.delightful (ff_ppo.py doesn't have that knob - see its module
-# docstring for why).
+# Systems whose critic is a Q-V critic (a value head and a Q head, using
+# separate torsos - see ARCH_TO_NETWORK/EXPLICIT_COT_NETWORK_BY_SYSTEM) rather
+# than the plain V-only critic ff_reinforce.py/ff_ppo_reinforce/
+# ff_ppo_explicit_reinforce use - every SYSTEM_TO_QAC_VARIANT entry except the
+# "reinforce" qac_variant. Used in Job.command() to target the right critic
+# network override keys for CNN architectures.
+QAC_CRITIC_SYSTEMS = tuple(s for s, v in SYSTEM_TO_QAC_VARIANT.items() if v != "reinforce")
+# Systems trained by ff_ppo.py/ff_ppo_explicit_cot.py (PPO's clipped
+# surrogate, several epochs of minibatch updates per rollout) rather than
+# ff_reinforce.py/ff_qac.py (a single REINFORCE/QAC gradient step per
+# rollout) - these get the epochs/num_minibatches/clip_eps axes (see
+# Job.command()) and don't support system.delightful (neither script has
+# that knob - see ff_ppo.py's module docstring for why).
 PPO_SYSTEMS = (
     "ff_ppo_fac",
     "ff_ppo_naive",
     "ff_ppo_cond_naive",
     "ff_ppo_cond_fac",
     "ff_ppo_reinforce",
+    "ff_ppo_explicit_fac",
+    "ff_ppo_explicit_naive",
+    "ff_ppo_explicit_cond_naive",
+    "ff_ppo_explicit_cond_fac",
+    "ff_ppo_explicit_reinforce",
+)
+# ff_ppo_explicit_* systems whose architecture is implied (always
+# transformer_explicit_cot) rather than picked via --architectures - see
+# EXPLICIT_COT_ARCH/build_grid.
+EXPLICIT_COT_PPO_SYSTEMS = (
+    "ff_ppo_explicit_fac",
+    "ff_ppo_explicit_naive",
+    "ff_ppo_explicit_cond_naive",
+    "ff_ppo_explicit_cond_fac",
+    "ff_ppo_explicit_reinforce",
 )
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
@@ -239,48 +285,45 @@ ARCH_TO_NETWORK = {
         "cnn+gru": "cnn_gru_compute",
         "cnn+iru": "cnn_iru_compute",
     },
+    # Every Q-V system uses SeparateValueAndQCritic (the "_separate_qv" network
+    # variant): V and Q each get their own torso, independently initialised,
+    # so neither head's gradient shares parameters with the other - see
+    # base_qac.py's module docstring for the shared- vs separate-torso tradeoff.
     "ff_qac_fac": {
-        "mlp": "mlp_compute_qac",
-        "iru_unshared": "iru_unshared_compute_qac",
-        "transformer": "transformer_compute_qac",
-        "gru": "gru_compute_qac",
-        "iru": "iru_compute_qac",
-        "cnn+mlp": "cnn_mlp_compute_qac",
-        "cnn+transformer": "cnn_transformer_compute_qac",
-        "cnn+gru": "cnn_gru_compute_qac",
-        "cnn+iru": "cnn_iru_compute_qac",
+        "mlp": "mlp_compute_qac_separate_qv",
+        "iru_unshared": "iru_unshared_compute_qac_separate_qv",
+        "transformer": "transformer_compute_qac_separate_qv",
+        "gru": "gru_compute_qac_separate_qv",
+        "iru": "iru_compute_qac_separate_qv",
+        "cnn+mlp": "cnn_mlp_compute_qac_separate_qv",
+        "cnn+transformer": "cnn_transformer_compute_qac_separate_qv",
+        "cnn+gru": "cnn_gru_compute_qac_separate_qv",
+        "cnn+iru": "cnn_iru_compute_qac_separate_qv",
     },
     "ff_qac_naive": {
-        "mlp": "mlp_compute_qac",
-        "iru_unshared": "iru_unshared_compute_qac",
-        "transformer": "transformer_compute_qac",
-        "gru": "gru_compute_qac",
-        "iru": "iru_compute_qac",
-        "cnn+mlp": "cnn_mlp_compute_qac",
-        "cnn+transformer": "cnn_transformer_compute_qac",
-        "cnn+gru": "cnn_gru_compute_qac",
-        "cnn+iru": "cnn_iru_compute_qac",
+        "mlp": "mlp_compute_qac_separate_qv",
+        "iru_unshared": "iru_unshared_compute_qac_separate_qv",
+        "transformer": "transformer_compute_qac_separate_qv",
+        "gru": "gru_compute_qac_separate_qv",
+        "iru": "iru_compute_qac_separate_qv",
+        "cnn+mlp": "cnn_mlp_compute_qac_separate_qv",
+        "cnn+transformer": "cnn_transformer_compute_qac_separate_qv",
+        "cnn+gru": "cnn_gru_compute_qac_separate_qv",
+        "cnn+iru": "cnn_iru_compute_qac_separate_qv",
     },
 }
-# ff_ppo_fac/ff_ppo_naive use the same Q-V critic (ValueAndQCritic) as
-# ff_qac_fac/ff_qac_naive, so they reuse ff_qac_fac's/ff_qac_naive's
+# ff_ppo_fac/ff_ppo_naive use the same separate-torso Q-V critic
+# (SeparateValueAndQCritic) as ff_qac_fac/ff_qac_naive; ff_ppo_cond_naive/
+# ff_ppo_cond_fac condition that same critic on compute_time in code (see
+# ValueAndQCritic._q_input) rather than via a different network yaml, so
+# they reuse ff_ppo_fac's network too - so they all reuse those networks'
 # (arch -> network) mappings rather than duplicating them.
-# ff_ppo_cond_naive/ff_ppo_cond_fac condition that critic's q_value on
-# compute_time in code (see ValueAndQCritic._q_input), and use the
-# "<network>_separate_qv" variant of each network - V and Q each get their
-# own torso (stoix.networks.base_qac.SeparateValueAndQCritic) rather than
-# sharing one, since sharing a torso between compute_time-conditioned Q and
-# unconditioned V here would otherwise let the Q head's compute_time
-# dependence leak into V's shared embedding.
 # ff_ppo_reinforce uses the same plain V-only critic as ff_reinforce, so it
 # reuses that network mapping too.
 ARCH_TO_NETWORK["ff_ppo_fac"] = ARCH_TO_NETWORK["ff_qac_fac"]
 ARCH_TO_NETWORK["ff_ppo_naive"] = ARCH_TO_NETWORK["ff_qac_naive"]
-ARCH_TO_NETWORK["ff_ppo_cond_qv"] = {
-    arch: f"{network}_separate_qv" for arch, network in ARCH_TO_NETWORK["ff_qac_fac"].items()
-}
-ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_cond_qv"]
-ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_cond_qv"]
+ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_fac"]
+ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
@@ -318,12 +361,28 @@ SERVER_MODULES = {
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
 # doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
-# it only exists for ff_reinforce, and via a different training script
-# (ff_reinforce_explicit_cot.py, not ff_reinforce.py), so it's handled separately.
+# it's only trained by a dedicated script per system (ff_reinforce_explicit_cot.py
+# for ff_reinforce, ff_ppo_explicit_cot.py for ff_ppo_explicit_*), not the plain
+# ff_reinforce.py/ff_ppo.py, so it's handled separately.
 EXPLICIT_COT_ARCH = "transformer_explicit_cot"
-EXPLICIT_COT_SCRIPT = "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"
-EXPLICIT_COT_NETWORK = "transformer_explicit_cot"
-EXPLICIT_COT_SYSTEMS = ("ff_reinforce",)
+EXPLICIT_COT_SCRIPT_BY_SYSTEM = {"ff_reinforce": "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"}
+EXPLICIT_COT_SCRIPT_BY_SYSTEM.update(
+    (system, "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py") for system in EXPLICIT_COT_PPO_SYSTEMS
+)
+# ff_ppo_explicit_fac/naive/cond_naive/cond_fac use the separate-torso Q-V
+# critic network (transformer_explicit_cot_qac_separate_qv.yaml), mirroring
+# ARCH_TO_NETWORK's "_separate_qv" convention above; ff_ppo_explicit_reinforce
+# uses the plain V-only network (transformer_explicit_cot.yaml), same as
+# ff_reinforce.
+EXPLICIT_COT_NETWORK_BY_SYSTEM = {
+    "ff_reinforce": "transformer_explicit_cot",
+    "ff_ppo_explicit_fac": "transformer_explicit_cot_qac_separate_qv",
+    "ff_ppo_explicit_naive": "transformer_explicit_cot_qac_separate_qv",
+    "ff_ppo_explicit_cond_naive": "transformer_explicit_cot_qac_separate_qv",
+    "ff_ppo_explicit_cond_fac": "transformer_explicit_cot_qac_separate_qv",
+    "ff_ppo_explicit_reinforce": "transformer_explicit_cot",
+}
+EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 
 
 @dataclass
@@ -412,8 +471,8 @@ class Job:
 
     def command(self, python_bin: str) -> List[str]:
         if self.arch == EXPLICIT_COT_ARCH:
-            script = EXPLICIT_COT_SCRIPT
-            network = EXPLICIT_COT_NETWORK
+            script = EXPLICIT_COT_SCRIPT_BY_SYSTEM[self.system]
+            network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system]
         else:
             script = SYSTEM_TO_SCRIPT[self.system]
             network = ARCH_TO_NETWORK[self.system][self.arch]
@@ -510,11 +569,21 @@ class Job:
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
             cmd.append(f"network.actor_network.input_layer.strides=[1]")
             cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
-            cmd.append(f"network.critic_network.input_layer.channel_sizes=[16]")
-            cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
-            cmd.append(f"network.critic_network.input_layer.strides=[1]")
-            cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
-            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
+            if self.system in QAC_CRITIC_SYSTEMS:
+                # Separate-torso Q-V critic (value_input_layer/q_input_layer +
+                # value_pre_torso/q_pre_torso), not a single input_layer/pre_torso.
+                for head in ("value", "q"):
+                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[16]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[3]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[1]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.hidden_sizes=[256]")
+                    cmd.append(f"network.critic_network.{head}_pre_torso.layer_sizes=[256]")
+            else:
+                cmd.append(f"network.critic_network.input_layer.channel_sizes=[16]")
+                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
+                cmd.append(f"network.critic_network.input_layer.strides=[1]")
+                cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
+                cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
         return cmd
 
     def run_dir(self) -> Path:
@@ -551,11 +620,16 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
     # mlp_dim) combos:
-    #  - transformer_explicit_cot only exists for ff_reinforce (see
-    #    EXPLICIT_COT_SYSTEMS) - any other requested (system, architecture)
-    #    pair is skipped rather than erroring, so e.g. the default
-    #    `--systems ff_reinforce,ff_qac_fac,ff_qac_naive` still works if the
-    #    user adds `--architectures ...,transformer_explicit_cot`.
+    #  - transformer_explicit_cot only exists for system in EXPLICIT_COT_SYSTEMS -
+    #    any other requested (system, architecture) pair is skipped rather than
+    #    erroring, so e.g. the default `--systems ff_reinforce,ff_qac_fac,
+    #    ff_qac_naive` still works if the user adds
+    #    `--architectures ...,transformer_explicit_cot`.
+    #  - ff_ppo_explicit_*'s architecture is implied (always
+    #    transformer_explicit_cot, see EXPLICIT_COT_PPO_SYSTEMS) rather than
+    #    selected via --architectures, so it's forced here regardless of what
+    #    --architectures requests, mirroring how the other unsupported axes
+    #    below are forced to a single value.
     #  - use_layer_norm only exists on AdaptiveComputationTimeTorso (mlp/cnn+mlp).
     #  - use_input_layer_norm exists on mlp/cnn+mlp/transformer/cnn+transformer/
     #    gru/cnn+gru/iru/cnn+iru, not yet on transformer_explicit_cot.
@@ -572,7 +646,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     system_arch_ln_combos = []
     n_skipped_incompatible = 0
     for system in args.systems:
-        for arch in args.architectures:
+        archs = (EXPLICIT_COT_ARCH,) if system in EXPLICIT_COT_PPO_SYSTEMS else args.architectures
+        for arch in archs:
             is_transformer_arch = arch in TRANSFORMER_ARCHES or arch == EXPLICIT_COT_ARCH
             num_heads_options = args.num_heads if is_transformer_arch else [args.num_heads[0]]
             mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
@@ -797,16 +872,21 @@ def main() -> None:
         "--systems",
         default="ff_reinforce,ff_qac_fac,ff_qac_naive",
         help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive, ff_ppo_fac, "
-        "ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce}. The ff_ppo_* "
-        "systems train stoix/systems/ramdp_vpg/ff_ppo.py (PPO's clipped surrogate, several "
-        "epochs of minibatch updates per rollout) instead of a single REINFORCE/QAC gradient "
-        "step per rollout - ff_ppo_fac/ff_ppo_naive use the same Q-V advantage as "
-        "ff_qac_fac/ff_qac_naive; ff_ppo_cond_naive/ff_ppo_cond_fac condition the critic's "
-        "Q on compute_time as an input instead (same architecture/parameter count for both, "
-        "differing only in whether the conditioned output is also scaled by gamma^(c-1) - "
-        "no ff_qac.py equivalent); ff_ppo_reinforce uses the same G-V (REINFORCE-with-baseline) "
-        "advantage as ff_reinforce. See --epochs/--num-minibatches/--clip-eps (PPO-only; "
-        "system.delightful is not supported by ff_ppo.py).",
+        "ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce, ff_ppo_explicit_fac, "
+        "ff_ppo_explicit_naive, ff_ppo_explicit_cond_naive, ff_ppo_explicit_cond_fac, "
+        "ff_ppo_explicit_reinforce}. The ff_ppo_* systems train stoix/systems/ramdp_vpg/ff_ppo.py "
+        "(PPO's clipped surrogate, several epochs of minibatch updates per rollout) instead of a "
+        "single REINFORCE/QAC gradient step per rollout - ff_ppo_fac/ff_ppo_naive use the same "
+        "Q-V advantage as ff_qac_fac/ff_qac_naive; ff_ppo_cond_naive/ff_ppo_cond_fac condition "
+        "the critic's Q on compute_time as an input instead (same architecture/parameter count "
+        "for both, differing only in whether the conditioned output is also scaled by "
+        "gamma^(c-1) - no ff_qac.py equivalent); ff_ppo_reinforce uses the same G-V "
+        "(REINFORCE-with-baseline) advantage as ff_reinforce. See --epochs/--num-minibatches/"
+        "--clip-eps (PPO-only; system.delightful is not supported by ff_ppo.py/"
+        "ff_ppo_explicit_cot.py). The five ff_ppo_explicit_* systems mirror the five ff_ppo_* "
+        "qac_variants exactly, but train stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py instead "
+        "(explicit chain-of-thought tokens, TransformerExplicitCoTTorso) - their architecture is "
+        "implied (transformer_explicit_cot) rather than picked via --architectures.",
     )
     parser.add_argument(
         "--architectures",

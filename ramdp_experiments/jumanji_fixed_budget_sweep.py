@@ -104,14 +104,18 @@ script's behavior differs):
   - system, architecture, budget, hidden_dim, lr, critic_lr, delightful,
     delightful_eta, epochs, num_minibatches, clip_eps, clip_value_loss,
     use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim,
-    seed: identical semantics to minatar_fixed_budget_sweep.py. Only
-    architecture in {mlp, transformer, gru, iru, cnn+mlp, cnn+transformer,
-    cnn+gru, cnn+iru} is supported here (no transformer_explicit_cot yet);
-    CNN architectures are only valid for env in {sokoban, slidingtile, maze}
-    (see ENV_SUPPORTS_CNN) - requesting a CNN architecture for knapsack (no
-    spatial structure) is skipped (not errored), matching how
-    minatar_fixed_budget_sweep.py skips (system, architecture) combos that
-    don't support transformer_explicit_cot.
+    seed: identical semantics to minatar_fixed_budget_sweep.py, including its
+    five ff_ppo_explicit_* systems (explicit chain-of-thought PPO, trains
+    stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py) and its
+    transformer_explicit_cot/cnn+transformer_explicit_cot architectures (see
+    EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS) - unlike minatar/lightsout,
+    ff_reinforce is also a valid EXPLICIT_COT_SYSTEMS member here since
+    ff_reinforce_explicit_cot.py is env-agnostic. CNN architectures (including
+    cnn+transformer_explicit_cot) are only valid for env in
+    {sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requesting one for
+    knapsack (no spatial structure) is skipped (not errored), same as
+    requesting an explicit-CoT architecture for a system outside
+    EXPLICIT_COT_SYSTEMS.
 
 gamma defaults to 0.99 (system.gamma, applied to every job, not swept):
 every one of these envs has an episode horizon well under a few hundred
@@ -143,6 +147,10 @@ Usage:
       --envs sokoban,slidingtile,maze  # CNN-input sweep (sokoban/slidingtile/maze, via jumanji/*_grid)
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs sokoban,slidingtile,maze \\
+      --systems ff_ppo_explicit_fac --architectures cnn+transformer_explicit_cot  # CNN-input explicit-CoT sweep
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py \\
+      --systems ff_ppo_explicit_fac,ff_ppo_explicit_reinforce   # explicit-CoT PPO sweep (flattened obs)
 """
 
 from __future__ import annotations
@@ -171,6 +179,17 @@ SYSTEM_TO_SCRIPT = {
     "ff_ppo_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
+    # Explicit-CoT PPO (TransformerExplicitCoTTorso instead of a latent-CoT
+    # torso) - one system per qac_variant, mirroring ff_ppo_fac/ff_ppo_naive/
+    # ff_ppo_cond_naive/ff_ppo_cond_fac/ff_ppo_reinforce above. Architecture
+    # defaults to transformer_explicit_cot (flattened observation) unless
+    # --architectures requests transformer_explicit_cot/
+    # cnn+transformer_explicit_cot explicitly - see EXPLICIT_COT_ARCHES/build_grid.
+    "ff_ppo_explicit_fac": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_naive": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    "ff_ppo_explicit_reinforce": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
 }
 SYSTEM_TO_QAC_VARIANT = {
     "ff_qac_fac": "fac",
@@ -180,6 +199,11 @@ SYSTEM_TO_QAC_VARIANT = {
     "ff_ppo_cond_naive": "cond_naive",
     "ff_ppo_cond_fac": "cond_fac",
     "ff_ppo_reinforce": "reinforce",
+    "ff_ppo_explicit_fac": "fac",
+    "ff_ppo_explicit_naive": "naive",
+    "ff_ppo_explicit_cond_naive": "cond_naive",
+    "ff_ppo_explicit_cond_fac": "cond_fac",
+    "ff_ppo_explicit_reinforce": "reinforce",
 }
 PPO_SYSTEMS = (
     "ff_ppo_fac",
@@ -187,6 +211,37 @@ PPO_SYSTEMS = (
     "ff_ppo_cond_naive",
     "ff_ppo_cond_fac",
     "ff_ppo_reinforce",
+    "ff_ppo_explicit_fac",
+    "ff_ppo_explicit_naive",
+    "ff_ppo_explicit_cond_naive",
+    "ff_ppo_explicit_cond_fac",
+    "ff_ppo_explicit_reinforce",
+)
+# ff_ppo_explicit_* systems whose architecture defaults to
+# transformer_explicit_cot (flattened observation) rather than being picked
+# via --architectures, unless --architectures requests one of
+# EXPLICIT_COT_ARCHES explicitly (e.g. cnn+transformer_explicit_cot) - see
+# build_grid.
+EXPLICIT_COT_PPO_SYSTEMS = (
+    "ff_ppo_explicit_fac",
+    "ff_ppo_explicit_naive",
+    "ff_ppo_explicit_cond_naive",
+    "ff_ppo_explicit_cond_fac",
+    "ff_ppo_explicit_reinforce",
+)
+# The four ff_ppo_explicit_* systems above whose critic is a genuine Q-V
+# critic (separate V and Q torsos, see EXPLICIT_COT_NETWORK_BY_SYSTEM) -
+# ff_ppo_explicit_reinforce uses a plain V-only critic instead. Used in
+# Job.command() to target the right critic network override keys for CNN
+# architectures. Unlike lightsout/minatar, jumanji's *non*-explicit-CoT Q-V
+# systems (ff_qac_fac/ff_qac_naive/ff_ppo_fac/...) still use a shared-torso
+# critic (see ARCH_TO_NETWORK) - only the newly-added explicit-CoT ones use
+# separate torsos here.
+EXPLICIT_COT_QAC_SYSTEMS = (
+    "ff_ppo_explicit_fac",
+    "ff_ppo_explicit_naive",
+    "ff_ppo_explicit_cond_naive",
+    "ff_ppo_explicit_cond_fac",
 )
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
@@ -226,11 +281,65 @@ ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 NO_LAYER_NORM_ARCHES = ("transformer", "cnn+transformer", "gru", "cnn+gru", "iru", "cnn+iru")
-CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
-VALID_ARCHITECTURES = ("mlp", "transformer", "gru", "iru") + CNN_ARCHES
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
+
+# TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
+# doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
+# it's only trained by a dedicated script per system (ff_reinforce_explicit_cot.py
+# for ff_reinforce, ff_ppo_explicit_cot.py for ff_ppo_explicit_*), not the plain
+# ff_reinforce.py/ff_ppo.py, so it's handled separately. Two architectures use
+# it: transformer_explicit_cot (flattened observation) and
+# cnn+transformer_explicit_cot (CNNTorso input_layer feeding the same torso,
+# see cnn_transformer_explicit_cot*.yaml) - both listed in CNN_ARCHES/below so
+# the CNN-vs-flatten observation handling in Job.command() applies uniformly.
+# Unlike lightsout/minatar, ff_reinforce is env-agnostic here too (via
+# ff_reinforce_explicit_cot.py) so it's included alongside the ff_ppo_explicit_*
+# systems.
+EXPLICIT_COT_ARCH = "transformer_explicit_cot"
+CNN_EXPLICIT_COT_ARCH = "cnn+transformer_explicit_cot"
+EXPLICIT_COT_ARCHES = (EXPLICIT_COT_ARCH, CNN_EXPLICIT_COT_ARCH)
+EXPLICIT_COT_SCRIPT_BY_SYSTEM = {"ff_reinforce": "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"}
+EXPLICIT_COT_SCRIPT_BY_SYSTEM.update(
+    (system, "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py") for system in EXPLICIT_COT_PPO_SYSTEMS
+)
+# Network name depends on both system (which qac_variant, or plain V-only for
+# ff_reinforce/ff_ppo_explicit_reinforce) and arch (flattened observation vs
+# CNN input) - nested the same way ARCH_TO_NETWORK is. ff_ppo_explicit_fac/
+# naive/cond_naive/cond_fac (EXPLICIT_COT_QAC_SYSTEMS) use the separate-torso
+# Q-V critic network; ff_ppo_explicit_reinforce/ff_reinforce use the plain
+# V-only network - see ff_ppo_explicit_cot.py's/ff_reinforce_explicit_cot.py's
+# learner_setup.
+EXPLICIT_COT_NETWORK_BY_SYSTEM = {
+    "ff_reinforce": {
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot",
+    },
+    "ff_ppo_explicit_fac": {
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+    },
+    "ff_ppo_explicit_naive": {
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+    },
+    "ff_ppo_explicit_cond_naive": {
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+    },
+    "ff_ppo_explicit_cond_fac": {
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+    },
+    "ff_ppo_explicit_reinforce": {
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot",
+    },
+}
+EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
+CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru", CNN_EXPLICIT_COT_ARCH)
+VALID_ARCHITECTURES = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
 
 # env -> (non-CNN scenario, CNN/grid scenario or None if unsupported).
 ENV_SCENARIOS = {
@@ -398,9 +507,13 @@ class Job:
         system_short = self.system.removeprefix("ff_")
         name = (
             f"{self.env}-{self.difficulty.tag}-{system_short}-{self.arch}-b{self.budget}"
-            f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-nl{self.num_layers}"
+            f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}"
         )
-        if self.arch in TRANSFORMER_ARCHES:
+        # Not shown for the explicit-CoT arches - num_layers isn't swept for
+        # them (they keep their own yaml default), see build_grid.
+        if self.arch not in EXPLICIT_COT_ARCHES:
+            name += f"-nl{self.num_layers}"
+        if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             name += f"-nh{self.num_heads}-md{self.mlp_dim}"
         if self.system in PPO_SYSTEMS:
             name += f"-ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
@@ -419,8 +532,12 @@ class Job:
         return f"{self.group_tag}-seed_{self.seed}"
 
     def command(self, python_bin: str) -> List[str]:
-        script = SYSTEM_TO_SCRIPT[self.system]
-        network = ARCH_TO_NETWORK[self.system][self.arch]
+        if self.arch in EXPLICIT_COT_ARCHES:
+            script = EXPLICIT_COT_SCRIPT_BY_SYSTEM[self.system]
+            network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system][self.arch]
+        else:
+            script = SYSTEM_TO_SCRIPT[self.system]
+            network = ARCH_TO_NETWORK[self.system][self.arch]
         is_cnn = self.arch in CNN_ARCHES
         flat_scenario, grid_scenario = ENV_SCENARIOS[self.env]
         if is_cnn:
@@ -460,7 +577,7 @@ class Job:
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
-        if self.arch in TRANSFORMER_ARCHES:
+        if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
         if self.wandb:
@@ -473,7 +590,9 @@ class Job:
         # use_layer_norm/use_input_layer_norm explicitly, so a plain `=`
         # override can fail with "Key not in struct" for some (system, arch)
         # combos - matches lightsout_fixed_budget_sweep.py/jumanji_sweep.py.
-        if self.arch in NO_LAYER_NORM_ARCHES:
+        if self.arch in EXPLICIT_COT_ARCHES:
+            pass  # TransformerExplicitCoTTorso has no LayerNorm params yet.
+        elif self.arch in NO_LAYER_NORM_ARCHES:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
@@ -490,11 +609,21 @@ class Job:
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
             cmd.append(f"network.actor_network.input_layer.strides=[1]")
             cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
-            cmd.append(f"network.critic_network.input_layer.channel_sizes=[32]")
-            cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
-            cmd.append(f"network.critic_network.input_layer.strides=[1]")
-            cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
-            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
+            if self.system in EXPLICIT_COT_QAC_SYSTEMS:
+                # Separate-torso Q-V critic (value_input_layer/q_input_layer +
+                # value_pre_torso/q_pre_torso), not a single input_layer/pre_torso.
+                for head in ("value", "q"):
+                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[32]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[3]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[1]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.hidden_sizes=[256]")
+                    cmd.append(f"network.critic_network.{head}_pre_torso.layer_sizes=[256]")
+            else:
+                cmd.append(f"network.critic_network.input_layer.channel_sizes=[32]")
+                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
+                cmd.append(f"network.critic_network.input_layer.strides=[1]")
+                cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
+                cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
         elif not ENV_HAS_BUILTIN_WRAPPER[self.env]:
             # sokoban (non-CNN)/slidingtile: native observation is a single
             # multi-dim array (grid/puzzle) that needs flattening for
@@ -521,20 +650,49 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         itertools.product(args.epochs, args.num_minibatches, args.clip_eps, args.clip_value_loss)
     )
 
+    # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
+    # mlp_dim) combos:
+    #  - transformer_explicit_cot/cnn+transformer_explicit_cot only exist for
+    #    system in EXPLICIT_COT_SYSTEMS - any other requested (system,
+    #    architecture) pair is skipped rather than erroring.
+    #  - ff_ppo_explicit_*'s architecture defaults to transformer_explicit_cot
+    #    (flattened observation, see EXPLICIT_COT_PPO_SYSTEMS) when
+    #    --architectures doesn't request either EXPLICIT_COT_ARCHES value;
+    #    requesting cnn+transformer_explicit_cot (optionally alongside
+    #    transformer_explicit_cot) opts into the CNN-input variant instead -
+    #    see EXPLICIT_COT_NETWORK_BY_SYSTEM.
+    #  - num_layers isn't swept for the explicit-CoT arches, which keep their
+    #    own yaml default instead (see --num-layers help); num_heads/mlp_dim
+    #    are swept for them (like TRANSFORMER_ARCHES), everything else forced
+    #    to a single value.
     system_arch_ln_combos = []
+    n_skipped_incompatible = 0
     for system in args.systems:
-        for arch in args.architectures:
-            is_transformer_arch = arch in TRANSFORMER_ARCHES
+        if system in EXPLICIT_COT_PPO_SYSTEMS:
+            requested_explicit_cot_archs = [a for a in args.architectures if a in EXPLICIT_COT_ARCHES]
+            archs = requested_explicit_cot_archs or (EXPLICIT_COT_ARCH,)
+        else:
+            archs = args.architectures
+        for arch in archs:
+            is_transformer_arch = arch in TRANSFORMER_ARCHES or arch in EXPLICIT_COT_ARCHES
             num_heads_options = args.num_heads if is_transformer_arch else [args.num_heads[0]]
             mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
-            if arch in NO_LAYER_NORM_ARCHES:
+            if arch in EXPLICIT_COT_ARCHES:
+                if system not in EXPLICIT_COT_SYSTEMS:
+                    n_skipped_incompatible += 1
+                    continue
+                ln_options = [(False, False)]
+                num_layers_options = [args.num_layers[0]]
+            elif arch in NO_LAYER_NORM_ARCHES:
                 ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
+                num_layers_options = args.num_layers
             else:
                 ln_options = [
                     (uln, uiln) for uln in args.use_layer_norm for uiln in args.use_input_layer_norm
                 ]
+                num_layers_options = args.num_layers
             for use_layer_norm, use_input_layer_norm in ln_options:
-                for num_layers in args.num_layers:
+                for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
                             system_arch_ln_combos.append(
@@ -549,6 +707,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                 )
                             )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
+    if n_skipped_incompatible:
+        print(
+            f"Skipping {n_skipped_incompatible} (system, architecture) combo(s) requesting "
+            f"one of {EXPLICIT_COT_ARCHES}, which is only implemented for {EXPLICIT_COT_SYSTEMS}."
+        )
 
     jobs = []
     n_skipped_cnn = 0
@@ -707,15 +870,23 @@ def main() -> None:
         "--systems",
         default="ff_reinforce,ff_qac_fac,ff_qac_naive",
         help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive, ff_ppo_fac, "
-        "ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce}. See "
-        "minatar_fixed_budget_sweep.py's module docstring for what each means.",
+        "ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce, ff_ppo_explicit_fac, "
+        "ff_ppo_explicit_naive, ff_ppo_explicit_cond_naive, ff_ppo_explicit_cond_fac, "
+        "ff_ppo_explicit_reinforce}. See minatar_fixed_budget_sweep.py's module docstring for "
+        "what each means. The five ff_ppo_explicit_* systems train "
+        "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py (explicit chain-of-thought tokens) and "
+        "default to a flattened-observation architecture regardless of --architectures unless it "
+        "requests transformer_explicit_cot/cnn+transformer_explicit_cot explicitly.",
     )
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
         help=f"Comma-separated subset of {{{','.join(VALID_ARCHITECTURES)}}}. CNN architectures "
-        "are only valid for env in {sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - "
-        "requested for knapsack, they're skipped, not errored.",
+        "(including cnn+transformer_explicit_cot) are only valid for env in "
+        "{sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requested for knapsack, they're "
+        "skipped, not errored. transformer_explicit_cot/cnn+transformer_explicit_cot "
+        f"(TransformerExplicitCoTTorso) are only implemented for system in {EXPLICIT_COT_SYSTEMS} "
+        "- other (system, architecture) combos requesting them are skipped too.",
     )
     parser.add_argument(
         "--budget",
