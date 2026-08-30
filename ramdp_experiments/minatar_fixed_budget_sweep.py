@@ -1015,6 +1015,7 @@ def main() -> None:
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
+    args.vocab_size = [int(x) for x in args.vocab_size.split(",")]
 
     for e in args.envs:
         assert e in MINATAR_GAMES, f"unknown env {e!r}, expected one of {list(MINATAR_GAMES)}"
@@ -1031,6 +1032,8 @@ def main() -> None:
         assert n >= 1, f"num_heads must be >= 1, got {n}"
     for d in args.mlp_dim:
         assert d >= 1, f"mlp_dim must be >= 1, got {d}"
+    for v in args.vocab_size:
+        assert v >= 1, f"vocab_size must be >= 1, got {v}"
     for e in args.epochs:
         assert e >= 1, f"epochs must be >= 1, got {e}"
     for m in args.num_minibatches:
@@ -1094,6 +1097,7 @@ def main() -> None:
         f"  num_heads={args.num_heads} mlp_dim={args.mlp_dim} "
         f"(cnn+transformer/cnn+transformer_explicit_cot only)"
     )
+    print(f"  vocab_size={args.vocab_size} (cnn+transformer_explicit_cot only)")
     print(f"  gamma={args.gamma}")
     print(
         f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "

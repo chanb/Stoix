@@ -113,6 +113,13 @@ Grid axes:
   - mlp_dim:     transformer feedforward width (network.actor_network.pre_torso.mlp_dim);
                  same applicability as num_heads (cnn+transformer/
                  cnn+transformer_explicit_cot only). Default 256.
+  - vocab_size:  thought-token vocabulary size (network.actor_network.pre_torso.vocab_size),
+                 i.e. how many discrete "thought" classes TransformerExplicitCoTTorso can
+                 emit before the extra "act now" class - see
+                 stoix/networks/torso_compute_explicit_cot.py. cnn+transformer_explicit_cot
+                 only (every other architecture, including cnn+transformer, has no such
+                 param, so this is forced to a single value for them). Default 32 (the
+                 network yaml default).
   - seed:        5 seeds per config by default
 
 gamma defaults to 0.9999 (system.gamma), applied to every job (not swept),
@@ -373,6 +380,7 @@ class Job:
     num_layers: int
     num_heads: int
     mlp_dim: int
+    vocab_size: int
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -404,6 +412,10 @@ class Job:
         # TRANSFORMER_ARCHES/build_grid.
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
             name += f"-nh{self.num_heads}-md{self.mlp_dim}"
+        # Only shown for cnn+transformer_explicit_cot - vocab_size doesn't
+        # exist on any other architecture, see EXPLICIT_COT_ARCH/build_grid.
+        if self.arch == EXPLICIT_COT_ARCH:
+            name += f"-vs{self.vocab_size}"
         # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
         # exist for ff_reinforce.py/ff_qac.py (single gradient step per
         # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
@@ -474,6 +486,10 @@ class Job:
             # TransformerExplicitCoTTorso only (see TRANSFORMER_ARCHES).
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
+        if self.arch == EXPLICIT_COT_ARCH:
+            # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
+            # no other architecture has this param.
+            cmd.append(f"++network.actor_network.pre_torso.vocab_size={self.vocab_size}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -583,6 +599,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    only exist on cnn+transformer/cnn+transformer_explicit_cot (see
     #    TRANSFORMER_ARCHES) - swept only for those, everything else forced to a
     #    single value.
+    #  - vocab_size (thought-token vocabulary size) only exists on
+    #    cnn+transformer_explicit_cot (see EXPLICIT_COT_ARCH) - swept only for
+    #    that architecture, everything else (including cnn+transformer) forced
+    #    to a single value.
     # Unsupported axes are forced to a single default value rather than
     # needlessly duplicated per requested setting.
     system_arch_ln_combos = []
@@ -593,6 +613,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             is_transformer_arch = arch in TRANSFORMER_ARCHES or arch == EXPLICIT_COT_ARCH
             num_heads_options = args.num_heads if is_transformer_arch else [args.num_heads[0]]
             mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
+            vocab_size_options = (
+                args.vocab_size if arch == EXPLICIT_COT_ARCH else [args.vocab_size[0]]
+            )
             if arch == EXPLICIT_COT_ARCH:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
@@ -611,17 +634,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            system_arch_ln_combos.append(
-                                (
-                                    system,
-                                    arch,
-                                    use_layer_norm,
-                                    use_input_layer_norm,
-                                    num_layers,
-                                    num_heads,
-                                    mlp_dim,
+                            for vocab_size in vocab_size_options:
+                                system_arch_ln_combos.append(
+                                    (
+                                        system,
+                                        arch,
+                                        use_layer_norm,
+                                        use_input_layer_norm,
+                                        num_layers,
+                                        num_heads,
+                                        mlp_dim,
+                                        vocab_size,
+                                    )
                                 )
-                            )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
     if n_skipped_incompatible:
         print(
@@ -649,7 +674,16 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     jobs = []
     for (
         env,
-        (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim),
+        (
+            system,
+            arch,
+            use_layer_norm,
+            use_input_layer_norm,
+            num_layers,
+            num_heads,
+            mlp_dim,
+            vocab_size,
+        ),
         (min_steps, max_steps),
         hidden_dim,
         lr,
@@ -699,6 +733,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_layers=num_layers,
                 num_heads=num_heads,
                 mlp_dim=mlp_dim,
+                vocab_size=vocab_size,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 total_num_envs=args.total_num_envs,
@@ -955,6 +990,17 @@ def main() -> None:
         "(forced to the first value) for every other architecture. Default 256.",
     )
     parser.add_argument(
+        "--vocab-size",
+        default="32",
+        help="Comma-separated ints - thought-token vocabulary size "
+        "(network.actor_network.pre_torso.vocab_size): how many discrete 'thought' classes "
+        "TransformerExplicitCoTTorso can emit before the extra 'act now' class - see "
+        "stoix/networks/torso_compute_explicit_cot.py. Only applies to architecture "
+        "cnn+transformer_explicit_cot (unlike --num-heads/--mlp-dim, NOT swept for "
+        "cnn+transformer, which has no such param); ignored (forced to the first value) for "
+        "every other architecture. Default 32 (the network yaml default).",
+    )
+    parser.add_argument(
         "--gamma",
         type=float,
         default=0.9999,
@@ -1048,6 +1094,7 @@ def main() -> None:
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
+    args.vocab_size = [int(x) for x in args.vocab_size.split(",")]
 
     for e in args.envs:
         assert e in MINATAR_GAMES, f"unknown env {e!r}, expected one of {list(MINATAR_GAMES)}"
@@ -1066,6 +1113,8 @@ def main() -> None:
         assert n >= 1, f"num_heads must be >= 1, got {n}"
     for d in args.mlp_dim:
         assert d >= 1, f"mlp_dim must be >= 1, got {d}"
+    for v in args.vocab_size:
+        assert v >= 1, f"vocab_size must be >= 1, got {v}"
     for e in args.epochs:
         assert e >= 1, f"epochs must be >= 1, got {e}"
     for m in args.num_minibatches:
@@ -1133,6 +1182,7 @@ def main() -> None:
         f"  num_heads={args.num_heads} mlp_dim={args.mlp_dim} "
         f"(cnn+transformer/cnn+transformer_explicit_cot only)"
     )
+    print(f"  vocab_size={args.vocab_size} (cnn+transformer_explicit_cot only)")
     print(f"  gamma={args.gamma}")
     print(
         f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "
