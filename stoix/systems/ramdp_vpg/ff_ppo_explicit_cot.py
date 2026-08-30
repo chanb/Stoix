@@ -327,12 +327,20 @@ def get_learner_fn(
                     )
                     entropy = actor_policy.entropy().mean()
 
+                    # Fraction of samples whose ratio fell outside the clip
+                    # range - the standard PPO clip diagnostic.
+                    ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                    clip_fraction = jnp.mean(
+                        (jnp.abs(ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
+                    )
+
                     total_loss_actor = loss_actor - config.system.ent_coef * entropy
                     loss_info = {
                         "actor_loss": loss_actor,
                         "entropy": entropy,
                         "advantages": advantage,
                         "compute_time": traj_batch.compute_time,
+                        "clip_fraction": clip_fraction,
                     }
                     return total_loss_actor, loss_info
 
