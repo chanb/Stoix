@@ -79,6 +79,7 @@ class TransformerExplicitCoTTorso(nn.Module):
     min_steps: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    use_input_layer_norm: bool = False
 
     @nn.compact
     def __call__(
@@ -124,9 +125,9 @@ class TransformerExplicitCoTTorso(nn.Module):
         act_token_id = self.vocab_size
         num_classes = self.vocab_size + 1
 
-        initial_token = parse_activation_fn(self.activation)(
-            nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
-        )
+        initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+        if self.use_input_layer_norm:
+            observation = nn.LayerNorm()(observation)
 
         pos_embedding = self.param(
             "pos_embedding", normal(stddev=0.02), (self.max_steps + 1, self.hidden_dim)

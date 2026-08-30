@@ -1,51 +1,43 @@
 """Compute-time-aware PPO with an *explicit* chain of thought (RAMDP-PPO,
 explicit CoT).
 
-This is a variant of `stoix.systems.ramdp_vpg.ff_ppo` whose actor's torso is
+Variant of `stoix.systems.ramdp_vpg.ff_ppo` whose actor's torso is
 `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`
-instead of a latent-CoT torso (`AdaptiveComputationTimeTorso`/
-`TransformerChainOfThoughtTorso`/...) - exactly the same swap
-`ff_reinforce_explicit_cot.py` makes relative to `ff_reinforce.py`. At every
-pondering step, the actor doesn't sample a separate "keep thinking?"
-decision, it samples a token from a learned vocabulary that has one extra
-class meaning "predict the environment action now" - so halting *is* emitting
-that token, in exactly the same sense as any other thought token or the
-environment action itself. A thought token's embedding (not a raw hidden
-state) is what gets fed back in as context for the next step, and the
-resulting chain of thought is therefore a literal, inspectable sequence of
-token ids, not an opaque vector - see `ff_reinforce_explicit_cot.py`'s module
-docstring for the full picture.
+instead of a latent-CoT torso - the same swap `ff_reinforce_explicit_cot.py`
+makes relative to `ff_reinforce.py`. At every pondering step, the actor
+samples a token from a learned vocabulary that has one extra class meaning
+"predict the environment action now" - so halting *is* emitting that token,
+in the same sense as any other thought token or the environment action
+itself. A thought token's embedding (not a raw hidden state) is fed back in
+as context for the next step, so the resulting chain of thought is a
+literal, inspectable sequence of token ids.
 
 Everything about *how* this is trained follows `ff_ppo.py`, unmodified:
 
   - `config.system.qac_variant` selects how the advantage is computed - the
     same four Q-V variants ("fac"/"naive"/"cond_naive"/"cond_fac", all using
     `stoix.networks.base_qac.ValueAndQCritic`) plus "reinforce" (G-V, using
-    `stoix.networks.base.FeedForwardCritic`) - see `ff_ppo.py`'s module
-    docstring for the full description of each.
+    `stoix.networks.base.FeedForwardCritic`).
   - PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is applied to the
     *joint* log-probability `log_prob = env_log_prob + cot_log_prob`, across
-    several epochs of minibatch gradient steps per rollout - not a single
-    REINFORCE gradient step, unlike `ff_reinforce_explicit_cot.py`.
+    several epochs of minibatch gradient steps per rollout.
   - The critic (V, and Q for "naive"/"fac") is trained with PPO's own clipped
     value loss against the `old` value/Q estimate recorded at rollout time by
     default, or with plain L2 regression when `config.system.clip_value_loss
     =False`.
-  - No `config.system.delightful` gate - see `ff_ppo.py`'s module docstring
-    for why PPO's clipped surrogate already serves an analogous role.
+  - No `config.system.delightful` gate - PPO's clipped surrogate already
+    serves an analogous role.
 
 And everything about *what gets replayed* follows `ff_reinforce_explicit_cot.py`:
 since `TransformerExplicitCoTTorso`'s sampling pass doesn't itself report the
 log-probability of the token trajectory it just sampled, each rollout step
 makes a second, replay-mode forward pass (`torso_kwargs={"target_tokens":
 thought_tokens}`) at the same rollout-time parameters, purely to read off
-`cot_log_prob` - mirroring `ff_ppo.py`'s second `target_compute_time` pass,
-and needed for exactly the same reason PPO (unlike REINFORCE/QAC) needs a
-fixed "old" log-probability to compute its ratio against across every epoch.
-`TransformerExplicitCoTTorso` has no latent-convergence diagnostics (unlike
-the latent-CoT torsos), so `first_convergence_step`/`num_close_steps` are not
-tracked here - `PPOExplicitCoTTransition` carries `thought_tokens` in their
-place, needed to replay the exact trajectory at each epoch's parameters.
+`cot_log_prob` - mirroring `ff_ppo.py`'s second `target_compute_time` pass.
+`TransformerExplicitCoTTorso` has no latent-convergence diagnostics, so
+`first_convergence_step`/`num_close_steps` are not tracked here -
+`PPOExplicitCoTTransition` carries `thought_tokens` in their place, needed to
+replay the exact trajectory at each epoch's parameters.
 
 This file intentionally duplicates most of `ff_ppo.py`/
 `ff_reinforce_explicit_cot.py` rather than modifying them, so those systems
@@ -110,7 +102,6 @@ def get_learner_fn(
 ) -> LearnerFn[RamdpOnPolicyLearnerState]:
     """Get the learner function."""
 
-    # Get apply and update functions for actor and critic networks.
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
 
@@ -123,20 +114,16 @@ def get_learner_fn(
         "reinforce",
     ), f"Unknown qac_variant: {qac_variant}"
     is_qac = qac_variant in ("naive", "fac", "cond_naive", "cond_fac")
-    # "cond_naive"/"cond_fac" condition the critic's q_value on compute_time
-    # as an extra input (see `ValueAndQCritic._q_input`), rather than
-    # applying compute_time afterwards via table-indexing ("naive") or an
-    # analytic scaling ("fac").
+    # "cond_naive"/"cond_fac" condition the critic on compute_time as an
+    # extra input rather than via table-indexing ("naive") or scaling ("fac").
     condition_q_on_compute_time = qac_variant in ("cond_naive", "cond_fac")
 
     def _q_output(
         critic_params: FrozenDict, obs: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
         """Get the critic's raw `q_value` output. "cond_naive"/"cond_fac"
-        condition the network on `compute_time` as an extra input;
-        "naive"/"fac" don't - `compute_time` is applied afterwards instead,
-        by indexing a table ("naive") or an analytic scaling ("fac"), see
-        `_q_at_action_and_compute_time`."""
+        condition the network on `compute_time` as an extra input; the other
+        variants apply it afterwards instead, see `_q_at_action_and_compute_time`."""
         if condition_q_on_compute_time:
             return critic_apply_fn(
                 critic_params, obs, method="q_value", compute_time=compute_time
@@ -147,19 +134,11 @@ def get_learner_fn(
         q_output: chex.Array, action: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
         """Read Q(s, a, c) off `_q_output`'s raw output, however it's
-        parameterised:
-
-          - "naive": `q_output` is a `(..., num_actions, max_steps)` table -
-            index by both `action` and `compute_time`.
-          - "fac": `q_output` is `(..., num_actions)`, representing Q(s,·,1) -
-            index by `action` only, then scale by `gamma ** (compute_time - 1)`
-            to recover Q(s,a,c), per the runtime-factorization identity.
-          - "cond_naive": `q_output` (from `_q_output`, already conditioned
-            on `compute_time`) is `(..., num_actions)`, representing Q(s,·,c)
-            directly - index by `action` only, no further scaling.
-          - "cond_fac": same conditioned shape as "cond_naive", but also
-            scaled by `gamma ** (compute_time - 1)` - see module docstring.
-        """
+        parameterised: "naive" indexes a `(num_actions, max_steps)` table by
+        both `action` and `compute_time`; "fac" indexes Q(s,·,1) by `action`
+        then scales by `gamma ** (compute_time - 1)`; "cond_naive" indexes
+        the already-conditioned Q(s,·,c) by `action` only; "cond_fac" does
+        the same plus the `gamma ** (compute_time - 1)` scaling."""
         if qac_variant == "naive":
             compute_time_idx = (compute_time - 1).astype(jnp.int32)
             q_at_c = jnp.take_along_axis(
@@ -174,10 +153,8 @@ def get_learner_fn(
     def _value_loss_fn(
         pred: chex.Array, behavior: chex.Array, targets: chex.Array
     ) -> chex.Array:
-        """The critic's (V, and Q for "naive") regression loss - either PPO's
-        clipped value loss (clipping `pred` against the `behavior` estimate
-        recorded at rollout time) or plain L2 to `targets`, per
-        `config.system.clip_value_loss` - see module docstring."""
+        """PPO's clipped value loss against `behavior`, or plain L2 to
+        `targets`, per `config.system.clip_value_loss`."""
         if config.system.clip_value_loss:
             return clipped_value_loss(pred, behavior, targets, config.system.clip_eps)
         return rlax.l2_loss(pred, targets).mean()
@@ -188,7 +165,6 @@ def get_learner_fn(
         def _env_step(
             learner_state: RamdpOnPolicyLearnerState, _: Any
         ) -> Tuple[RamdpOnPolicyLearnerState, PPOExplicitCoTTransition]:
-            """Step the environment."""
             (
                 params,
                 opt_states,
@@ -200,7 +176,6 @@ def get_learner_fn(
                 episode_discounted_return,
             ) = learner_state
 
-            # SELECT ACTION
             key, policy_key, cot_key = jax.random.split(key, 3)
             actor_policy, compute_time, thought_tokens = actor_apply_fn(
                 params.actor_params,
@@ -210,12 +185,8 @@ def get_learner_fn(
             action = actor_policy.sample(seed=policy_key)
             env_log_prob = actor_policy.log_prob(action)
 
-            # The sampling pass above doesn't report the log-probability of the
-            # token trajectory (thoughts and the halting "act now" token) it
-            # just sampled (see `TransformerExplicitCoTTorso`'s docstring) -
-            # get it with a second, replay-mode forward pass at these same
-            # (rollout-time) parameters, so PPO has a fixed "old" joint
-            # log_prob to compute its ratio against across every later epoch.
+            # Second replay-mode pass to get cot_log_prob at these same
+            # (rollout-time) params, giving PPO a fixed "old" log_prob.
             _, cot_log_prob = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
@@ -235,10 +206,8 @@ def get_learner_fn(
                 value = critic_apply_fn(params.critic_params, last_timestep.observation)
                 q_value = jnp.zeros_like(value)
 
-            # STEP ENVIRONMENT
             env_state, timestep = env.step(env_state, action)
 
-            # LOG EPISODE METRICS
             done = timestep.last().reshape(-1)
             (
                 running_cum_compute_time,
@@ -283,12 +252,10 @@ def get_learner_fn(
             )
             return learner_state, transition
 
-        # STEP ENVIRONMENT FOR ROLLOUT LENGTH
         learner_state, traj_batch = jax.lax.scan(
             _env_step, learner_state, None, config.system.rollout_length
         )
 
-        # CALCULATE ADVANTAGE
         (
             params,
             opt_states,
@@ -306,13 +273,10 @@ def get_learner_fn(
         else:
             last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
 
-        # Swap the batch and time axes.
         traj_batch = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), traj_batch)
 
-        # RETURN TARGET for V (and, for "naive", for Q too): the same n-step,
-        # compute-discounted return as `ff_reinforce.py`'s critic - see its
-        # module docstring for the full derivation of
-        # `G_h = gamma^(C_h - 1) * (r_h + gamma * G_{h+1})`.
+        # Return target for V (and, for "naive", Q too): the same n-step,
+        # compute-discounted return as `ff_reinforce.py`'s critic.
         compute_time = traj_batch.compute_time
         r_t = traj_batch.reward * config.system.gamma ** (compute_time - 1)
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
@@ -339,7 +303,6 @@ def get_learner_fn(
             def _update_minibatch(train_state: Tuple, batch_info: Tuple) -> Tuple:
                 """Update the network for a single minibatch."""
 
-                # UNPACK TRAIN STATE AND BATCH INFO
                 params, opt_states = train_state
                 traj_batch, advantages, targets = batch_info
 
@@ -349,23 +312,16 @@ def get_learner_fn(
                     advantage: chex.Array,
                 ) -> Tuple:
                     """Calculate the actor loss."""
-                    # RERUN NETWORK. Replay (rather than re-sample) the token
-                    # trajectory that was actually taken during rollout
-                    # (`traj_batch.thought_tokens`), mirroring how
-                    # `log_prob(traj_batch.action)` below evaluates the stored
-                    # action rather than drawing a fresh sample.
+                    # Replay the token trajectory actually taken during
+                    # rollout, mirroring log_prob(traj_batch.action) below.
                     actor_policy, cot_log_prob = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_tokens": traj_batch.thought_tokens},
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
-                    # The thought tokens, the halting decision, and the
-                    # environment action they led to are trained jointly,
-                    # from one combined ratio - see module docstring.
                     log_prob = env_log_prob + cot_log_prob
 
-                    # CALCULATE ACTOR LOSS
                     loss_actor = ppo_clip_loss(
                         log_prob, traj_batch.log_prob, advantage, config.system.clip_eps
                     )
@@ -387,7 +343,6 @@ def get_learner_fn(
                 ) -> Tuple:
                     """Calculate the critic loss."""
                     if is_qac:
-                        # RERUN NETWORK
                         value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
                         value_loss = _value_loss_fn(value, traj_batch.value, targets)
 
@@ -396,13 +351,9 @@ def get_learner_fn(
                         )
                         if qac_variant == "fac":
                             # Regress the raw (unscaled) Q(s,·,1) prediction
-                            # against a rescaled target, rather than scaling
-                            # the prediction up to the target's natural scale
-                            # - keeps the critic's gradient in the same
-                            # (small, c=1) space regardless of the realised
-                            # compute time, avoiding a gamma^(2(c-1))
-                            # implicit down-weighting of large-c samples that
-                            # scaling the prediction instead would introduce.
+                            # against a rescaled target - keeps the critic's
+                            # gradient in the same (c=1) scale regardless of
+                            # the realised compute time.
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
                             ).squeeze(-1)
@@ -410,11 +361,8 @@ def get_learner_fn(
                                 traj_batch.compute_time - 1
                             )
                         else:  # "naive", "cond_naive", "cond_fac"
-                            # Already in the true Q(s,a,c) scale (table
-                            # lookup, or a c-conditioned prediction possibly
-                            # scaled by `_q_at_action_and_compute_time`) - no
-                            # prediction/target scale mismatch, so regress
-                            # directly against `targets`.
+                            # Already in the true Q(s,a,c) scale, so regress
+                            # directly against targets.
                             q_pred = _q_at_action_and_compute_time(
                                 q_output, traj_batch.action, traj_batch.compute_time
                             )
@@ -427,10 +375,7 @@ def get_learner_fn(
                             "q_loss": q_loss,
                         }
                     else:  # "reinforce"
-                        # RERUN NETWORK
                         value = critic_apply_fn(critic_params, traj_batch.obs)
-
-                        # CALCULATE VALUE LOSS
                         value_loss = _value_loss_fn(value, traj_batch.value, targets)
 
                         critic_total_loss = config.system.vf_coef * value_loss
@@ -439,49 +384,39 @@ def get_learner_fn(
                         }
                     return critic_total_loss, loss_info
 
-                # CALCULATE ACTOR LOSS
                 actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
                 actor_grads, actor_loss_info = actor_grad_fn(
                     params.actor_params, traj_batch, advantages
                 )
 
-                # CALCULATE CRITIC LOSS
                 critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
                 critic_grads, critic_loss_info = critic_grad_fn(
                     params.critic_params, traj_batch, targets
                 )
 
-                # Compute the parallel mean (pmean) over the batch.
-                # This calculation is inspired by the Anakin architecture demo notebook.
-                # available at https://tinyurl.com/26tdzs5x
-                # This pmean could be a regular mean as the batch axis is on the same device.
+                # pmean over the batch axis, then over devices.
                 actor_grads, actor_loss_info, critic_grads, critic_loss_info = jax.lax.pmean(
                     (actor_grads, actor_loss_info, critic_grads, critic_loss_info),
                     axis_name="batch",
                 )
-                # pmean over devices.
                 actor_grads, actor_loss_info, critic_grads, critic_loss_info = jax.lax.pmean(
                     (actor_grads, actor_loss_info, critic_grads, critic_loss_info),
                     axis_name="device",
                 )
 
-                # UPDATE ACTOR PARAMS AND OPTIMISER STATE
                 actor_updates, actor_new_opt_state = actor_update_fn(
                     actor_grads, opt_states.actor_opt_state
                 )
                 actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
-                # UPDATE CRITIC PARAMS AND OPTIMISER STATE
                 critic_updates, critic_new_opt_state = critic_update_fn(
                     critic_grads, opt_states.critic_opt_state
                 )
                 critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
 
-                # PACK NEW PARAMS AND OPTIMISER STATE
                 new_params = ActorCriticParams(actor_new_params, critic_new_params)
                 new_opt_state = ActorCriticOptStates(actor_new_opt_state, critic_new_opt_state)
 
-                # PACK LOSS INFO
                 loss_info = {
                     **actor_loss_info,
                     **critic_loss_info,
@@ -498,7 +433,6 @@ def get_learner_fn(
             ) = update_state
             key, shuffle_key = jax.random.split(key)
 
-            # SHUFFLE MINIBATCHES
             batch_size = config.system.rollout_length * config.arch.num_envs
             permutation = jax.random.permutation(shuffle_key, batch_size)
             batch = (traj_batch, advantages, targets)
@@ -511,7 +445,6 @@ def get_learner_fn(
                 shuffled_batch,
             )
 
-            # UPDATE MINIBATCHES
             (params, opt_states), loss_info = jax.lax.scan(
                 _update_minibatch, (params, opt_states), minibatches
             )
@@ -535,7 +468,6 @@ def get_learner_fn(
             key,
         )
 
-        # UPDATE EPOCHS
         update_state, loss_info = jax.lax.scan(
             _update_epoch, update_state, None, config.system.epochs
         )
@@ -557,13 +489,6 @@ def get_learner_fn(
     def learner_fn(
         learner_state: RamdpOnPolicyLearnerState,
     ) -> AnakinExperimentOutput[RamdpOnPolicyLearnerState]:
-        """Learner function.
-
-        This function represents the learner, it updates the network parameters
-        by iteratively applying the `_update_step` function for a fixed number of
-        updates. The `_update_step` function is vectorized over a batch of inputs.
-        """
-
         batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
 
         learner_state, (episode_info, loss_info) = jax.lax.scan(
@@ -582,14 +507,11 @@ def learner_setup(
     env: Environment, keys: chex.Array, config: DictConfig
 ) -> Tuple[LearnerFn[RamdpOnPolicyLearnerState], Actor, RamdpOnPolicyLearnerState]:
     """Initialise learner_fn, network, optimiser, environment and states."""
-    # Get available TPU cores.
     n_devices = len(jax.devices())
 
-    # Get number/dimension of actions.
     num_actions = int(env.action_space().num_values)
     config.system.action_dim = num_actions
 
-    # PRNG keys.
     key, actor_net_key, critic_net_key = keys
 
     qac_variant = config.system.qac_variant
@@ -601,16 +523,12 @@ def learner_setup(
         "reinforce",
     ), f"Unknown qac_variant: {qac_variant}"
 
-    # Define network and optimiser.
     actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
     actor_action_head = hydra.utils.instantiate(
         config.network.actor_network.action_head, action_dim=num_actions
     )
-    # A `value_pre_torso`/`q_pre_torso` pair (instead of a single shared
-    # `pre_torso`) selects `SeparateValueAndQCritic`: V and Q each get their
-    # own torso, so the two heads share no parameters at all (see
-    # `base_qac.py`'s module docstring for the shared- vs separate-torso
-    # tradeoff).
+    # A `value_pre_torso`/`q_pre_torso` pair selects `SeparateValueAndQCritic`:
+    # V and Q each get their own torso and share no parameters.
     separate_qv_torsos = "value_pre_torso" in config.network.critic_network
     if separate_qv_torsos:
         value_torso = hydra.utils.instantiate(config.network.critic_network.value_pre_torso)
@@ -618,9 +536,7 @@ def learner_setup(
     else:
         critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
 
-    # input_layer is optional (e.g. a CNNTorso encoding a raw grid observation into
-    # a vector before it reaches the pondering torso, which itself needs a plain
-    # vector) - defaults to Actor/Critic's own ArrayInput() (identity) when absent.
+    # input_layer is optional - defaults to identity when absent.
     actor_kwargs = {}
     if "input_layer" in config.network.actor_network:
         actor_kwargs["input_layer"] = hydra.utils.instantiate(
@@ -645,14 +561,8 @@ def learner_setup(
 
     if qac_variant in ("naive", "fac", "cond_naive", "cond_fac"):
         value_head = hydra.utils.instantiate(config.network.critic_network.value_head)
-        # The Q head's output shape depends on `qac_variant` (see module
-        # docstring): "naive" learns a full (action, compute_time) table, so
-        # needs `max_steps` (read off the actor's compute-aware torso
-        # config, which bounds the range of compute times the actor can ever
-        # realise); "fac"/"cond_naive"/"cond_fac" only ever need one value
-        # per action - "cond_naive"/"cond_fac" get their compute_time
-        # dependence from an extra input instead (see
-        # `ValueAndQCritic._q_input`), not the output shape.
+        # "naive" learns a full (action, compute_time) table, so needs
+        # max_steps; the other variants only need one value per action.
         if qac_variant == "naive":
             max_steps = config.network.actor_network.pre_torso.max_steps
             q_head = hydra.utils.instantiate(
@@ -698,20 +608,16 @@ def learner_setup(
         optax.adam(critic_lr, eps=1e-5),
     )
 
-    # Initialise observation
     init_x = env.observation_space().generate_value()
     init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
 
-    # Initialise actor params and optimiser state.
     actor_params = actor_network.init(
         actor_net_key, init_x, torso_kwargs={"rng": actor_net_key}
     )
     actor_opt_state = actor_optim.init(actor_params)
 
-    # Initialise critic params and optimiser state. "cond_naive"/"cond_fac"
-    # need a representative `compute_time` at init time too, so `q_head`'s
-    # input layer is sized to include the conditioning feature from the
-    # start (see `ValueAndQCritic._q_input`).
+    # "cond_naive"/"cond_fac" need a representative compute_time at init
+    # time too, so the conditioning feature is sized in from the start.
     if qac_variant in ("cond_naive", "cond_fac"):
         dummy_compute_time = jnp.ones((1,), dtype=jnp.int32)
         critic_params = critic_network.init(
@@ -721,21 +627,17 @@ def learner_setup(
         critic_params = critic_network.init(critic_net_key, init_x)
     critic_opt_state = critic_optim.init(critic_params)
 
-    # Pack params.
     params = ActorCriticParams(actor_params, critic_params)
 
     actor_network_apply_fn = actor_network.apply
     critic_network_apply_fn = critic_network.apply
 
-    # Pack apply and update functions.
     apply_fns = (actor_network_apply_fn, critic_network_apply_fn)
     update_fns = (actor_optim.update, critic_optim.update)
 
-    # Get batched iterated update and replicate it to pmap it over cores.
     learn = get_learner_fn(env, apply_fns, update_fns, config)
     learn = jax.pmap(learn, axis_name="device")
 
-    # Initialise environment states and timesteps: across devices and batches.
     key, *env_keys = jax.random.split(
         key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
     )
@@ -743,22 +645,17 @@ def learner_setup(
     reshape_states = lambda x: x.reshape(
         (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
     )
-    # (devices, update batch size, num_envs, ...)
     env_states = jax.tree_util.tree_map(reshape_states, env_states)
     timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
 
-    # Load model from checkpoint if specified.
     if config.logger.checkpointing.load_model:
         loaded_checkpoint = Checkpointer(
             model_name=config.system.system_name,
-            **config.logger.checkpointing.load_args,  # Other checkpoint args
+            **config.logger.checkpointing.load_args,
         )
-        # Restore the learner state from the checkpoint
         restored_params, _ = loaded_checkpoint.restore_params(input_params=params)
-        # Update the params
         params = restored_params
 
-    # Define params to be replicated across devices and batches.
     key, step_key = jax.random.split(key)
     step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
     reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
@@ -766,18 +663,12 @@ def learner_setup(
     opt_states = ActorCriticOptStates(actor_opt_state, critic_opt_state)
     replicate_learner = (params, opt_states)
 
-    # Duplicate learner for update_batch_size.
     broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
-
-    # Duplicate learner across devices.
     replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
-    # Initialise learner state. running_cum_compute_time/running_discounted_return/
-    # episode_discounted_return (see RamdpOnPolicyLearnerState) start at 0 for every
-    # env - shape matches env_states/timesteps' leading (devices, update_batch_size,
-    # num_envs) dims, since these are per-env running accumulators, not replicated
-    # network state.
+    # running_cum_compute_time/running_discounted_return/episode_discounted_return
+    # start at 0 for every env, shaped like env_states/timesteps' leading dims.
     params, opt_states = replicate_learner
     zeros_per_env = jnp.zeros(
         (n_devices, config.arch.update_batch_size, config.arch.num_envs), dtype=jnp.float32
@@ -800,7 +691,6 @@ def run_experiment(_config: DictConfig) -> float:
     """Runs experiment."""
     config = copy.deepcopy(_config)
 
-    # Calculate total timesteps.
     n_devices = len(jax.devices())
     config.num_devices = n_devices
     config = check_total_timesteps(config)
@@ -808,20 +698,16 @@ def run_experiment(_config: DictConfig) -> float:
         config.arch.num_updates >= config.arch.num_evaluation
     ), "Number of updates per evaluation must be less than total number of updates."
 
-    # Create the environments for train and eval.
     env, eval_env = environments.make(config=config)
 
-    # PRNG keys.
     key, key_e, actor_net_key, critic_net_key = jax.random.split(
         jax.random.PRNGKey(config.arch.seed), num=4
     )
 
-    # Setup learner.
     learn, actor_network, learner_state = learner_setup(
         env, (key, actor_net_key, critic_net_key), config
     )
 
-    # Setup evaluator.
     evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = (
         evaluator_setup_with_compute_time(
             eval_env=eval_env,
@@ -832,7 +718,6 @@ def run_experiment(_config: DictConfig) -> float:
         )
     )
 
-    # Calculate environment steps per evaluation.
     steps_per_rollout = (
         n_devices
         * config.arch.num_updates_per_eval
@@ -841,64 +726,50 @@ def run_experiment(_config: DictConfig) -> float:
         * config.arch.num_envs
     )
 
-    # Logger setup
     logger = StoixLogger(config)
     logger.log_config(OmegaConf.to_container(config, resolve=True))
     print(f"{Fore.YELLOW}{Style.BRIGHT}JAX Global Devices {jax.devices()}{Style.RESET_ALL}")
 
-    # Set up checkpointer
     save_checkpoint = config.logger.checkpointing.save_model
     if save_checkpoint:
         checkpointer = Checkpointer(
-            metadata=config,  # Save all config as metadata in the checkpoint
+            metadata=config,
             model_name=config.system.system_name,
-            **config.logger.checkpointing.save_args,  # Checkpoint args
+            **config.logger.checkpointing.save_args,
         )
 
-    # Run experiment for a total number of evaluations.
     max_episode_return = -jnp.inf
     best_params = unreplicate_batch_dim(learner_state.params.actor_params)
     for eval_step in range(config.arch.num_evaluation):
-        # Train.
         start_time = time.time()
 
         learner_output = learn(learner_state)
         jax.block_until_ready(learner_output)
 
-        # Log the results of the training.
         elapsed_time = time.time() - start_time
         t = int(steps_per_rollout * (eval_step + 1))
         episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
         episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
 
-        # Separately log timesteps, actoring metrics and training metrics.
         logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
+        if ep_completed:
             logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
         train_metrics = learner_output.train_metrics
-        # Calculate the number of optimiser steps per second. Since gradients are aggregated
-        # across the device and batch axis, we don't consider updates per device/batch as part of
-        # the SPS for the learner.
         opt_steps_per_eval = config.arch.num_updates_per_eval * (
             config.system.epochs * config.system.num_minibatches
         )
         train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
         logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
 
-        # Prepare for evaluation.
         start_time = time.time()
-        trained_params = unreplicate_batch_dim(
-            learner_output.learner_state.params.actor_params
-        )  # Select only actor params
+        trained_params = unreplicate_batch_dim(learner_output.learner_state.params.actor_params)
         key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
         eval_keys = jnp.stack(eval_keys)
         eval_keys = eval_keys.reshape(n_devices, -1)
 
-        # Evaluate.
         evaluator_output = evaluator(trained_params, eval_keys)
         jax.block_until_ready(evaluator_output)
 
-        # Log the results of the evaluation.
         elapsed_time = time.time() - start_time
         episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
 
@@ -907,7 +778,6 @@ def run_experiment(_config: DictConfig) -> float:
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
 
         if save_checkpoint:
-            # Save checkpoint of learner state
             checkpointer.save(
                 timestep=int(steps_per_rollout * (eval_step + 1)),
                 unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
@@ -918,10 +788,8 @@ def run_experiment(_config: DictConfig) -> float:
             best_params = copy.deepcopy(trained_params)
             max_episode_return = episode_return
 
-        # Update runner state to continue training.
         learner_state = learner_output.learner_state
 
-    # Measure absolute metric.
     if config.arch.absolute_metric:
         start_time = time.time()
 
@@ -938,10 +806,7 @@ def run_experiment(_config: DictConfig) -> float:
         evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.ABSOLUTE)
 
-    # Stop the logger.
     logger.stop()
-    # Record the performance for the final evaluation run. If the absolute metric is not
-    # calculated, this will be the final evaluation run.
     eval_performance = float(jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
     return eval_performance
 
@@ -953,10 +818,8 @@ def run_experiment(_config: DictConfig) -> float:
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
     """Experiment entry point."""
-    # Allow dynamic attributes.
     OmegaConf.set_struct(cfg, False)
 
-    # Run experiment.
     eval_performance = run_experiment(cfg)
 
     print(

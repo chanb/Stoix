@@ -176,9 +176,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
         # The first scratchpad token is the observation projected into the
         # model width.
-        initial_token = parse_activation_fn(self.activation)(
-            nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
-        )
+        initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
             observation = nn.LayerNorm()(observation)
 
@@ -217,7 +215,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
                 tokens = block(tokens)
             state = tokens[..., -1, :]
 
-            halting_prob = nn.sigmoid(halting_head(state))
+            halting_prob = nn.sigmoid(halting_head(nn.LayerNorm()(state)))
             halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
 
             step_count = step + 1
