@@ -179,11 +179,20 @@ class TransformerExplicitCoTTorso(nn.Module):
             # the observation); `act_token_id` has no embedding, so substitute
             # a dummy id where it was emitted - those entries are never read
             # since nothing attends past its own (causally masked) position.
-            thought_id = jnp.where(target_tokens == act_token_id, 0, target_tokens)
-            token_embeds = token_embed(thought_id)
-            scratchpad = jnp.concatenate(
-                [initial_token[..., None, :], token_embeds[..., :-1, :]], axis=-2
-            )
+            if self.max_steps > 1:
+                # Guarded the same way as the rollout loop below (which only
+                # calls `token_embed` on non-final steps): with `max_steps ==
+                # 1` the single step is also the final, forced-halt step, so
+                # `token_embed` is never called there either - calling it
+                # unconditionally here would create an "embedding" param at
+                # apply-time that rollout-driven `init` never created.
+                thought_id = jnp.where(target_tokens == act_token_id, 0, target_tokens)
+                token_embeds = token_embed(thought_id)
+                scratchpad = jnp.concatenate(
+                    [initial_token[..., None, :], token_embeds[..., :-1, :]], axis=-2
+                )
+            else:
+                scratchpad = initial_token[..., None, :]
             tokens_in = scratchpad + pos_embedding[: self.max_steps]
 
             causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (self.max_steps,)))
