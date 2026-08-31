@@ -341,6 +341,18 @@ EXPLICIT_COT_NETWORK_BY_SYSTEM = {
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru", CNN_EXPLICIT_COT_ARCH)
 VALID_ARCHITECTURES = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
+# Short forms for group_tag/run_name (wandb group names get long fast):
+# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
+# -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru are already short.
+ARCH_SHORT_TAG = {
+    "transformer": "TF-iCoT",
+    "cnn+transformer": "cnn+TF-iCoT",
+    EXPLICIT_COT_ARCH: "TF-eCoT",
+    CNN_EXPLICIT_COT_ARCH: "cnn+TF-eCoT",
+}
+# Shortened dataset_name -> group_tag suffix for the longer Boxoban tiers (the
+# override still passes the full HuggingFace dataset_name, only the tag shrinks).
+SOKOBAN_TAG_SHORT = {"unfiltered-train": "unfilt-train", "medium-train": "med-train"}
 
 # env -> (non-CNN scenario, CNN/grid scenario or None if unsupported).
 ENV_SCENARIOS = {
@@ -412,7 +424,7 @@ def _sokoban_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
             # downloaded from HuggingFace Hub on first use.
             combos.append(
                 EnvDifficulty(
-                    tag=choice,
+                    tag=SOKOBAN_TAG_SHORT.get(choice, choice),
                     overrides=(
                         "+env.kwargs.generator._target_="
                         "jumanji.environments.routing.sokoban.generator.HuggingFaceDeepMindGenerator",
@@ -439,7 +451,10 @@ def _slidingtile_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty
 
 
 def _knapsack_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
-    return [
+    # Item weights are drawn in [0, 1], so total weight is at most num_items -
+    # if num_items < total_budget, the budget can never bind (every item
+    # always fits), making the task trivial. Skip those combos.
+    combos = [
         EnvDifficulty(
             tag=f"ni{ni}-tb{tb:g}",
             overrides=(
@@ -449,7 +464,15 @@ def _knapsack_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
         )
         for ni in args.knapsack_num_items
         for tb in args.knapsack_total_budget
+        if ni >= tb
     ]
+    n_skipped = len(args.knapsack_num_items) * len(args.knapsack_total_budget) - len(combos)
+    if n_skipped:
+        print(
+            f"Skipping {n_skipped} knapsack (num_items, total_budget) combo(s) where "
+            "num_items < total_budget (item weights are in [0, 1], so the budget can never bind)."
+        )
+    return combos
 
 
 def _maze_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
@@ -505,30 +528,55 @@ class Job:
     wandb_project: str
 
     @property
-    def group_tag(self) -> str:
-        system_short = self.system.removeprefix("ff_")
-        name = (
-            f"{self.env}-{self.difficulty.tag}-{system_short}-{self.arch}-b{self.budget}"
-            f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}"
+    def group_tag_parts(self) -> List[str]:
+        """The group tag broken into semantic chunks - env/difficulty, algo,
+        budget, network hparams, PPO hparams, misc flags - instead of one
+        flat dash-joined string. `group_tag` still joins these with "-" for
+        run_name/filenames/manifest (unchanged, filesystem-safe); the parts
+        list is for `logger.loggers.wandb.group_tag`, which Neptune stores as
+        a real list of tags (see stoix/utils/logger.py) so each axis stays
+        independently filterable instead of buried in one long string.
+        """
+        system_short = (
+            self.system.removeprefix("ff_").replace("explicit", "expl").replace("reinforce", "reinf")
         )
-        name += f"-nl{self.num_layers}"
+        arch_short = ARCH_SHORT_TAG.get(self.arch, self.arch)
+        parts = [
+            f"{self.env}-{self.difficulty.tag}",
+            f"{system_short}-{arch_short}",
+            f"b{self.budget}",
+        ]
+
+        net = f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-nl{self.num_layers}"
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
-            name += f"-nh{self.num_heads}-md{self.mlp_dim}"
+            net += f"-nh{self.num_heads}-md{self.mlp_dim}"
         # Only shown for the explicit-CoT arches - vocab_size doesn't exist on
         # any other architecture, see EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
-            name += f"-vs{self.vocab_size}"
+            net += f"-vs{self.vocab_size}"
+        parts.append(net)
+
         if self.system in PPO_SYSTEMS:
-            name += f"-ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
+            ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
             if not self.clip_value_loss:
-                name += "-l2c"
+                ppo += "-l2c"
+            parts.append(ppo)
+
+        extra = []
         if self.delightful:
-            name += f"-deta{self.delightful_eta:g}"
+            extra.append(f"deta{self.delightful_eta:g}")
         if self.use_layer_norm:
-            name += "-ln"
+            extra.append("ln")
         if self.use_input_layer_norm:
-            name += "-iln"
-        return name
+            extra.append("iln")
+        if extra:
+            parts.append("-".join(extra))
+
+        return parts
+
+    @property
+    def group_tag(self) -> str:
+        return "-".join(self.group_tag_parts)
 
     @property
     def run_name(self) -> str:
@@ -590,7 +638,7 @@ class Job:
         if self.wandb:
             cmd.append("logger.loggers.wandb.enabled=True")
             cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
-            cmd.append(f"logger.loggers.wandb.group_tag=[{self.group_tag}]")
+            cmd.append(f"logger.loggers.wandb.group_tag=[{','.join(self.group_tag_parts)}]")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         # `++` (override-or-add), not `=`: not every network yaml declares
