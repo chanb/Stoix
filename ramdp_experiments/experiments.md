@@ -89,3 +89,23 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 
  ### TF with explicit CoT
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32,64 --mlp-dim 64 --num-layers 1,2 --num-heads 2,4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_explicit_cot --yes --runs-per-gpu 2 --gpus 0,1
+
+# Comments on Aug 31:
+
+## Comments about experiments from Aug. 30
+### Implicit CoT, `lightsout`
+- Group: `lightsout-5x4-ppo_reinforce-transformer-hd32-lr0.0003-clr0.0003-nl1-nh4-md64-ep8-mb16-clip0.2-l2c-iln`
+  - Budget = 8 is better than all other variants, perhaps 100M steps is insufficient compute.
+- Group: `lightsout-5x4-ppo_reinforce-transformer-hd64-lr0.0003-clr0.0003-nl1-nh2-md64-ep8-mb16-clip0.2-l2c-iln`
+  - General trend is that more budget gives better performance---of course we can increase number of training steps
+- Group: `lightsout-5x4-ppo_reinforce-transformer-hd64-lr0.0003-clr0.0003-nl1-nh4-md64-ep8-mb16-clip0.2-l2c-iln`
+  - General trend is that more budget gives better performance---of course we can increase number of training steps---not as dramatic as `num_heads=2`
+- Group: `lightsout-5x4-ppo_reinforce-transformer-hd32-lr0.0003-clr0.0003-nl2-nh4-md64-ep8-mb16-clip0.2-l2c-iln`
+  - Performance is similar across budget, but it seems like with more training step there could be separation
+
+We will choose the last group: `lightsout-5x4-ppo_reinforce-transformer-hd32-lr0.0003-clr0.0003-nl2-nh4-md64-ep8-mb16-clip0.2-l2c-iln` since it's the closest to current TF models---rerunning
+
+
+### Explicit CoT, `lightsout`
+- Needed to expose `num_layers`---it was missing.
+- Use similar setting as above, it seems more training steps can help. Setting `epoch=8` is generally better than `epoch=16`.

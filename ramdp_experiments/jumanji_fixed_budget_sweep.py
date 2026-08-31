@@ -511,10 +511,7 @@ class Job:
             f"{self.env}-{self.difficulty.tag}-{system_short}-{self.arch}-b{self.budget}"
             f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}"
         )
-        # Not shown for the explicit-CoT arches - num_layers isn't swept for
-        # them (they keep their own yaml default), see build_grid.
-        if self.arch not in EXPLICIT_COT_ARCHES:
-            name += f"-nl{self.num_layers}"
+        name += f"-nl{self.num_layers}"
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             name += f"-nh{self.num_heads}-md{self.mlp_dim}"
         # Only shown for the explicit-CoT arches - vocab_size doesn't exist on
@@ -671,10 +668,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    requesting cnn+transformer_explicit_cot (optionally alongside
     #    transformer_explicit_cot) opts into the CNN-input variant instead -
     #    see EXPLICIT_COT_NETWORK_BY_SYSTEM.
-    #  - num_layers isn't swept for the explicit-CoT arches, which keep their
-    #    own yaml default instead (see --num-layers help); num_heads/mlp_dim
-    #    are swept for them (like TRANSFORMER_ARCHES), everything else forced
-    #    to a single value.
+    #  - num_layers is swept for every arch, including the explicit-CoT arches;
+    #    num_heads/mlp_dim are also swept for them (like TRANSFORMER_ARCHES),
+    #    everything else forced to a single value.
     #  - vocab_size (thought-token vocabulary size) only exists on the
     #    explicit-CoT arches (see EXPLICIT_COT_ARCHES) - swept only for them,
     #    everything else (including plain transformer) forced to a single
@@ -699,7 +695,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     n_skipped_incompatible += 1
                     continue
                 ln_options = [(False, False)]
-                num_layers_options = [args.num_layers[0]]
+                num_layers_options = args.num_layers
             elif arch in NO_LAYER_NORM_ARCHES:
                 ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
                 num_layers_options = args.num_layers

@@ -93,9 +93,9 @@ Grid axes:
                  step (network.actor_network.pre_torso.num_layers) - Dense
                  layers for mlp, GRU cells for gru, IRU cells for iru,
                  transformer layers for transformer (see
-                 stoix/networks/torso_compute*.py); not swept for
-                 transformer_explicit_cot, which keeps its own yaml default
-                 (2) instead. Default 1.
+                 stoix/networks/torso_compute*.py), or explicit-CoT
+                 transformer layers for transformer_explicit_cot
+                 (TransformerExplicitCoTTorso's yaml default is 2). Default 1.
   - num_heads:   attention head count (network.actor_network.pre_torso.num_heads);
                  only applies to transformer (TransformerChainOfThoughtTorso)
                  and transformer_explicit_cot (TransformerExplicitCoTTorso) -
@@ -386,10 +386,7 @@ class Job:
             f"{self.env}-{system_short}-{self.arch}-b{self.budget}"
             f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}"
         )
-        # Not shown for transformer_explicit_cot - num_layers isn't swept for
-        # that arch (it keeps its own yaml default), see build_grid.
-        if self.arch != EXPLICIT_COT_ARCH:
-            name += f"-nl{self.num_layers}"
+        name += f"-nl{self.num_layers}"
         # Only shown for architectures with num_heads/mlp_dim params - see
         # TRANSFORMER_ARCHES/build_grid.
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
@@ -555,9 +552,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #  - use_input_layer_norm exists on mlp/transformer/gru/iru, not yet on
     #    transformer_explicit_cot.
     #  - num_layers (sub-layers stacked inside each shared pondering step,
-    #    see stoix/networks/torso_compute*.py) is swept for every arch except
-    #    transformer_explicit_cot, which keeps its own yaml default instead
-    #    (see --num-layers help).
+    #    see stoix/networks/torso_compute*.py) is swept for every arch,
+    #    including transformer_explicit_cot.
     #  - num_heads (attention heads) and mlp_dim (transformer feedforward width)
     #    only exist on transformer/transformer_explicit_cot (see
     #    TRANSFORMER_ARCHES) - swept only for those, everything else forced to a
@@ -584,7 +580,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     n_skipped_incompatible += 1
                     continue
                 ln_options = [(False, False)]
-                num_layers_options = [args.num_layers[0]]
+                num_layers_options = args.num_layers
             elif arch in NO_LAYER_NORM_ARCHES:
                 ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
                 num_layers_options = args.num_layers
@@ -901,8 +897,8 @@ def main() -> None:
         "(AdaptiveComputationTimeTorso), GRU cells for gru (GRUAdaptiveComputationTimeTorso), "
         "IRU cells for iru (IRUAdaptiveComputationTimeTorso), or transformer layers for "
         "transformer (TransformerChainOfThoughtTorso) - see "
-        "stoix/networks/torso_compute*.py. Default 1 sub-layer per step. Not swept for "
-        "transformer_explicit_cot (TransformerExplicitCoTTorso keeps its own yaml default of 2).",
+        "stoix/networks/torso_compute*.py. Default 1 sub-layer per step. Also swept for "
+        "transformer_explicit_cot (TransformerExplicitCoTTorso's yaml default is 2).",
     )
     parser.add_argument(
         "--num-heads",
@@ -1123,7 +1119,7 @@ def main() -> None:
         f"  use_layer_norm={args.use_layer_norm} (mlp only) "
         f"use_input_layer_norm={args.use_input_layer_norm} (not transformer_explicit_cot)"
     )
-    print(f"  num_layers={args.num_layers} (not swept for transformer_explicit_cot)")
+    print(f"  num_layers={args.num_layers}")
     print(
         f"  num_heads={args.num_heads} mlp_dim={args.mlp_dim} "
         f"(transformer/transformer_explicit_cot only)"
