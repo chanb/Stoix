@@ -109,3 +109,6 @@ We will choose the last group: `lightsout-5x4-ppo_reinforce-transformer-hd32-lr0
 ### Explicit CoT, `lightsout`
 - Needed to expose `num_layers`---it was missing.
 - Use similar setting as above, it seems more training steps can help. Setting `epoch=8` is generally better than `epoch=16`.
+
+### Jumanji
+- Currently testing knapsack, maze, slidingtile
