@@ -506,6 +506,7 @@ class Job:
     hidden_dim: int
     lr: float
     critic_lr: float
+    ent_coef: float
     delightful: bool
     delightful_eta: float
     epochs: int
@@ -547,7 +548,10 @@ class Job:
             f"b{self.budget}",
         ]
 
-        net = f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-nl{self.num_layers}"
+        net = (
+            f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-ec{self.ent_coef:g}"
+            f"-nl{self.num_layers}"
+        )
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             net += f"-nh{self.num_heads}-md{self.mlp_dim}"
         # Only shown for the explicit-CoT arches - vocab_size doesn't exist on
@@ -615,7 +619,7 @@ class Job:
             f"network.actor_network.pre_torso.min_steps={self.budget}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
-            "system.ent_coef=0.01",
+            f"system.ent_coef={self.ent_coef:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
@@ -796,6 +800,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             hidden_dim,
             lr,
             critic_lr,
+            ent_coef,
             (delightful, delightful_eta),
             (epochs, num_minibatches, clip_eps, clip_value_loss),
             seed,
@@ -806,6 +811,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.hidden_dim,
             args.lr,
             args.critic_lr,
+            args.ent_coef,
             delightful_combos,
             ppo_combos,
             range(args.seeds),
@@ -827,6 +833,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     hidden_dim=hidden_dim,
                     lr=lr,
                     critic_lr=critic_lr,
+                    ent_coef=ent_coef,
                     delightful=delightful,
                     delightful_eta=delightful_eta,
                     epochs=epochs,
@@ -975,6 +982,10 @@ def main() -> None:
         "--critic-lr", default="1e-4,3e-4,1e-3",
         help="Comma-separated system.critic_lr values, swept independently of --lr.",
     )
+    parser.add_argument(
+        "--ent-coef", default="0.01",
+        help="Comma-separated system.ent_coef values (entropy bonus coefficient).",
+    )
     parser.add_argument("--delightful", default="false", help="Comma-separated bools - system.delightful (not PPO).")
     parser.add_argument("--delightful-eta", default="1.0", help="Comma-separated system.delightful_eta values.")
     parser.add_argument("--epochs", default="4", help="Comma-separated system.epochs values (PPO only).")
@@ -1067,6 +1078,7 @@ def main() -> None:
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
     args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
+    args.ent_coef = [float(x) for x in args.ent_coef.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
     args.epochs = [int(x) for x in args.epochs.split(",")]
@@ -1138,7 +1150,7 @@ def main() -> None:
     print(f"  envs={args.envs}")
     print(f"  systems={args.systems} architectures={args.architectures}")
     print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
-    print(f"  lr={args.lr} critic_lr={args.critic_lr}")
+    print(f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef}")
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
     print(f"  knapsack_num_items={args.knapsack_num_items} knapsack_total_budget={args.knapsack_total_budget}")

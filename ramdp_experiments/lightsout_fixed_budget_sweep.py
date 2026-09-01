@@ -331,6 +331,13 @@ EXPLICIT_COT_NETWORK_BY_SYSTEM = {
     "ff_ppo_explicit_reinforce": "transformer_explicit_cot",
 }
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
+# Short forms for group_tag/run_name (wandb group names get long fast):
+# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
+# -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru/iru_unshared are already short.
+ARCH_SHORT_TAG = {
+    "transformer": "TF-iCoT",
+    EXPLICIT_COT_ARCH: "TF-eCoT",
+}
 
 
 @dataclass
@@ -342,6 +349,7 @@ class Job:
     hidden_dim: int
     lr: float
     critic_lr: float
+    ent_coef: float
     delightful: bool
     delightful_eta: float
     epochs: int
@@ -374,41 +382,63 @@ class Job:
         return f"lightsout-{self.grid_size}"
 
     @property
-    def group_tag(self) -> str:
-        """Abbreviated form of run_name with the seed suffix omitted -
-        identifies the hyperparameter setting shared by every seed of a
-        config, for W&B grouping (logger.loggers.wandb.group_tag) and
-        manifest.jsonl. Uses short axis prefixes (b/hd/lr/clr/nl/nh/md/ep/
-        mb/clip/deta/ln/iln) rather than run_name's full field names, since
-        W&B's group field gets unwieldy at run_name's length."""
-        system_short = self.system.removeprefix("ff_")
-        name = (
-            f"{self.env}-{system_short}-{self.arch}-b{self.budget}"
-            f"-hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}"
+    def group_tag_parts(self) -> List[str]:
+        """The group tag broken into semantic chunks - env, algo/arch,
+        budget, network hparams, PPO hparams, misc flags - instead of one
+        flat dash-joined string. `group_tag` still joins these with "-" for
+        run_name/filenames/manifest (unchanged, filesystem-safe); the parts
+        list is for `logger.loggers.wandb.group_tag`, which Neptune stores as
+        a real list of tags (see stoix/utils/logger.py) so each axis stays
+        independently filterable instead of buried in one long string. Uses
+        short axis prefixes (b/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/iln)
+        rather than run_name's full field names, and ARCH_SHORT_TAG/expl/reinf
+        abbreviations, since W&B's group field (the parts joined by "_", see
+        WandBLogger) gets unwieldy at run_name's length otherwise."""
+        system_short = self.system.removeprefix("ff_").replace("explicit", "expl").replace(
+            "reinforce", "reinf"
         )
-        name += f"-nl{self.num_layers}"
+        arch_short = ARCH_SHORT_TAG.get(self.arch, self.arch)
+        parts = [self.env, f"{system_short}-{arch_short}", f"b{self.budget}"]
+
+        net = f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-ec{self.ent_coef:g}-nl{self.num_layers}"
         # Only shown for architectures with num_heads/mlp_dim params - see
         # TRANSFORMER_ARCHES/build_grid.
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
-            name += f"-nh{self.num_heads}-md{self.mlp_dim}"
+            net += f"-nh{self.num_heads}-md{self.mlp_dim}"
         # Only shown for transformer_explicit_cot - vocab_size doesn't exist
         # on any other architecture, see EXPLICIT_COT_ARCH/build_grid.
         if self.arch == EXPLICIT_COT_ARCH:
-            name += f"-vs{self.vocab_size}"
+            net += f"-vs{self.vocab_size}"
+        parts.append(net)
+
         # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
         # exist for ff_reinforce.py/ff_qac.py (single gradient step per
         # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
         if self.system in PPO_SYSTEMS:
-            name += f"-ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
+            ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
             if not self.clip_value_loss:
-                name += "-l2c"
+                ppo += "-l2c"
+            parts.append(ppo)
+
+        extra = []
         if self.delightful:
-            name += f"-deta{self.delightful_eta:g}"
+            extra.append(f"deta{self.delightful_eta:g}")
         if self.use_layer_norm:
-            name += "-ln"
+            extra.append("ln")
         if self.use_input_layer_norm:
-            name += "-iln"
-        return name
+            extra.append("iln")
+        if extra:
+            parts.append("-".join(extra))
+
+        return parts
+
+    @property
+    def group_tag(self) -> str:
+        """Abbreviated form of run_name with the seed suffix omitted -
+        identifies the hyperparameter setting shared by every seed of a
+        config, for filenames/manifest.jsonl. See `group_tag_parts` for the
+        W&B/Neptune-facing list form."""
+        return "-".join(self.group_tag_parts)
 
     @property
     def run_name(self) -> str:
@@ -445,7 +475,7 @@ class Job:
             f"network.actor_network.pre_torso.min_steps={self.budget}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
-            f"system.ent_coef=0.01",
+            f"system.ent_coef={self.ent_coef:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
@@ -477,10 +507,13 @@ class Job:
             # collide on the same W&B run.
             cmd.append("logger.loggers.wandb.enabled=True")
             cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
-            # Single-element list: WandBLogger joins group_tag with "_" into
-            # W&B's group field (see stoix/utils/logger.py), so every seed of
-            # this hyperparameter setting groups together in the W&B UI.
-            cmd.append(f"logger.loggers.wandb.group_tag=[{self.group_tag}]")
+            # WandBLogger joins these parts with "_" into W&B's group field
+            # (see stoix/utils/logger.py), so every seed of this
+            # hyperparameter setting groups together in the W&B UI; passed as
+            # multiple list elements (group_tag_parts, not the single
+            # dash-joined group_tag string) so Neptune stores each axis as an
+            # independently filterable tag instead of one long string.
+            cmd.append(f"logger.loggers.wandb.group_tag=[{','.join(self.group_tag_parts)}]")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         if self.arch == EXPLICIT_COT_ARCH:
@@ -630,6 +663,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         hidden_dim,
         lr,
         critic_lr,
+        ent_coef,
         (delightful, delightful_eta),
         (epochs, num_minibatches, clip_eps, clip_value_loss),
         seed,
@@ -640,6 +674,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.hidden_dim,
         args.lr,
         args.critic_lr,
+        args.ent_coef,
         delightful_combos,
         ppo_combos,
         range(args.seeds),
@@ -662,6 +697,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 hidden_dim=hidden_dim,
                 lr=lr,
                 critic_lr=critic_lr,
+                ent_coef=ent_coef,
                 delightful=delightful,
                 delightful_eta=delightful_eta,
                 epochs=epochs,
@@ -831,6 +867,12 @@ def main() -> None:
         default="1e-4,3e-4,1e-3",
         help="Comma-separated system.critic_lr values, swept independently of --lr "
         "(full cross product).",
+    )
+    parser.add_argument(
+        "--ent-coef",
+        default="0.01",
+        help="Comma-separated system.ent_coef values (entropy bonus coefficient), swept "
+        "independently of --lr/--critic-lr (full cross product). Default 0.01.",
     )
     parser.add_argument(
         "--delightful",
@@ -1020,6 +1062,7 @@ def main() -> None:
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
     args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
+    args.ent_coef = [float(x) for x in args.ent_coef.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
     args.epochs = [int(x) for x in args.epochs.split(",")]
@@ -1109,7 +1152,7 @@ def main() -> None:
     print(f"  grid_sizes={args.grid_sizes}")
     print(f"  systems={args.systems} architectures={args.architectures}")
     print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
-    print(f"  lr={args.lr} critic_lr={args.critic_lr}")
+    print(f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef}")
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "

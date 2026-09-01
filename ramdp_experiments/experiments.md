@@ -90,8 +90,10 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
  ### TF with explicit CoT
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32,64 --mlp-dim 64 --num-layers 1,2 --num-heads 2,4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_explicit_cot --yes --runs-per-gpu 2 --gpus 0,1
 
-# Comments on Aug 31:
 
+
+
+# Comments on Aug 31:
 ## Comments about experiments from Aug. 30
 ### Implicit CoT, `lightsout`
 - Group: `lightsout-5x4-ppo_reinforce-transformer-hd32-lr0.0003-clr0.0003-nl1-nh4-md64-ep8-mb16-clip0.2-l2c-iln`
@@ -109,3 +111,37 @@ We will choose the last group: `lightsout-5x4-ppo_reinforce-transformer-hd32-lr0
 ### Explicit CoT, `lightsout`
 - Needed to expose `num_layers`---it was missing.
 - Use similar setting as above, it seems more training steps can help. Setting `epoch=8` is generally better than `epoch=16`.
+- Use shared embed/umembed---this seems to help!
+
+
+## Jumanji architecture search
+Start with knapsack: `python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,4 --seeds 3 --runs-per-gpu 4 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 5e7 --clip-value-loss false --lr 1e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 5,10,20,50 --knapsack-total-budget 2.5,12.5 --use-input-layer-norm true --gpus 0,1 --total-num-envs 128 --rollout-length 64 --epochs 8 --num-minibatches 16 --wandb true --wandb-project jumanji_sweep-ppo_only-test`
+
+
+# Comments on Sept 1:
+### Implicit CoT, `lightsout`
+`lightsout-5x4-ppo_reinforce-transformer-hd32-lr0.0003-clr0.0003-nl2-nh4-md64-ep8-mb16-clip0.2-l2c-iln` has a reasonably nice trend, in that with more compute it can do better.
+Command ran on salient:
+```
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test --yes --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing
+```
+
+Now we try adaptive budget
+```
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_naive,ff_ppo_cond_fac --max-steps 10 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing
+```
+
+### Explicit CoT, `lightsout`
+`lightsout-5x4-ppo_explicit_reinforce-transformer_explicit_cot-hd32-lr0.0003-clr0.0003-nl2-nh4-md64-ep8-mb16-clip0.2-l2c` generally has high entropy when `vocab_size` is > 1. This somewhat makes sense because it has to explore all possible paths.
+
+Command:
+```
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=1,2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-shared_embed_explicit_cot --runs-per-gpu 2 --gpus 0,1 --no-skip-existing --yes
+```
+
+One way is to decrease the entropy regularization effect.
+
+Command:
+```
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=1,2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-shared_embed_explicit_cot --runs-per-gpu 2 --gpus 0,1,2,3 --no-skip-existing --ent-coef 0.001,0.0001
+```

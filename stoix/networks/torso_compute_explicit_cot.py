@@ -141,8 +141,16 @@ class TransformerExplicitCoTTorso(nn.Module):
         pos_embedding = self.param(
             "pos_embedding", normal(stddev=0.02), (self.max_steps + 1, self.hidden_dim)
         )
-        token_embed = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_dim)
-        token_head = nn.Dense(num_classes, kernel_init=self.kernel_init)
+        # `token_embed` doubles as the unembedding ("token_head") via
+        # `.attend()` (query @ embedding.T) - standard input/output
+        # weight-tying. Its table has one row beyond `vocab_size` for
+        # `act_token_id`: that row is only ever read through `.attend()` (to
+        # produce the "act now" logit), never through `token_embed(...)` (the
+        # embedding lookup fed back into the scratchpad), since choosing
+        # `act_token_id` halts before another embedding is needed - see the
+        # `act_token_id -> 0` substitutions below/in the rollout loop.
+        token_embed = nn.Embed(num_embeddings=num_classes, features=self.hidden_dim)
+        token_head = token_embed.attend
 
         blocks = [
             TransformerBlock(
@@ -151,24 +159,29 @@ class TransformerExplicitCoTTorso(nn.Module):
             for _ in range(self.num_layers)
         ]
 
-        # Per-step "act now" legality, precomputed once as a constant additive
+        # Per-step "act now" legality, precomputed once as a constant boolean
         # mask over the step axis (shape `(max_steps, num_classes)`) instead
         # of as a Python-level `if` per loop iteration - used by both the
-        # rollout loop below and the parallel replay path.
+        # rollout loop below and the parallel replay path. Applied via
+        # `jnp.where`/`log_softmax(..., where=...)` (value substitution)
+        # rather than adding `_NEG_INF` to the logits, so an illegal class is
+        # excluded regardless of how large `token_head`'s raw output is -
+        # additive masking can in principle be defeated by a logit close to
+        # float32's max magnitude cancelling out `_NEG_INF`.
         step_counts = np.arange(1, self.max_steps + 1)
         is_final_step = step_counts == self.max_steps
         can_halt = step_counts >= self.min_steps
-        step_mask = np.zeros((self.max_steps, num_classes), dtype=np.float32)
+        legal_mask = np.ones((self.max_steps, num_classes), dtype=bool)
         # A halt is forced at the final step regardless of the policy: mask
         # out every thought class so "act now" is the only one left. Its
         # log-probability under that mask is an inputs-independent constant
         # (zero), so no gradient flows through a step that was never really a
         # choice.
-        step_mask[is_final_step, :] = _NEG_INF
-        step_mask[is_final_step, act_token_id] = 0.0
+        legal_mask[is_final_step, :] = False
+        legal_mask[is_final_step, act_token_id] = True
         # Before min_steps, "act now" isn't a legal choice yet.
-        step_mask[~can_halt, act_token_id] = _NEG_INF
-        step_mask = jnp.asarray(step_mask)
+        legal_mask[~can_halt, act_token_id] = False
+        legal_mask = jnp.asarray(legal_mask)
 
         if replaying:
             # Attention is causally masked (see `TransformerBlock`), so every
@@ -200,7 +213,11 @@ class TransformerExplicitCoTTorso(nn.Module):
                 tokens_in = block(tokens_in, mask=causal_mask)
             states = tokens_in  # (*batch, max_steps, hidden_dim); one state per step.
 
-            token_logits = token_head(states) + step_mask
+            # Same masked-logits expression as the rollout loop below, so
+            # replay scores the exact distribution rollout would have sampled
+            # from at each state - required for the log-probs used in the
+            # policy gradient to match the trajectory that was actually taken.
+            token_logits = jnp.where(legal_mask, token_head(states), _NEG_INF)
             log_token_probs = jax.nn.log_softmax(token_logits, axis=-1)
             token_log_prob = jnp.take_along_axis(
                 log_token_probs, target_tokens[..., None], axis=-1
@@ -240,7 +257,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 tokens_in = block(tokens_in, mask=causal_mask)
             state = tokens_in[..., -1, :]
 
-            token_logits = token_head(state) + step_mask[step]
+            token_logits = jnp.where(legal_mask[step], token_head(state), _NEG_INF)
 
             if deterministic:
                 token_id = jnp.argmax(token_logits, axis=-1)
