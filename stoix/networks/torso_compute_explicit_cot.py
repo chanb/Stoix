@@ -101,13 +101,17 @@ class _ExplicitCoTBackbone(nn.Module):
     """The transformer blocks, token (un)embedding, positional embedding and
     (when `use_latent_feedback=True`) latent-feedback fusion - instantiated
     *once* in `TransformerExplicitCoTTorso.__call__` and reused, via its
-    methods, by every code path that needs them: the parallel one-shot replay
-    pass, and the scanned per-step body (`nn.scan`'s functional form, see
-    `TransformerExplicitCoTTorso.__call__`) used by rollout mode and (when
-    `use_latent_feedback=True`) replay mode.
+    methods, by every code path that needs them: `run` for the parallel
+    one-shot replay pass, and `step` for the scanned per-step body (`nn.scan`
+    's functional form, see `TransformerExplicitCoTTorso.__call__`) used by
+    rollout mode and (when `use_latent_feedback=True`) replay mode. `run`
+    reprocesses a whole (sub)sequence in one call (used once, so O(seq_len)
+    is fine); `step` is `TransformerBlock`'s KV-cached incremental mode,
+    advancing one new token per call in O(1) instead of reprocessing
+    everything so far - see `TransformerBlock` for why the two share weights.
 
-    Sharing one instance - rather than, say, building a fresh
-    `TransformerBlock` list separately for each code path - is what makes
+    Sharing one `TransformerBlock` list between `run` and `step` - rather
+    than, say, building separate blocks for each code path - is what makes
     those paths use the exact same weights instead of silently diverging into
     independently-initialized copies: a `setup()`-style module's submodules
     are created once (on first use) and namespaced under this module's own
@@ -116,7 +120,7 @@ class _ExplicitCoTBackbone(nn.Module):
     `use_latent_feedback` combination it's called with) still creates the
     complete parameter set every other path also needs - the layers here are
     only ever a function of `hidden_dim`/`num_heads`/`mlp_dim`/`vocab_size`,
-    never of the sequence length a given path happens to call `run` with.
+    never of which method/sequence length a given call happens to use.
     """
 
     hidden_dim: int
@@ -165,14 +169,13 @@ class _ExplicitCoTBackbone(nn.Module):
         return self.token_embed.attend(state)
 
     def run(self, scratchpad: chex.Array) -> chex.Array:
-        """Runs the transformer over `scratchpad` (`(*batch, seq_len,
-        hidden_dim)`, any `seq_len <= max_steps + 1`) under a causal mask and
-        returns the per-position states - the shared core of the parallel
-        replay pass (`seq_len == max_steps`) and the scanned per-step body
-        (`seq_len == max_steps + 1`, called once per step - see
-        `TransformerExplicitCoTTorso.__call__` for why a fixed full-width,
-        causally-masked pass is equivalent to recomputing just the valid
-        growing prefix)."""
+        """Runs the transformer over `scratchpad` (`(*batch, max_steps,
+        hidden_dim)`) under a causal mask in one call and returns the
+        per-position states - used only by the parallel one-shot replay pass
+        (`TransformerExplicitCoTTorso.__call__`'s `replaying and not
+        use_latent_feedback` branch), which already knows the whole token
+        trajectory up front so has no per-step recurrence to cache against.
+        The other paths use `step` instead (see class docstring)."""
         seq_len = scratchpad.shape[-2]
         batch_shape = scratchpad.shape[:-2]
         tokens_in = scratchpad + self.pos_embedding[:seq_len]
@@ -190,6 +193,31 @@ class _ExplicitCoTBackbone(nn.Module):
         return self.latent_feedback_value(state) * jax.nn.sigmoid(
             self.latent_feedback_gate(token_emb)
         )
+
+    def step(
+        self,
+        token: chex.Array,
+        cached_keys: list,
+        cached_values: list,
+        step_idx: chex.Array,
+    ) -> Tuple[chex.Array, list, list]:
+        """Incremental counterpart to `run`, used by the scanned per-step
+        body (rollout mode and, when `use_latent_feedback=True`, replay
+        mode): advances a single new token through every layer, reading/
+        extending each layer's KV-cache (`TransformerBlock.step`) instead of
+        reprocessing the whole scratchpad. Uses the same `self.blocks` as
+        `run`, so its weights stay shared with the parallel replay pass (see
+        class docstring)."""
+        x = token + self.pos_embedding[step_idx]
+        new_cached_keys = []
+        new_cached_values = []
+        for layer_idx, block in enumerate(self.blocks):
+            x, k, v = block.step(
+                x, cached_keys[layer_idx], cached_values[layer_idx], step_idx, self.max_steps
+            )
+            new_cached_keys.append(k)
+            new_cached_values.append(v)
+        return x, new_cached_keys, new_cached_values
 
 
 class TransformerExplicitCoTTorso(nn.Module):
@@ -365,7 +393,7 @@ class TransformerExplicitCoTTorso(nn.Module):
 
             return final_state, log_prob
 
-        # Sequential scratchpad build, shared by rollout mode and (when
+        # KV-cached step-by-step build, shared by rollout mode and (when
         # `use_latent_feedback=True`) replay mode: with latent feedback, each
         # scratchpad entry depends on the *computed* hidden state of the
         # previous step (see module docstring), so - unlike the parallel path
@@ -373,13 +401,15 @@ class TransformerExplicitCoTTorso(nn.Module):
         # (`target_tokens`) is already known. The two modes differ only in
         # where `token_id` comes from (sampled/argmax vs. read off
         # `target_tokens`) and what they accumulate (compute_time/emitted
-        # tokens vs. log_prob) - everything else, including the scratchpad
-        # fusion, is identical.
-        # Pre-allocate the CoT scratchpad; unwritten positions are never read
-        # by attention since `backbone.run`'s causal mask cuts off any
-        # dependency on them (see `_ExplicitCoTBackbone.run`).
-        scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
-        scratchpad = scratchpad.at[..., 0, :].set(initial_token)
+        # tokens vs. log_prob) - everything else, including the cache update,
+        # is identical.
+        assert self.hidden_dim % self.num_heads == 0, (
+            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        )
+        head_dim = self.hidden_dim // self.num_heads
+        cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
+        cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
+        cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
 
         still_running = jnp.ones(batch_shape, dtype=bool)
         final_state = initial_token
@@ -394,7 +424,9 @@ class TransformerExplicitCoTTorso(nn.Module):
             backbone: _ExplicitCoTBackbone, carry: Tuple[chex.Array, ...], step_idx: chex.Array
         ) -> Tuple[Tuple[chex.Array, ...], None]:
             (
-                scratchpad,
+                current_token,
+                cached_keys,
+                cached_values,
                 still_running,
                 num_steps_taken,
                 emitted_tokens,
@@ -403,8 +435,9 @@ class TransformerExplicitCoTTorso(nn.Module):
                 rng,
             ) = carry
 
-            states = backbone.run(scratchpad)  # (*batch, max_steps + 1, hidden_dim)
-            state = states[..., step_idx, :]
+            state, cached_keys, cached_values = backbone.step(
+                current_token, cached_keys, cached_values, step_idx
+            )
             token_logits = jnp.where(legal_mask[step_idx], backbone.token_head(state), _NEG_INF)
 
             if replaying:
@@ -429,21 +462,22 @@ class TransformerExplicitCoTTorso(nn.Module):
 
             # `act_token_id`'s embedding row is never read back through this
             # lookup (see `_ExplicitCoTBackbone.setup`); substitute a dummy
-            # id where it was chosen. In-bounds even on the final step
-            # (step_idx == max_steps - 1, so step_idx + 1 == max_steps, the
-            # last valid scratchpad index); the write is simply never read
-            # back since the scratchpad is discarded once the scan ends.
+            # id where it was chosen - those entries are never read back,
+            # since once an example has halted, its `current_token` keeps
+            # being computed (every example runs the same fixed number of
+            # scan iterations) but is discarded.
             thought_id = jnp.where(token_id == act_token_id, 0, token_id)
             token_emb = backbone.token_embed(thought_id)
-            next_entry = (
+            current_token = (
                 backbone.fuse_latent_feedback(state, token_emb)
                 if self.use_latent_feedback
                 else token_emb
             )
-            scratchpad = scratchpad.at[..., step_idx + 1, :].set(next_entry)
 
             new_carry = (
-                scratchpad,
+                current_token,
+                cached_keys,
+                cached_values,
                 still_running,
                 num_steps_taken,
                 emitted_tokens,
@@ -460,7 +494,9 @@ class TransformerExplicitCoTTorso(nn.Module):
         # -initialized copy scoped under the scan - see `_ExplicitCoTBackbone`.
         scan_step = nn.scan(step_fn, variable_broadcast="params", split_rngs={"params": False})
         initial_carry = (
-            scratchpad,
+            initial_token,  # current_token
+            cached_keys,
+            cached_values,
             still_running,
             num_steps_taken,
             emitted_tokens,
@@ -469,6 +505,8 @@ class TransformerExplicitCoTTorso(nn.Module):
             step_rng,
         )
         (
+            _,
+            _,
             _,
             _,
             num_steps_taken,

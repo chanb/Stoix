@@ -25,21 +25,20 @@ Concretely, per CoT step `t` (0-indexed):
      the scratchpad and continue.
 
 The causal mask means each position's representation is a function only of
-its own past, at every layer - so, although the scratchpad is recomputed
-from scratch each step (no KV-cache), re-deriving it never changes a
-position's earlier output. Because the whole (causal) scratchpad is visible
-via self-attention, a step's thought can depend on every earlier thought, not
-just the immediately preceding one - the natural inductive bias for a chain
-of thought, as opposed to the Markovian single-hidden-state recurrence of the
-MLP ACT torso.
+its own past, at every layer. Because the whole (causal) scratchpad is
+visible via self-attention, a step's thought can depend on every earlier
+thought, not just the immediately preceding one - the natural inductive bias
+for a chain of thought, as opposed to the Markovian single-hidden-state
+recurrence of the MLP ACT torso.
 
-Since `max_steps` must be static for JAX, the scratchpad is a pre-allocated
-buffer and the CoT loop runs as an `nn.scan` (a weight-tied `jax.lax.scan`
-over the shared transformer blocks/halting head), not a Python loop - see
-`_CoTStep` for why that means every step re-attends over the *full*
-scratchpad under a fixed causal mask rather than a growing slice (no
-KV-caching either way), so this is O(max_steps^2) rather than O(max_steps) -
-fine for the small `max_steps` this is meant to be used with.
+Since `max_steps` must be static for JAX, the CoT loop runs as an `nn.scan`
+(a weight-tied `jax.lax.scan` over the shared transformer blocks/halting
+head), not a Python loop. Each layer maintains a KV-cache across steps (see
+`TransformerBlock.step`), so a step only ever runs the *single new token*
+through the stack - attention reads the growing cache instead of
+recomputing it, and the MLP only ever touches one token per step - giving
+O(max_steps) total compute rather than O(max_steps^2) for a design that
+recomputed the whole scratchpad from scratch every step.
 """
 
 from typing import Optional, Tuple
@@ -54,16 +53,34 @@ from flax.linen.initializers import Initializer, normal, orthogonal
 from stoix.networks.utils import parse_activation_fn
 
 _PROB_EPS = 1e-6
+_NEG_INF = jnp.finfo(jnp.float32).min
 
 
 class TransformerBlock(nn.Module):
     """A single pre-norm transformer block: self-attention + MLP.
 
-    Operates on `(*batch, seq_len, hidden_dim)`. `mask` should be a causal
-    mask (e.g. from `nn.make_causal_mask`) so that each position's output is
-    a function only of its own past - required for the CoT torsos' per-step
-    recompute-from-scratch loop to be a true (KV-cache-free) reimplementation
-    of causal decoding rather than a bidirectional re-encode of the prefix.
+    Exposes two forward modes, built on the *same* projection weights
+    (`setup()`, not `@nn.compact`, specifically so both are available
+    regardless of which is called first - see below):
+
+      - `__call__(tokens, mask)`: full-sequence self-attention over
+        `(*batch, seq_len, hidden_dim)` in one call. `mask` should be a
+        causal mask (e.g. from `nn.make_causal_mask`) so each position's
+        output is a function only of its own past.
+      - `step(token, cached_keys, cached_values, step_idx, max_steps)`:
+        incremental decoding - processes a *single* new token
+        (`(*batch, hidden_dim)`), reading/extending a per-layer KV-cache
+        (`(*batch, max_steps + 1, num_heads, head_dim)`) instead of
+        reprocessing a whole sequence - O(1) work per call instead of
+        O(seq_len).
+
+    Sharing weights between the two matters beyond just avoiding waste:
+    `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`
+    uses `__call__` for one code path (its parallel one-shot replay pass) and
+    `step` for another (rollout/latent-feedback-replay), for the *same*
+    logical model - if those weights could drift apart, replay would be
+    scoring a rollout against a different policy than the one that actually
+    produced it, corrupting the policy gradient.
     """
 
     hidden_dim: int
@@ -72,23 +89,80 @@ class TransformerBlock(nn.Module):
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
 
-    @nn.compact
-    def __call__(self, tokens: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
-        y = nn.LayerNorm()(tokens)
-        y = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            qkv_features=self.hidden_dim,
-            out_features=self.hidden_dim,
-            kernel_init=self.kernel_init,
-        )(y, y, mask=mask)
-        tokens = tokens + y
+    def setup(self) -> None:
+        assert self.hidden_dim % self.num_heads == 0, (
+            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        )
+        head_dim = self.hidden_dim // self.num_heads
+        dense = lambda name: nn.DenseGeneral(  # noqa: E731
+            axis=-1, features=(self.num_heads, head_dim), kernel_init=self.kernel_init, name=name
+        )
+        self.query_proj = dense("query")
+        self.key_proj = dense("key")
+        self.value_proj = dense("value")
+        self.out_proj = nn.DenseGeneral(
+            features=self.hidden_dim, axis=(-2, -1), kernel_init=self.kernel_init, name="out"
+        )
+        self.attn_norm = nn.LayerNorm()
+        self.mlp_norm = nn.LayerNorm()
+        self.mlp_dense_0 = nn.Dense(self.mlp_dim, kernel_init=self.kernel_init)
+        self.mlp_dense_1 = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)
 
-        y = nn.LayerNorm()(tokens)
-        y = nn.Dense(self.mlp_dim, kernel_init=self.kernel_init)(y)
+    def _mlp(self, tokens: chex.Array) -> chex.Array:
+        y = self.mlp_norm(tokens)
+        y = self.mlp_dense_0(y)
         y = parse_activation_fn(self.activation)(y)
-        y = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(y)
-        tokens = tokens + y
-        return tokens
+        y = self.mlp_dense_1(y)
+        return tokens + y
+
+    def __call__(self, tokens: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
+        y = self.attn_norm(tokens)
+        q, k, v = self.query_proj(y), self.key_proj(y), self.value_proj(y)
+        head_dim = q.shape[-1]
+        scale = 1.0 / jnp.sqrt(jnp.array(head_dim, dtype=q.dtype))
+        scores = jnp.einsum("...qhd,...khd->...hqk", q, k) * scale
+        if mask is not None:
+            scores = jnp.where(mask, scores, _NEG_INF)
+        weights = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum("...hqk,...khd->...qhd", weights, v)
+        tokens = tokens + self.out_proj(attn_out)
+        return self._mlp(tokens)
+
+    def step(
+        self,
+        token: chex.Array,
+        cached_keys: chex.Array,
+        cached_values: chex.Array,
+        step_idx: chex.Array,
+        max_steps: int,
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+        """
+        token: `(*batch, hidden_dim)` - this layer's input at this step.
+        cached_keys, cached_values: `(*batch, max_steps + 1, num_heads,
+            head_dim)` - this layer's cache (positions > step_idx are
+            not-yet-written).
+        step_idx: traced scalar - the position to write/attend through.
+
+        Returns `(new_token, updated_keys, updated_values)`.
+        """
+        y = self.attn_norm(token)
+        q, k, v = self.query_proj(y), self.key_proj(y), self.value_proj(y)
+
+        cached_keys = cached_keys.at[..., step_idx, :, :].set(k)
+        cached_values = cached_values.at[..., step_idx, :, :].set(v)
+
+        # True for cache positions written by step `step_idx` or earlier;
+        # `key`/`value` for later positions are still zero (not yet written).
+        key_mask = jnp.arange(max_steps + 1) <= step_idx
+        head_dim = q.shape[-1]
+        scale = 1.0 / jnp.sqrt(jnp.array(head_dim, dtype=q.dtype))
+        scores = jnp.einsum("...hd,...khd->...hk", q, cached_keys) * scale
+        scores = jnp.where(key_mask, scores, _NEG_INF)
+        weights = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum("...hk,...khd->...hd", weights, cached_values)
+
+        token = token + self.out_proj(attn_out)
+        return self._mlp(token), cached_keys, cached_values
 
 
 class _CoTStep(nn.Module):
@@ -97,19 +171,16 @@ class _CoTStep(nn.Module):
     Holds the transformer blocks, halting head and positional embedding as
     submodules/params created on first trace; `nn.scan(..., variable_broadcast
     ="params")` then shares those same params across every step instead of
-    creating a fresh set per step, exactly reproducing the weight-tying of the
-    Python-unrolled version this replaces.
+    creating a fresh set per step, exactly reproducing the weight-tying of an
+    unrolled Python loop, without the O(max_steps) compile-time cost of
+    actually unrolling one.
 
-    Since scan traces this body once for *all* steps, it can't slice the
-    scratchpad down to the valid prefix the way the unrolled loop did (the
-    slice length would have to be a Python int, not a traced step index).
-    Instead it always runs the transformer over the full `(max_steps + 1)`-
-    token scratchpad under a fixed causal mask - because every layer's
-    attention is causally masked, position `step_idx`'s representation is, at
-    every layer, purely a function of positions `<= step_idx` (see
-    `TransformerBlock`), so it's unaffected by whatever garbage sits in the
-    not-yet-written positions after it; only the state at `step_idx` is ever
-    read out.
+    Since scan traces this body once for *all* steps, it needs a fixed-shape
+    carry - unlike a Python loop, it can't grow the KV-cache array itself.
+    Instead each layer's cache is pre-allocated at its final `max_steps + 1`
+    size, `TransformerBlock.step` writes into position `step_idx` each call,
+    and a `step_idx`-dependent mask keeps not-yet-written positions from
+    being attended to (see `TransformerBlock.step`).
     """
 
     hidden_dim: int
@@ -129,7 +200,9 @@ class _CoTStep(nn.Module):
         self, carry: Tuple[chex.Array, ...], step_idx: chex.Array
     ) -> Tuple[Tuple[chex.Array, ...], None]:
         (
-            scratchpad,
+            current_token,
+            cached_keys,
+            cached_values,
             still_running,
             num_steps_taken,
             halting_log_prob,
@@ -154,13 +227,18 @@ class _CoTStep(nn.Module):
         ]
         halting_head = nn.Dense(1, kernel_init=self.kernel_init)
 
-        batch_shape = scratchpad.shape[:-2]
-        causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (self.max_steps + 1,)))
-
-        tokens = scratchpad + pos_embedding
-        for block in blocks:
-            tokens = block(tokens, mask=causal_mask)
-        state = tokens[..., step_idx, :]
+        x = current_token + pos_embedding[step_idx]
+        new_cached_keys = []
+        new_cached_values = []
+        for layer_idx, block in enumerate(blocks):
+            x, k, v = block.step(
+                x, cached_keys[layer_idx], cached_values[layer_idx], step_idx, self.max_steps
+            )
+            new_cached_keys.append(k)
+            new_cached_values.append(v)
+        state = x
+        cached_keys = new_cached_keys
+        cached_values = new_cached_values
 
         halting_prob = nn.sigmoid(halting_head(nn.LayerNorm()(state)))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
@@ -223,15 +301,12 @@ class _CoTStep(nn.Module):
         final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
         still_running = still_running & (~halts_this_step)
-
-        # In-bounds even on the final step (step_idx == max_steps - 1, so
-        # step_idx + 1 == max_steps, the last valid scratchpad index); the
-        # write is simply never read back since the scratchpad is discarded
-        # once the scan loop ends.
-        scratchpad = scratchpad.at[..., step_idx + 1, :].set(state)
+        current_token = state
 
         new_carry = (
-            scratchpad,
+            current_token,
+            cached_keys,
+            cached_values,
             still_running,
             num_steps_taken,
             halting_log_prob,
@@ -336,6 +411,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
                 f"min_steps must be between 1 and max_steps ({self.max_steps}), "
                 f"got min_steps={self.min_steps}."
             )
+        assert self.hidden_dim % self.num_heads == 0, (
+            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        )
 
         # The first scratchpad token is the observation projected into the
         # model width.
@@ -343,11 +421,14 @@ class TransformerChainOfThoughtTorso(nn.Module):
         if self.use_input_layer_norm:
             initial_token = nn.LayerNorm()(initial_token)
 
-        # Pre-allocate the CoT scratchpad; unwritten positions are never read
-        # by attention since `_CoTStep`'s causal mask cuts off any
-        # dependency on them (see `_CoTStep` docstring).
-        scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
-        scratchpad = scratchpad.at[..., 0, :].set(initial_token)
+        # Pre-allocate each layer's KV-cache; positions written by
+        # `_CoTStep`/`TransformerBlock.step` are set incrementally, and
+        # not-yet-written positions are masked out of attention (see
+        # `TransformerBlock.step`), never read.
+        head_dim = self.hidden_dim // self.num_heads
+        cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
+        cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
+        cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
 
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
@@ -378,7 +459,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
         )
 
         initial_carry = (
-            scratchpad,
+            initial_token,  # current_token
+            cached_keys,
+            cached_values,
             still_running,
             num_steps_taken,
             halting_log_prob,
@@ -390,6 +473,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
             target_compute_time,
         )
         (
+            _,
+            _,
             _,
             _,
             num_steps_taken,
