@@ -97,6 +97,101 @@ from stoix.networks.utils import parse_activation_fn
 _NEG_INF = jnp.finfo(jnp.float32).min
 
 
+class _ExplicitCoTBackbone(nn.Module):
+    """The transformer blocks, token (un)embedding, positional embedding and
+    (when `use_latent_feedback=True`) latent-feedback fusion - instantiated
+    *once* in `TransformerExplicitCoTTorso.__call__` and reused, via its
+    methods, by every code path that needs them: the parallel one-shot replay
+    pass, and the scanned per-step body (`nn.scan`'s functional form, see
+    `TransformerExplicitCoTTorso.__call__`) used by rollout mode and (when
+    `use_latent_feedback=True`) replay mode.
+
+    Sharing one instance - rather than, say, building a fresh
+    `TransformerBlock` list separately for each code path - is what makes
+    those paths use the exact same weights instead of silently diverging into
+    independently-initialized copies: a `setup()`-style module's submodules
+    are created once (on first use) and namespaced under this module's own
+    scope regardless of which method is called first, so a single `.init()`
+    call (which only ever exercises *one* code path, whichever `replaying`/
+    `use_latent_feedback` combination it's called with) still creates the
+    complete parameter set every other path also needs - the layers here are
+    only ever a function of `hidden_dim`/`num_heads`/`mlp_dim`/`vocab_size`,
+    never of the sequence length a given path happens to call `run` with.
+    """
+
+    hidden_dim: int
+    vocab_size: int
+    num_heads: int
+    num_layers: int
+    mlp_dim: int
+    max_steps: int
+    activation: str
+    kernel_init: Initializer
+    use_latent_feedback: bool
+
+    def setup(self) -> None:
+        self.pos_embedding = self.param(
+            "pos_embedding", normal(stddev=0.02), (self.max_steps + 1, self.hidden_dim)
+        )
+        # `token_embed` doubles as the unembedding ("token_head") via
+        # `.attend()` (query @ embedding.T) - standard input/output
+        # weight-tying. Its table has one row beyond `vocab_size` for
+        # `act_token_id`: that row is only ever read through `.attend()` (to
+        # produce the "act now" logit), never through `token_embed(...)` (the
+        # embedding lookup fed back into the scratchpad), since choosing
+        # `act_token_id` halts before another embedding is needed - see the
+        # `act_token_id -> 0` substitutions at the `token_embed(...)` call
+        # sites in `TransformerExplicitCoTTorso.__call__`.
+        self.token_embed = nn.Embed(
+            num_embeddings=self.vocab_size + 1, features=self.hidden_dim
+        )
+        self.blocks = [
+            TransformerBlock(
+                self.hidden_dim, self.num_heads, self.mlp_dim, self.activation, self.kernel_init
+            )
+            for _ in range(self.num_layers)
+        ]
+        if self.use_latent_feedback:
+            # Paper Eq. 4: e_t (X) h_{t-1} = W^U h_{t-1} * sigmoid(W^G e_t).
+            # No bias terms, matching the paper.
+            self.latent_feedback_value = nn.Dense(
+                self.hidden_dim, use_bias=False, kernel_init=self.kernel_init
+            )
+            self.latent_feedback_gate = nn.Dense(
+                self.hidden_dim, use_bias=False, kernel_init=self.kernel_init
+            )
+
+    def token_head(self, state: chex.Array) -> chex.Array:
+        return self.token_embed.attend(state)
+
+    def run(self, scratchpad: chex.Array) -> chex.Array:
+        """Runs the transformer over `scratchpad` (`(*batch, seq_len,
+        hidden_dim)`, any `seq_len <= max_steps + 1`) under a causal mask and
+        returns the per-position states - the shared core of the parallel
+        replay pass (`seq_len == max_steps`) and the scanned per-step body
+        (`seq_len == max_steps + 1`, called once per step - see
+        `TransformerExplicitCoTTorso.__call__` for why a fixed full-width,
+        causally-masked pass is equivalent to recomputing just the valid
+        growing prefix)."""
+        seq_len = scratchpad.shape[-2]
+        batch_shape = scratchpad.shape[:-2]
+        tokens_in = scratchpad + self.pos_embedding[:seq_len]
+        causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
+        for block in self.blocks:
+            tokens_in = block(tokens_in, mask=causal_mask)
+        return tokens_in
+
+    def fuse_latent_feedback(self, state: chex.Array, token_emb: chex.Array) -> chex.Array:
+        # `state` plays the role of h_{t-1} and `token_emb` the role of e_t,
+        # evaluated one step "in the future" relative to the paper's
+        # indexing (we fuse the state and token produced *at* step to build
+        # the scratchpad entry consumed *after* step, whereas the paper
+        # names the state as already "previous" - same relationship).
+        return self.latent_feedback_value(state) * jax.nn.sigmoid(
+            self.latent_feedback_gate(token_emb)
+        )
+
+
 class TransformerExplicitCoTTorso(nn.Module):
     """Explicit Chain-of-Thought transformer torso with adaptively-sampled
     halting and discrete, sampled thought tokens. See module docstring.
@@ -171,52 +266,23 @@ class TransformerExplicitCoTTorso(nn.Module):
 
         initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
-            observation = nn.LayerNorm()(observation)
+            initial_token = nn.LayerNorm()(initial_token)
 
-        pos_embedding = self.param(
-            "pos_embedding", normal(stddev=0.02), (self.max_steps + 1, self.hidden_dim)
+        # See `_ExplicitCoTBackbone` for why a single shared instance (rather
+        # than separately-constructed submodules per code path below) is
+        # what keeps the parallel replay pass and the scanned rollout/
+        # latent-feedback-replay path tied to the same weights.
+        backbone = _ExplicitCoTBackbone(
+            self.hidden_dim,
+            self.vocab_size,
+            self.num_heads,
+            self.num_layers,
+            self.mlp_dim,
+            self.max_steps,
+            self.activation,
+            self.kernel_init,
+            self.use_latent_feedback,
         )
-        # `token_embed` doubles as the unembedding ("token_head") via
-        # `.attend()` (query @ embedding.T) - standard input/output
-        # weight-tying. Its table has one row beyond `vocab_size` for
-        # `act_token_id`: that row is only ever read through `.attend()` (to
-        # produce the "act now" logit), never through `token_embed(...)` (the
-        # embedding lookup fed back into the scratchpad), since choosing
-        # `act_token_id` halts before another embedding is needed - see the
-        # `act_token_id -> 0` substitutions below/in the rollout loop.
-        token_embed = nn.Embed(num_embeddings=num_classes, features=self.hidden_dim)
-        token_head = token_embed.attend
-
-        if self.use_latent_feedback:
-            # Paper Eq. 4: e_t (X) h_{t-1} = W^U h_{t-1} * sigmoid(W^G e_t).
-            # No bias terms, matching the paper; `state` plays the role of
-            # h_{t-1} and `token_emb` the role of e_t, evaluated one step
-            # "in the future" relative to the paper's indexing (we fuse the
-            # state and token produced *at* step to build the scratchpad
-            # entry consumed *after* step, whereas the paper names the state
-            # as already "previous" - same relationship, see call sites).
-            latent_feedback_value = nn.Dense(
-                self.hidden_dim,
-                use_bias=False,
-                kernel_init=self.kernel_init,
-                name="latent_feedback_value",
-            )
-            latent_feedback_gate = nn.Dense(
-                self.hidden_dim,
-                use_bias=False,
-                kernel_init=self.kernel_init,
-                name="latent_feedback_gate",
-            )
-
-            def fuse_latent_feedback(state: chex.Array, token_emb: chex.Array) -> chex.Array:
-                return latent_feedback_value(state) * jax.nn.sigmoid(latent_feedback_gate(token_emb))
-
-        blocks = [
-            TransformerBlock(
-                self.hidden_dim, self.num_heads, self.mlp_dim, self.activation, self.kernel_init
-            )
-            for _ in range(self.num_layers)
-        ]
 
         # Per-step "act now" legality, precomputed once as a constant boolean
         # mask over the step axis (shape `(max_steps, num_classes)`) instead
@@ -242,93 +308,40 @@ class TransformerExplicitCoTTorso(nn.Module):
         legal_mask[~can_halt, act_token_id] = False
         legal_mask = jnp.asarray(legal_mask)
 
-        def run_step(scratchpad: chex.Array, step: int) -> Tuple[chex.Array, chex.Array]:
-            """Runs the transformer over `scratchpad[..., :step + 1, :]` and
-            returns `(state, token_logits)` for that step - the shared core
-            of both the rollout loop and (when `use_latent_feedback=True`)
-            the sequential replay loop below, since both need to recompute
-            the growing causal-masked prefix from scratch at every step
-            (no KV cache)."""
-            seq_len = step + 1
-            tokens_in = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
-            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
-            for block in blocks:
-                tokens_in = block(tokens_in, mask=causal_mask)
-            state = tokens_in[..., -1, :]
-            token_logits = jnp.where(legal_mask[step], token_head(state), _NEG_INF)
-            return state, token_logits
-
-        if replaying and self.use_latent_feedback:
-            # Latent feedback makes each scratchpad entry depend on the
-            # *computed* hidden state of the previous step (see module
-            # docstring), so - unlike the parallel path below - the whole
-            # scratchpad can no longer be built up front from `target_tokens`
-            # alone. Replay a known token trajectory one step at a time
-            # instead, mirroring the rollout loop but reading `target_tokens`
-            # instead of sampling.
-            scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
-            scratchpad = scratchpad.at[..., 0, :].set(initial_token)
-
-            still_running = jnp.ones(batch_shape, dtype=bool)
-            final_state = initial_token
-            log_prob = jnp.zeros(batch_shape)
-
-            for step in range(self.max_steps):
-                state, token_logits = run_step(scratchpad, step)
-                log_token_probs = jax.nn.log_softmax(token_logits, axis=-1)
-                token_id = target_tokens[..., step]
-                token_log_prob = jnp.take_along_axis(
-                    log_token_probs, token_id[..., None], axis=-1
-                ).squeeze(axis=-1)
-                log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
-
-                halts_this_step = still_running & (token_id == act_token_id)
-                final_state = jnp.where(halts_this_step[..., None], state, final_state)
-                still_running = still_running & (~halts_this_step)
-
-                if step_counts[step] != self.max_steps:
-                    thought_id = jnp.where(token_id == act_token_id, 0, token_id)
-                    token_emb = token_embed(thought_id)
-                    fused = fuse_latent_feedback(state, token_emb)
-                    scratchpad = scratchpad.at[..., step + 1, :].set(fused)
-
-            return final_state, log_prob
-
-        if replaying:
+        if replaying and not self.use_latent_feedback:
             # Attention is causally masked (see `TransformerBlock`), so every
             # scratchpad entry is determined by the known `target_tokens`
             # alone - the whole trajectory can be built and scored in one
-            # pass instead of an unrolled loop. Scratchpad position `step` is
-            # the embedding of `target_tokens[..., step - 1]` (position 0 is
-            # the observation); `act_token_id` has no embedding, so substitute
-            # a dummy id where it was emitted - those entries are never read
-            # since nothing attends past its own (causally masked) position.
+            # pass instead of a step-by-step loop. Scratchpad position `step`
+            # is the embedding of `target_tokens[..., step - 1]` (position 0
+            # is the observation); `act_token_id` has no embedding, so
+            # substitute a dummy id where it was emitted - those entries are
+            # never read since nothing attends past its own (causally masked)
+            # position. Only valid without latent feedback: with it, each
+            # scratchpad entry depends on the *computed* hidden state of the
+            # previous step (see module docstring), so it can no longer be
+            # built up front from `target_tokens` alone - see the scanned
+            # path below, shared with rollout mode.
             if self.max_steps > 1:
-                # Guarded the same way as the rollout loop below (which only
-                # calls `token_embed` on non-final steps): with `max_steps ==
-                # 1` the single step is also the final, forced-halt step, so
-                # `token_embed` is never called there either - calling it
-                # unconditionally here would create an "embedding" param at
-                # apply-time that rollout-driven `init` never created.
+                # With `max_steps == 1` the single step is also the final,
+                # forced-halt step, so no previous token is ever fed back -
+                # `token_embed` is simply not called in that case (its params
+                # still exist either way, created unconditionally by
+                # `backbone`'s `setup()`).
                 thought_id = jnp.where(target_tokens == act_token_id, 0, target_tokens)
-                token_embeds = token_embed(thought_id)
+                token_embeds = backbone.token_embed(thought_id)
                 scratchpad = jnp.concatenate(
                     [initial_token[..., None, :], token_embeds[..., :-1, :]], axis=-2
                 )
             else:
                 scratchpad = initial_token[..., None, :]
-            tokens_in = scratchpad + pos_embedding[: self.max_steps]
+            states = backbone.run(scratchpad)  # (*batch, max_steps, hidden_dim)
 
-            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (self.max_steps,)))
-            for block in blocks:
-                tokens_in = block(tokens_in, mask=causal_mask)
-            states = tokens_in  # (*batch, max_steps, hidden_dim); one state per step.
-
-            # Same masked-logits expression as the rollout loop below, so
+            # Same masked-logits expression as the scanned path below, so
             # replay scores the exact distribution rollout would have sampled
             # from at each state - required for the log-probs used in the
             # policy gradient to match the trajectory that was actually taken.
-            token_logits = jnp.where(legal_mask, token_head(states), _NEG_INF)
+            token_logits = jnp.where(legal_mask, backbone.token_head(states), _NEG_INF)
             log_token_probs = jax.nn.log_softmax(token_logits, axis=-1)
             token_log_prob = jnp.take_along_axis(
                 log_token_probs, target_tokens[..., None], axis=-1
@@ -352,44 +365,119 @@ class TransformerExplicitCoTTorso(nn.Module):
 
             return final_state, log_prob
 
+        # Sequential scratchpad build, shared by rollout mode and (when
+        # `use_latent_feedback=True`) replay mode: with latent feedback, each
+        # scratchpad entry depends on the *computed* hidden state of the
+        # previous step (see module docstring), so - unlike the parallel path
+        # above - it can't be built up front even when the token trajectory
+        # (`target_tokens`) is already known. The two modes differ only in
+        # where `token_id` comes from (sampled/argmax vs. read off
+        # `target_tokens`) and what they accumulate (compute_time/emitted
+        # tokens vs. log_prob) - everything else, including the scratchpad
+        # fusion, is identical.
+        # Pre-allocate the CoT scratchpad; unwritten positions are never read
+        # by attention since `backbone.run`'s causal mask cuts off any
+        # dependency on them (see `_ExplicitCoTBackbone.run`).
         scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
         scratchpad = scratchpad.at[..., 0, :].set(initial_token)
 
         still_running = jnp.ones(batch_shape, dtype=bool)
-        num_steps_taken = jnp.zeros(batch_shape)
         final_state = initial_token
+        num_steps_taken = jnp.zeros(batch_shape)
         emitted_tokens = jnp.zeros(batch_shape + (self.max_steps,), dtype=jnp.int32)
+        log_prob = jnp.zeros(batch_shape)
+        # Unused (never read) unless sampling, but must still be a concrete
+        # array: it's carried through every scan step regardless of mode.
+        step_rng = rng if rng is not None else jax.random.PRNGKey(0)
 
-        for step in range(self.max_steps):
-            state, token_logits = run_step(scratchpad, step)
+        def step_fn(
+            backbone: _ExplicitCoTBackbone, carry: Tuple[chex.Array, ...], step_idx: chex.Array
+        ) -> Tuple[Tuple[chex.Array, ...], None]:
+            (
+                scratchpad,
+                still_running,
+                num_steps_taken,
+                emitted_tokens,
+                log_prob,
+                final_state,
+                rng,
+            ) = carry
 
-            if deterministic:
+            states = backbone.run(scratchpad)  # (*batch, max_steps + 1, hidden_dim)
+            state = states[..., step_idx, :]
+            token_logits = jnp.where(legal_mask[step_idx], backbone.token_head(state), _NEG_INF)
+
+            if replaying:
+                token_id = target_tokens[..., step_idx]
+                log_token_probs = jax.nn.log_softmax(token_logits, axis=-1)
+                token_log_prob = jnp.take_along_axis(
+                    log_token_probs, token_id[..., None], axis=-1
+                ).squeeze(axis=-1)
+                log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
+            elif deterministic:
                 token_id = jnp.argmax(token_logits, axis=-1)
             else:
                 rng, token_rng = jax.random.split(rng)
                 token_id = jax.random.categorical(token_rng, token_logits)
 
             halts_this_step = still_running & (token_id == act_token_id)
-
-            num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
-            emitted_tokens = emitted_tokens.at[..., step].set(token_id)
-
+            if not replaying:
+                num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
+                emitted_tokens = emitted_tokens.at[..., step_idx].set(token_id)
             still_running = still_running & (~halts_this_step)
 
-            if step_counts[step] != self.max_steps:
-                # `act_token_id` is out of range for `token_embed` (which only
-                # knows the `vocab_size` thought tokens); substitute a dummy
-                # id where it was chosen - those entries are never read back,
-                # since scratchpad positions for already-halted examples are
-                # only ever fed to blocks whose output gets discarded above.
-                thought_id = jnp.where(token_id == act_token_id, 0, token_id)
-                token_emb = token_embed(thought_id)
-                next_entry = (
-                    fuse_latent_feedback(state, token_emb)
-                    if self.use_latent_feedback
-                    else token_emb
-                )
-                scratchpad = scratchpad.at[..., step + 1, :].set(next_entry)
+            # `act_token_id`'s embedding row is never read back through this
+            # lookup (see `_ExplicitCoTBackbone.setup`); substitute a dummy
+            # id where it was chosen. In-bounds even on the final step
+            # (step_idx == max_steps - 1, so step_idx + 1 == max_steps, the
+            # last valid scratchpad index); the write is simply never read
+            # back since the scratchpad is discarded once the scan ends.
+            thought_id = jnp.where(token_id == act_token_id, 0, token_id)
+            token_emb = backbone.token_embed(thought_id)
+            next_entry = (
+                backbone.fuse_latent_feedback(state, token_emb)
+                if self.use_latent_feedback
+                else token_emb
+            )
+            scratchpad = scratchpad.at[..., step_idx + 1, :].set(next_entry)
 
+            new_carry = (
+                scratchpad,
+                still_running,
+                num_steps_taken,
+                emitted_tokens,
+                log_prob,
+                final_state,
+                rng,
+            )
+            return new_carry, None
+
+        # Functional form of `nn.scan` (rather than wrapping a fresh
+        # `nn.Module` class): `backbone` is instantiated once, above, and
+        # passed through explicitly so its params stay shared with the
+        # parallel replay path rather than becoming a second, independently
+        # -initialized copy scoped under the scan - see `_ExplicitCoTBackbone`.
+        scan_step = nn.scan(step_fn, variable_broadcast="params", split_rngs={"params": False})
+        initial_carry = (
+            scratchpad,
+            still_running,
+            num_steps_taken,
+            emitted_tokens,
+            log_prob,
+            final_state,
+            step_rng,
+        )
+        (
+            _,
+            _,
+            num_steps_taken,
+            emitted_tokens,
+            log_prob,
+            final_state,
+            _,
+        ), _ = scan_step(backbone, initial_carry, jnp.arange(self.max_steps))
+
+        if replaying:
+            return final_state, log_prob
         return final_state, num_steps_taken, emitted_tokens

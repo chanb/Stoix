@@ -32,7 +32,7 @@ system/architecture/PPO-knob/env-difficulty-knob descriptions):
   - env, <env>-specific difficulty knobs, system, architecture, hidden_dim,
     lr, critic_lr, delightful, delightful_eta, epochs, num_minibatches,
     clip_eps, clip_value_loss, use_layer_norm, use_input_layer_norm,
-    num_layers, num_heads, mlp_dim, vocab_size, seed: identical semantics to
+    num_layers, num_heads, mlp_dim, vocab_size, use_latent_feedback, seed: identical semantics to
     jumanji_fixed_budget_sweep.py, including its five ff_ppo_explicit_*
     systems and its transformer_explicit_cot/cnn+transformer_explicit_cot
     architectures (see EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS).
@@ -445,6 +445,7 @@ class Job:
     num_heads: int
     mlp_dim: int
     vocab_size: int
+    use_latent_feedback: bool
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -499,6 +500,8 @@ class Job:
             extra.append("ln")
         if self.use_input_layer_norm:
             extra.append("iln")
+        if self.use_latent_feedback:
+            extra.append("lf")
         if extra:
             parts.append("-".join(extra))
 
@@ -568,6 +571,11 @@ class Job:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
             cmd.append(f"++network.actor_network.pre_torso.vocab_size={self.vocab_size}")
+            # Latent feedback decoding (Full-Bandwidth Transformer, arXiv:2608.08888) -
+            # TransformerExplicitCoTTorso only, see stoix/networks/torso_compute_explicit_cot.py.
+            cmd.append(
+                f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
+            )
         if self.wandb:
             cmd.append("logger.loggers.wandb.enabled=True")
             cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
@@ -656,6 +664,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    explicit-CoT arches (see EXPLICIT_COT_ARCHES) - swept only for them,
     #    everything else (including plain transformer) forced to a single
     #    value.
+    #  - use_latent_feedback (latent feedback decoding) likewise only exists on
+    #    the explicit-CoT arches - swept only for them, everything else forced
+    #    to a single value.
     system_arch_ln_combos = []
     n_skipped_incompatible = 0
     for system in args.systems:
@@ -670,6 +681,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
             vocab_size_options = (
                 args.vocab_size if arch in EXPLICIT_COT_ARCHES else [args.vocab_size[0]]
+            )
+            use_latent_feedback_options = (
+                args.use_latent_feedback
+                if arch in EXPLICIT_COT_ARCHES
+                else [args.use_latent_feedback[0]]
             )
             if arch in EXPLICIT_COT_ARCHES:
                 if system not in EXPLICIT_COT_SYSTEMS:
@@ -689,7 +705,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size in vocab_size_options:
+                            for vocab_size, use_latent_feedback in itertools.product(
+                                vocab_size_options, use_latent_feedback_options
+                            ):
                                 system_arch_ln_combos.append(
                                     (
                                         system,
@@ -700,6 +718,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         num_heads,
                                         mlp_dim,
                                         vocab_size,
+                                        use_latent_feedback,
                                     )
                                 )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -741,6 +760,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_heads,
                 mlp_dim,
                 vocab_size,
+                use_latent_feedback,
             ),
             (min_steps, max_steps),
             hidden_dim,
@@ -793,6 +813,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_heads=num_heads,
                     mlp_dim=mlp_dim,
                     vocab_size=vocab_size,
+                    use_latent_feedback=use_latent_feedback,
                     seed=seed,
                     total_timesteps=args.total_timesteps,
                     total_num_envs=args.total_num_envs,
@@ -962,6 +983,16 @@ def main() -> None:
         "arches (EXPLICIT_COT_ARCHES); ignored (forced to the first value) for every other "
         "architecture, including plain transformer. Default 32 (the network yaml default).",
     )
+    parser.add_argument(
+        "--use-latent-feedback",
+        default="false",
+        help="Comma-separated bools (true/false) - latent feedback decoding "
+        "(network.actor_network.pre_torso.use_latent_feedback), the Full-Bandwidth "
+        "Transformer's gated hidden-state feedback (arXiv:2608.08888) - see "
+        "stoix/networks/torso_compute_explicit_cot.py. Only applies to the explicit-CoT "
+        "arches (EXPLICIT_COT_ARCHES); ignored (forced to the first value) for every other "
+        "architecture. Default false.",
+    )
 
     parser.add_argument(
         "--sokoban-generator",
@@ -1049,6 +1080,9 @@ def main() -> None:
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
     args.vocab_size = [int(x) for x in args.vocab_size.split(",")]
+    args.use_latent_feedback = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_latent_feedback.split(",")
+    ]
     args.sokoban_generator = args.sokoban_generator.split(",")
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]

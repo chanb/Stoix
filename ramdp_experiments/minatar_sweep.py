@@ -120,6 +120,15 @@ Grid axes:
                  only (every other architecture, including cnn+transformer, has no such
                  param, so this is forced to a single value for them). Default 32 (the
                  network yaml default).
+  - use_latent_feedback: latent feedback decoding
+                 (network.actor_network.pre_torso.use_latent_feedback) - fuses the
+                 previous step's top-layer hidden state into the next scratchpad entry
+                 via a gated linear unit instead of feeding back only the sampled
+                 token's bare embedding (the Full-Bandwidth Transformer's "latent
+                 feedback decoding", arXiv:2608.08888) - see
+                 stoix/networks/torso_compute_explicit_cot.py. cnn+transformer_explicit_cot
+                 only (every other architecture, including cnn+transformer, has no such
+                 param, so this is forced to a single value for them). Default False.
   - seed:        5 seeds per config by default
 
 gamma defaults to 0.9999 (system.gamma), applied to every job (not swept),
@@ -390,6 +399,7 @@ class Job:
     num_heads: int
     mlp_dim: int
     vocab_size: int
+    use_latent_feedback: bool
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -452,6 +462,8 @@ class Job:
             extra.append("ln")
         if self.use_input_layer_norm:
             extra.append("iln")
+        if self.use_latent_feedback:
+            extra.append("lf")
         if extra:
             parts.append("-".join(extra))
 
@@ -522,6 +534,11 @@ class Job:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
             cmd.append(f"++network.actor_network.pre_torso.vocab_size={self.vocab_size}")
+            # Latent feedback decoding (Full-Bandwidth Transformer, arXiv:2608.08888) -
+            # TransformerExplicitCoTTorso only, see stoix/networks/torso_compute_explicit_cot.py.
+            cmd.append(
+                f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
+            )
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -637,6 +654,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    cnn+transformer_explicit_cot (see EXPLICIT_COT_ARCH) - swept only for
     #    that architecture, everything else (including cnn+transformer) forced
     #    to a single value.
+    #  - use_latent_feedback (latent feedback decoding) likewise only exists on
+    #    cnn+transformer_explicit_cot - swept only for that architecture, everything
+    #    else forced to a single value.
     # Unsupported axes are forced to a single default value rather than
     # needlessly duplicated per requested setting.
     system_arch_ln_combos = []
@@ -649,6 +669,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
             vocab_size_options = (
                 args.vocab_size if arch == EXPLICIT_COT_ARCH else [args.vocab_size[0]]
+            )
+            use_latent_feedback_options = (
+                args.use_latent_feedback
+                if arch == EXPLICIT_COT_ARCH
+                else [args.use_latent_feedback[0]]
             )
             if arch == EXPLICIT_COT_ARCH:
                 if system not in EXPLICIT_COT_SYSTEMS:
@@ -668,7 +693,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size in vocab_size_options:
+                            for vocab_size, use_latent_feedback in itertools.product(
+                                vocab_size_options, use_latent_feedback_options
+                            ):
                                 system_arch_ln_combos.append(
                                     (
                                         system,
@@ -679,6 +706,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         num_heads,
                                         mlp_dim,
                                         vocab_size,
+                                        use_latent_feedback,
                                     )
                                 )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -717,6 +745,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             num_heads,
             mlp_dim,
             vocab_size,
+            use_latent_feedback,
         ),
         (min_steps, max_steps),
         hidden_dim,
@@ -771,6 +800,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_heads=num_heads,
                 mlp_dim=mlp_dim,
                 vocab_size=vocab_size,
+                use_latent_feedback=use_latent_feedback,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 total_num_envs=args.total_num_envs,
@@ -1044,6 +1074,18 @@ def main() -> None:
         "every other architecture. Default 32 (the network yaml default).",
     )
     parser.add_argument(
+        "--use-latent-feedback",
+        default="false",
+        help="Comma-separated bools (true/false) - latent feedback decoding "
+        "(network.actor_network.pre_torso.use_latent_feedback): fuses the previous step's "
+        "top-layer hidden state into the next scratchpad entry via a gated linear unit, "
+        "instead of feeding back only the sampled token's bare embedding (the Full-Bandwidth "
+        "Transformer's 'latent feedback decoding', arXiv:2608.08888) - see "
+        "stoix/networks/torso_compute_explicit_cot.py. Only applies to architecture "
+        "cnn+transformer_explicit_cot; ignored (forced to the first value) for every other "
+        "architecture, since those torsos have no such param. Default false.",
+    )
+    parser.add_argument(
         "--gamma",
         type=float,
         default=0.9999,
@@ -1139,6 +1181,9 @@ def main() -> None:
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
     args.vocab_size = [int(x) for x in args.vocab_size.split(",")]
+    args.use_latent_feedback = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_latent_feedback.split(",")
+    ]
 
     for e in args.envs:
         assert e in MINATAR_GAMES, f"unknown env {e!r}, expected one of {list(MINATAR_GAMES)}"
@@ -1227,6 +1272,7 @@ def main() -> None:
         f"(cnn+transformer/cnn+transformer_explicit_cot only)"
     )
     print(f"  vocab_size={args.vocab_size} (cnn+transformer_explicit_cot only)")
+    print(f"  use_latent_feedback={args.use_latent_feedback} (cnn+transformer_explicit_cot only)")
     print(f"  gamma={args.gamma}")
     print(
         f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "

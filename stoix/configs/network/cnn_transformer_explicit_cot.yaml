@@ -28,6 +28,10 @@ actor_network:
     min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
       # fixed-budget, non-adaptive baseline.
     activation: gelu
+    use_latent_feedback: False # Full-Bandwidth Transformer's latent feedback decoding
+      # (arXiv:2608.08888) - fuses the previous step's top-layer hidden state into the
+      # next scratchpad entry via a gated linear unit instead of feeding back only the
+      # sampled token's bare embedding. See torso_compute_explicit_cot.py.
   action_head:
     _target_: stoix.networks.heads.CategoricalHead
 
