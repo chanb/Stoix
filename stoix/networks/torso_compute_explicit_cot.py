@@ -38,11 +38,12 @@ different at the next step:
     latent-CoT torso, where the scratchpad entry fed back in is the model's
     own hidden state and therefore only knowable by actually running the
     steps - every scratchpad entry here is just the embedding of an
-    already-known token. That means replay doesn't need the unrolled
-    step-by-step loop at all: the whole scratchpad can be built up front and
-    scored in one causal-masked pass, reading every step's logits off in
-    parallel instead of recomputing the growing prefix from scratch
-    `max_steps` times.
+    already-known token, so replay doesn't need the unrolled step-by-step
+    loop at all: the whole scratchpad can be built up front and scored in
+    one causal-masked pass, reading every step's logits off in parallel
+    instead of recomputing the growing prefix from scratch `max_steps`
+    times. (This stops being true under `use_latent_feedback=True` - see
+    below.)
   - Deterministic mode (`deterministic=True`): at every step, picks the
     highest-probability class - a thought token or "act now" - instead of
     sampling, for greedy evaluation.
@@ -51,6 +52,34 @@ The environment action head still reads off the final continuous hidden
 state (not a token embedding) - the discrete tokens are a communicative side
 channel the policy can use to "show its work", not a bottleneck on how much
 information reaches the action itself.
+
+`use_latent_feedback=True` additionally implements "latent feedback
+decoding" from the Full-Bandwidth Transformer (arXiv:2608.08888). In a
+standard transformer, the only thing carried from step t to step t+1's input
+is the sampled token's embedding - the top-layer hidden state that produced
+it (itself a function of every layer below) is discarded. Latent feedback
+decoding instead fuses that hidden state with the new token's embedding via
+a dimension-preserving gated linear unit, and feeds the fused vector back
+into the scratchpad in place of the bare embedding:
+
+    e_t (X) h_{t-1} = W^U h_{t-1} * sigmoid(W^G e_t)          (paper Eq. 4)
+
+The asymmetry is deliberate (see the paper's sec. 3.1): the hidden state
+`h_{t-1}` occupies the multiplicative *value* pathway and the new token
+embedding `e_t` only *gates* it, so the model cannot cheat by learning to
+ignore `h_{t-1}` and recover plain token-only feedback - discarding the
+value pathway discards the input itself. The very first scratchpad entry
+(the observation) is never gated, matching the paper's `C = e_0, e_1 (X)
+h_0^L, ...`: there is no previous hidden state for it to fuse with.
+
+This recurrence (step t+1's input depends on the *computed* hidden state at
+step t, not just on which token was sampled) is exactly why generation is
+already sequential in the paper's decoding setting, and it is why replay
+mode here can no longer score a known token trajectory in a single
+causal-masked pass when `use_latent_feedback=True`: the fused scratchpad
+entries have to be built up one step at a time, just like rollout, even
+though the tokens themselves are already known. See the `replaying` branch
+below.
 """
 
 from typing import Optional, Tuple, Union
@@ -77,6 +106,11 @@ class TransformerExplicitCoTTorso(nn.Module):
     `max_steps` regardless. Setting `min_steps == max_steps` therefore removes
     adaptivity entirely: every example always takes exactly `max_steps` -
     useful as a fixed-budget baseline against the adaptive policy.
+
+    `use_latent_feedback` switches the scratchpad feedback from the sampled
+    token's bare embedding to a gated fusion of that embedding with the
+    hidden state that produced it (the Full-Bandwidth Transformer's "latent
+    feedback decoding", arXiv:2608.08888) - see the module docstring.
     """
 
     hidden_dim: int
@@ -89,6 +123,7 @@ class TransformerExplicitCoTTorso(nn.Module):
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
+    use_latent_feedback: bool = False
 
     @nn.compact
     def __call__(
@@ -152,6 +187,30 @@ class TransformerExplicitCoTTorso(nn.Module):
         token_embed = nn.Embed(num_embeddings=num_classes, features=self.hidden_dim)
         token_head = token_embed.attend
 
+        if self.use_latent_feedback:
+            # Paper Eq. 4: e_t (X) h_{t-1} = W^U h_{t-1} * sigmoid(W^G e_t).
+            # No bias terms, matching the paper; `state` plays the role of
+            # h_{t-1} and `token_emb` the role of e_t, evaluated one step
+            # "in the future" relative to the paper's indexing (we fuse the
+            # state and token produced *at* step to build the scratchpad
+            # entry consumed *after* step, whereas the paper names the state
+            # as already "previous" - same relationship, see call sites).
+            latent_feedback_value = nn.Dense(
+                self.hidden_dim,
+                use_bias=False,
+                kernel_init=self.kernel_init,
+                name="latent_feedback_value",
+            )
+            latent_feedback_gate = nn.Dense(
+                self.hidden_dim,
+                use_bias=False,
+                kernel_init=self.kernel_init,
+                name="latent_feedback_gate",
+            )
+
+            def fuse_latent_feedback(state: chex.Array, token_emb: chex.Array) -> chex.Array:
+                return latent_feedback_value(state) * jax.nn.sigmoid(latent_feedback_gate(token_emb))
+
         blocks = [
             TransformerBlock(
                 self.hidden_dim, self.num_heads, self.mlp_dim, self.activation, self.kernel_init
@@ -182,6 +241,58 @@ class TransformerExplicitCoTTorso(nn.Module):
         # Before min_steps, "act now" isn't a legal choice yet.
         legal_mask[~can_halt, act_token_id] = False
         legal_mask = jnp.asarray(legal_mask)
+
+        def run_step(scratchpad: chex.Array, step: int) -> Tuple[chex.Array, chex.Array]:
+            """Runs the transformer over `scratchpad[..., :step + 1, :]` and
+            returns `(state, token_logits)` for that step - the shared core
+            of both the rollout loop and (when `use_latent_feedback=True`)
+            the sequential replay loop below, since both need to recompute
+            the growing causal-masked prefix from scratch at every step
+            (no KV cache)."""
+            seq_len = step + 1
+            tokens_in = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
+            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
+            for block in blocks:
+                tokens_in = block(tokens_in, mask=causal_mask)
+            state = tokens_in[..., -1, :]
+            token_logits = jnp.where(legal_mask[step], token_head(state), _NEG_INF)
+            return state, token_logits
+
+        if replaying and self.use_latent_feedback:
+            # Latent feedback makes each scratchpad entry depend on the
+            # *computed* hidden state of the previous step (see module
+            # docstring), so - unlike the parallel path below - the whole
+            # scratchpad can no longer be built up front from `target_tokens`
+            # alone. Replay a known token trajectory one step at a time
+            # instead, mirroring the rollout loop but reading `target_tokens`
+            # instead of sampling.
+            scratchpad = jnp.zeros(batch_shape + (self.max_steps + 1, self.hidden_dim))
+            scratchpad = scratchpad.at[..., 0, :].set(initial_token)
+
+            still_running = jnp.ones(batch_shape, dtype=bool)
+            final_state = initial_token
+            log_prob = jnp.zeros(batch_shape)
+
+            for step in range(self.max_steps):
+                state, token_logits = run_step(scratchpad, step)
+                log_token_probs = jax.nn.log_softmax(token_logits, axis=-1)
+                token_id = target_tokens[..., step]
+                token_log_prob = jnp.take_along_axis(
+                    log_token_probs, token_id[..., None], axis=-1
+                ).squeeze(axis=-1)
+                log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
+
+                halts_this_step = still_running & (token_id == act_token_id)
+                final_state = jnp.where(halts_this_step[..., None], state, final_state)
+                still_running = still_running & (~halts_this_step)
+
+                if step_counts[step] != self.max_steps:
+                    thought_id = jnp.where(token_id == act_token_id, 0, token_id)
+                    token_emb = token_embed(thought_id)
+                    fused = fuse_latent_feedback(state, token_emb)
+                    scratchpad = scratchpad.at[..., step + 1, :].set(fused)
+
+            return final_state, log_prob
 
         if replaying:
             # Attention is causally masked (see `TransformerBlock`), so every
@@ -250,14 +361,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         emitted_tokens = jnp.zeros(batch_shape + (self.max_steps,), dtype=jnp.int32)
 
         for step in range(self.max_steps):
-            seq_len = step + 1
-            tokens_in = scratchpad[..., :seq_len, :] + pos_embedding[:seq_len]
-            causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
-            for block in blocks:
-                tokens_in = block(tokens_in, mask=causal_mask)
-            state = tokens_in[..., -1, :]
-
-            token_logits = jnp.where(legal_mask[step], token_head(state), _NEG_INF)
+            state, token_logits = run_step(scratchpad, step)
 
             if deterministic:
                 token_id = jnp.argmax(token_logits, axis=-1)
@@ -280,6 +384,12 @@ class TransformerExplicitCoTTorso(nn.Module):
                 # since scratchpad positions for already-halted examples are
                 # only ever fed to blocks whose output gets discarded above.
                 thought_id = jnp.where(token_id == act_token_id, 0, token_id)
-                scratchpad = scratchpad.at[..., step + 1, :].set(token_embed(thought_id))
+                token_emb = token_embed(thought_id)
+                next_entry = (
+                    fuse_latent_feedback(state, token_emb)
+                    if self.use_latent_feedback
+                    else token_emb
+                )
+                scratchpad = scratchpad.at[..., step + 1, :].set(next_entry)
 
         return final_state, num_steps_taken, emitted_tokens

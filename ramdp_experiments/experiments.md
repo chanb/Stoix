@@ -145,3 +145,7 @@ Command:
 ```
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=1,2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-shared_embed_explicit_cot --runs-per-gpu 2 --gpus 0,1,2,3 --no-skip-existing --ent-coef 0.001,0.0001
 ```
+
+
+### Jumanji architecture search
+Start with maze: `python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,4,8,16 --seeds 3 --runs-per-gpu 4 --architectures transformer_explicit_cot --hidden-dim 8,16,32 --mlp-dim 32,64 --num-layers 2 --num-heads 4 --vocab-size=1,2,4,8 --total-timesteps 5e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --use-input-layer-norm true --gpus 0,1 --rollout-length 64 --epochs 8 --num-minibatches 16 --wandb true --wandb-project jumanji_sweep-ppo_only-test-sept_1 --server vulcan`
