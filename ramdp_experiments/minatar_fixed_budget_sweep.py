@@ -81,8 +81,7 @@ Grid axes:
                  requested).
   - use_input_layer_norm: LayerNorm on the encoded observation before the
                  initial token/state/recurrent-input projection; supported by
-                 cnn+mlp/cnn+transformer/cnn+gru/cnn+iru, not yet by
-                 cnn+transformer_explicit_cot (forced off).
+                 cnn+mlp/cnn+transformer/cnn+gru/cnn+iru/cnn+transformer_explicit_cot.
   - num_layers:  how many sub-layers are stacked inside each shared pondering
                  step (network.actor_network.pre_torso.num_layers) - Dense
                  layers for cnn+mlp, GRU cells for cnn+gru, IRU cells
@@ -522,12 +521,12 @@ class Job:
             cmd.append(f"logger.loggers.wandb.group_tag=[{','.join(self.group_tag_parts)}]")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
-        if self.arch == EXPLICIT_COT_ARCH:
-            pass  # TransformerExplicitCoTTorso has no LayerNorm params yet.
-        elif self.arch in NO_LAYER_NORM_ARCHES:
-            # TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso, and
-            # IRUAdaptiveComputationTimeTorso only have use_input_layer_norm, not
-            # use_layer_norm (see stoix/networks/torso_compute_transformer.py and
+        if self.arch == EXPLICIT_COT_ARCH or self.arch in NO_LAYER_NORM_ARCHES:
+            # TransformerChainOfThoughtTorso, TransformerExplicitCoTTorso,
+            # GRUAdaptiveComputationTimeTorso, and IRUAdaptiveComputationTimeTorso
+            # only have use_input_layer_norm, not use_layer_norm (see
+            # stoix/networks/torso_compute_transformer.py,
+            # stoix/networks/torso_compute_explicit_cot.py, and
             # stoix/networks/torso_compute.py).
             cmd.append(
                 f"network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
@@ -601,8 +600,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    --architectures requests, mirroring how the other unsupported axes
     #    below are forced to a single value.
     #  - use_layer_norm only exists on AdaptiveComputationTimeTorso (cnn+mlp).
-    #  - use_input_layer_norm exists on cnn+mlp/cnn+transformer/cnn+gru/cnn+iru,
-    #    not yet on cnn+transformer_explicit_cot.
+    #  - use_input_layer_norm exists on cnn+mlp/cnn+transformer/cnn+gru/cnn+iru/
+    #    cnn+transformer_explicit_cot (cnn+transformer_explicit_cot has no
+    #    use_layer_norm though, same as cnn+transformer/cnn+gru/cnn+iru - see
+    #    NO_LAYER_NORM_ARCHES).
     #  - num_layers (sub-layers stacked inside each shared pondering step,
     #    see stoix/networks/torso_compute*.py) is swept for every arch,
     #    including cnn+transformer_explicit_cot.
@@ -639,7 +640,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
                     continue
-                ln_options = [(False, False)]
+                ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
                 num_layers_options = args.num_layers
             elif arch in NO_LAYER_NORM_ARCHES:
                 ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
@@ -952,8 +953,8 @@ def main() -> None:
         default="false",
         help="Comma-separated bools (true/false) - LayerNorm on the raw observation before the "
         "initial token/state projection (network.actor_network.pre_torso.use_input_layer_norm). "
-        "Supported by architecture in {cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}; ignored "
-        "(forced off) for cnn+transformer_explicit_cot.",
+        "Supported by architecture in {cnn+mlp, cnn+transformer, cnn+gru, cnn+iru, "
+        "cnn+transformer_explicit_cot}.",
     )
     parser.add_argument(
         "--num-layers",
@@ -1175,7 +1176,7 @@ def main() -> None:
     )
     print(
         f"  use_layer_norm={args.use_layer_norm} (cnn+mlp only) "
-        f"use_input_layer_norm={args.use_input_layer_norm} (not cnn+transformer_explicit_cot)"
+        f"use_input_layer_norm={args.use_input_layer_norm}"
     )
     print(f"  num_layers={args.num_layers}")
     print(

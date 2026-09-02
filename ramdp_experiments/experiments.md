@@ -153,15 +153,66 @@ Start with maze: `python ramdp_experiments/jumanji_fixed_budget_sweep.py --syste
 
 ## Seems to be a bug... Rerun
 ```
-
+####### implicit, layernorm
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing --ent-coef 0.001,0.0001
 
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 1 --gpus 4,5 --no-skip-existing --ent-coef 0.001,0.0001 &
-python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_naive,ff_ppo_cond_fac --max-steps 16 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.001,0.0001 &
-wait
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 1 --gpus 4,5 --no-skip-existing --ent-coef 0.001,0.0001
+
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_naive,ff_ppo_cond_fac --max-steps 16 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.001,0.0001
 
 
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --runs-per-gpu 2 --gpus 0,1 --no-skip-existing --use-latent-feedback true --ent-coef 0.001,0.0001
+
+####### implicit, no layernorm
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 2 --gpus 6,7 --no-skip-existing --ent-coef 0.001,0.0001
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 2 --gpus 0,1 --no-skip-existing --ent-coef 0.001,0.0001
+
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_naive,ff_ppo_cond_fac --max-steps 16 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.001,0.0001
+
+
+####### explicit, layernorm, latent_feedback (Earlier runs use full-bandwidth tf implementation (Pre Sept. 2), later runs use skip connection (Post Sept. 2))
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --runs-per-gpu 2 --gpus 6,7 --no-skip-existing --use-latent-feedback true --ent-coef 0.001,0.0001
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --runs-per-gpu 1 --gpus 2,3 --no-skip-existing --use-latent-feedback true --ent-coef 0.001,0.0001
+
+####### explicit, layernorm, no latent_feedback
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --runs-per-gpu 2 --gpus 2,3 --no-skip-existing --use-latent-feedback false --ent-coef 0.001,0.0001
+```
+
+
+# Comments on Sept 2:
+When `input_layer_norm=True`:
+- Large `max_steps` should have smaller entropy coef, e.g. `max_steps>=4` should have at `ent_coef=0.0001`.
+- Large `max_steps` should have smaller entropy coef, e.g. `max_steps<4` should have at `ent_coef=0.001`.
+
+
+```
+####### implicit, layernorm
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing --ent-coef 0.001,0.0001
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 1 --gpus 4,5 --no-skip-existing --ent-coef 0.001,0.0001
+
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_cond_naive,ff_ppo_cond_fac --max-steps 16 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.001,0.0001
+
+
+
+####### implicit, no layernorm
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing --ent-coef 0.001 --yes
+# tmux attach -t1: running, gpus 4 5 6 7
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 0,1,2,3 --no-skip-existing --ent-coef 0.0001 --yes
+# tmux attach -t0: running, gpus 0 1 2 3
+
+## WAIT FOR ABOVE TWO
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.0001  --yes
+
+
+####### explicit: for latent_feedback (Earlier runs use full-bandwidth tf implementation (Pre Sept. 2), later runs use skip connection (Post Sept. 2))
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 0,1,2,3 --no-skip-existing --ent-coef 0.001
+
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 1 --gpus 2,3 --no-skip-existing --ent-coef 0.0001
+
+## WAIT FOR ABOVE TWO
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.0001  --yes
 ```

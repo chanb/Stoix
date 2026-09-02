@@ -586,9 +586,12 @@ class Job:
         # use_layer_norm/use_input_layer_norm explicitly, so a plain `=`
         # override can fail with "Key not in struct" for some (system, arch)
         # combos - matches lightsout_fixed_budget_sweep.py/lightsout_sweep.py.
-        if self.arch in EXPLICIT_COT_ARCHES:
-            pass  # TransformerExplicitCoTTorso has no LayerNorm params yet.
-        elif self.arch in NO_LAYER_NORM_ARCHES:
+        if self.arch in EXPLICIT_COT_ARCHES or self.arch in NO_LAYER_NORM_ARCHES:
+            # TransformerExplicitCoTTorso only has use_input_layer_norm, not
+            # use_layer_norm, same as TransformerChainOfThoughtTorso/
+            # GRUAdaptiveComputationTimeTorso/IRUAdaptiveComputationTimeTorso
+            # (see stoix/networks/torso_compute_explicit_cot.py and
+            # stoix/networks/torso_compute_transformer.py).
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
@@ -691,7 +694,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
                     continue
-                ln_options = [(False, False)]
+                ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
                 num_layers_options = args.num_layers
             elif arch in NO_LAYER_NORM_ARCHES:
                 ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]

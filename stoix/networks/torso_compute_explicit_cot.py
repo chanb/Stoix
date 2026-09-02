@@ -155,15 +155,15 @@ class _ExplicitCoTBackbone(nn.Module):
             )
             for _ in range(self.num_layers)
         ]
-        if self.use_latent_feedback:
-            # Paper Eq. 4: e_t (X) h_{t-1} = W^U h_{t-1} * sigmoid(W^G e_t).
-            # No bias terms, matching the paper.
-            self.latent_feedback_value = nn.Dense(
-                self.hidden_dim, use_bias=False, kernel_init=self.kernel_init
-            )
-            self.latent_feedback_gate = nn.Dense(
-                self.hidden_dim, use_bias=False, kernel_init=self.kernel_init
-            )
+        # if self.use_latent_feedback:
+        #     # Paper Eq. 4: e_t (X) h_{t-1} = W^U h_{t-1} * sigmoid(W^G e_t).
+        #     # No bias terms, matching the paper.
+        #     self.latent_feedback_value = nn.Dense(
+        #         self.hidden_dim, use_bias=False, kernel_init=self.kernel_init
+        #     )
+        #     self.latent_feedback_gate = nn.Dense(
+        #         self.hidden_dim, use_bias=False, kernel_init=self.kernel_init
+        #     )
 
     def token_head(self, state: chex.Array) -> chex.Array:
         return self.token_embed.attend(state)
@@ -184,15 +184,23 @@ class _ExplicitCoTBackbone(nn.Module):
             tokens_in = block(tokens_in, mask=causal_mask)
         return tokens_in
 
+    # def fuse_latent_feedback(self, state: chex.Array, token_emb: chex.Array) -> chex.Array:
+    #     # `state` plays the role of h_{t-1} and `token_emb` the role of e_t,
+    #     # evaluated one step "in the future" relative to the paper's
+    #     # indexing (we fuse the state and token produced *at* step to build
+    #     # the scratchpad entry consumed *after* step, whereas the paper
+    #     # names the state as already "previous" - same relationship).
+    #     return self.latent_feedback_value(state) * jax.nn.sigmoid(
+    #         self.latent_feedback_gate(token_emb)
+    #     )
+
     def fuse_latent_feedback(self, state: chex.Array, token_emb: chex.Array) -> chex.Array:
         # `state` plays the role of h_{t-1} and `token_emb` the role of e_t,
         # evaluated one step "in the future" relative to the paper's
         # indexing (we fuse the state and token produced *at* step to build
         # the scratchpad entry consumed *after* step, whereas the paper
         # names the state as already "previous" - same relationship).
-        return self.latent_feedback_value(state) * jax.nn.sigmoid(
-            self.latent_feedback_gate(token_emb)
-        )
+        return state + token_emb
 
     def step(
         self,
