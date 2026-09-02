@@ -467,6 +467,7 @@ class Job:
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
+            "arch.num_eval_episodes=10",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # min_steps == max_steps == budget: no adaptivity, every example always

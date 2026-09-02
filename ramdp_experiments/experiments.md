@@ -185,7 +185,6 @@ When `input_layer_norm=True`:
 - Large `max_steps` should have smaller entropy coef, e.g. `max_steps>=4` should have at `ent_coef=0.0001`.
 - Large `max_steps` should have smaller entropy coef, e.g. `max_steps<4` should have at `ent_coef=0.001`.
 
-
 ```
 ####### implicit, layernorm
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_1 --yes --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing --ent-coef 0.001,0.0001
@@ -198,7 +197,7 @@ python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce,ff_ppo_co
 
 ####### implicit, no layernorm
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 4,5,6,7 --no-skip-existing --ent-coef 0.001 --yes
-# tmux attach -t1: running, gpus 4 5 6 7
+# tmux attach -t1: DONE, gpus 4 5 6 7
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4,8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 0,1,2,3 --no-skip-existing --ent-coef 0.0001 --yes
 # tmux attach -t0: running, gpus 0 1 2 3
@@ -208,11 +207,35 @@ python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_con
 
 
 ####### explicit: for latent_feedback (Earlier runs use full-bandwidth tf implementation (Pre Sept. 2), later runs use skip connection (Post Sept. 2))
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 0,1,2,3 --no-skip-existing --ent-coef 0.001
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 6,7 --no-skip-existing --ent-coef 0.001
+# tmux attach -t2: running, gpus 6 7
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1,2 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 2 --gpus 4,5 --no-skip-existing --ent-coef 0.001
+# tmux attach -t1: cancelled half way (latent feedback unnecessary), gpus 4 5
 
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 1 --gpus 2,3 --no-skip-existing --ent-coef 0.0001
 
 ## WAIT FOR ABOVE TWO
 python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false,true --use-latent-feedback false,true --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2 --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --ent-coef 0.0001  --yes
+```
+
+- It seems like the architecture is already pretty good with budget = 1. Next step is to do architecture sweep again...
+```
+# IMPLICIT CoT
+# Check architecture with budget of 1
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 8 --mlp-dim 8,16 --num-layers 2,4 --num-heads 2,4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8,16 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 3 --gpus 2,3 --no-skip-existing --ent-coef 0.001
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 16 --mlp-dim 16,32 --num-layers 2,4 --num-heads 2,4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 3 --gpus 2,3 --no-skip-existing --ent-coef 0.001
+# tmux attach -t8: running, gpus 2 3
+
+# Check architecture with budget of 8
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 8 --seeds 3 --architectures transformer --hidden-dim 8,16,32 --mlp-dim 16,32,64 --num-layers 2,4 --num-heads 2,4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 2 --gpus 1,2,3 --no-skip-existing --ent-coef 0.001
+
+
+
+# EXPLICIT CoT
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 16 --mlp-dim 16,32 --num-layers 2,4 --num-heads 2,4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 3 --gpus 1,4,5 --no-skip-existing --ent-coef 0.001
+
+# tmux attach -t8: running, gpus 4 5
 ```
