@@ -278,3 +278,9 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x4_weight_decay_search --runs-per-gpu 3 --gpus 3,4,5 --no-skip-existing --ent-coef 0.0001 --actor-weight-decay 0.0,0.1,0.01
 # tmux attach -t1: running, gpus 3 4 5
 ```
+
+
+```
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 32 --grid-sizes 5x5,4x6,5x6 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-maze_search --runs-per-gpu 2 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.0,0.01
+
+```
