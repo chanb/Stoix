@@ -41,6 +41,14 @@ clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"
   # (rlax.l2_loss, as in ff_reinforce.py/ff_qac.py). Only affects the critic - the actor's
   # ratio is always clipped regardless of this setting.
 ent_coef: 0.01 # Entropy regularisation term for loss function.
+latent_kl_coef: 0.0 # Coefficient on an optional trust-region penalty for how far the
+  # actor torso's per-step "thought" states (states_history) may drift across a PPO
+  # update, on top of the existing halting-log-prob ratio clip (which only bounds the
+  # halting *decision*, not the continuous states themselves). Interpretable as
+  # 1 / (2 * sigma^2) of an isotropic Gaussian centered at each step's state: the
+  # penalty is exactly KL(N(new, sigma^2 I) || N(old, sigma^2 I)) between rollout-time
+  # and current-epoch states. 0.0 (default) disables it exactly, recovering the
+  # original ff_ppo.py behaviour.
 vf_coef: 0.5 # Critic weight.
 standardize_advantages: False # Whether to standardize the advantages.
 max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.

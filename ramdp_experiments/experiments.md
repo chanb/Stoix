@@ -315,6 +315,8 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explic
 ```
 
 5x5 maze (salient3)
+- For implcit CoT, we don't seem to be getting better performance.
+  - Can we add a similar technique to the latent states as explicit CoT, where we penalize how far the latent states can drift?
 ```
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01
 # tmux attach -t11: done, gpus 0 1 2, salient3
@@ -327,6 +329,7 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 - For explicit CoT, maybe the clipping needs to be less aggressive?
   - It is also the case that we clip based on the (unnormalized) sequence-level probability rather than per-token level, so that might be too aggressive as well.
     - XXX: CHANGING THIS TO BE PER TOKEN LEVEL
+      - This seems to be helping so far (for vocab_size=2)
 ```
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --vocab-size=1 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 3,4,5 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --yes
 # tmux attach -t1: done, gpus 3 4 5

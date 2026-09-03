@@ -7,8 +7,7 @@ files, compute time is folded into the discounting rather than the reward
 (see `ff_reinforce.py`'s module docstring for the full
 `G_h = gamma^(C_h - 1) * (r_h + gamma * G_{h+1})` derivation), and the
 actor's halting trajectory (sampled by an Adaptive Computation Time torso)
-is trained jointly with the environment action from one combined
-log-probability `log_prob = env_log_prob + halting_log_prob`.
+is trained alongside the environment action.
 
 `config.system.qac_variant` selects how the advantage used to train the
 actor is computed - the same knob `ff_qac.py` uses, extended with three more
@@ -33,21 +32,58 @@ The four Q-V variants all use `stoix.networks.base_qac.ValueAndQCritic` (a
 shared torso with a V head and a Q head).
 
 Whichever variant, PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is
-applied to the *joint* log-probability:
-`ratio = exp((env_log_prob + halting_log_prob) - old_log_prob)`, one clipped
-surrogate term, not separate ratios for the action and halting decisions.
-The critic (V, and Q for "naive"/"fac") is trained with PPO's own clipped
-value loss (`stoix.utils.loss.clipped_value_loss`) against the `old`
-value/Q estimate recorded at rollout time by default, or with plain L2
-regression (`rlax.l2_loss`) when `config.system.clip_value_loss=False`.
+applied *per decision*, not once over the joint trajectory: the environment
+action gets its own ratio/clip (`env_log_prob` vs. its rollout-time value),
+and each pondering step gets its own ratio/clip too (`halting_log_prob`,
+shape `(*batch, max_steps)`, vs. its rollout-time value), masked to the
+steps actually taken and averaged over them across the whole minibatch. This
+mirrors `ff_ppo_explicit_cot.py`'s per-step CoT-token clip, for the same
+reason: summing the `max_steps` (weight-tied, for `TransformerChainOfThoughtTorso`;
+independently-parameterized for `UnsharedIRUAdaptiveComputationTimeTorso`,
+still no probability-ratio protection either way) per-step log-probs into
+one joint ratio before exponentiating would make the *effective* per-step
+trust region shrink as `max_steps` grows - clipping longer-budget runs far
+more readily than short ones for reasons unrelated to whether the update is
+actually good. The two clipped surrogates are added together (each already
+an average over its own decisions) before the entropy bonus. The critic (V,
+and Q for "naive"/"fac") is trained with PPO's own clipped value loss
+(`stoix.utils.loss.clipped_value_loss`) against the `old` value/Q estimate
+recorded at rollout time by default, or with plain L2 regression
+(`rlax.l2_loss`) when `config.system.clip_value_loss=False`.
 
 Because PPO needs a fixed "old" log-probability to compute the ratio against
 across every epoch, and the Adaptive Computation Time torso's sampling pass
 does not itself report the log-probability of the halting trajectory it just
 sampled, each rollout step makes a second actor forward pass in replay mode
 (`torso_kwargs={"target_compute_time": compute_time}`) purely to read off
-`halting_log_prob` at the rollout-time parameters. This doubles the actor's
-per-step forward cost during rollout.
+`halting_log_prob` (per-step) at the rollout-time parameters. This doubles
+the actor's per-step forward cost during rollout.
+
+Optionally (`config.system.latent_kl_coef > 0`), the actor loss also adds a
+trust-region *penalty* (not a clip) on how far the torso's per-step "thought"
+states are allowed to drift across a PPO update - the halting-log-prob ratio
+above only bounds the halting *decision*; the continuous states themselves
+(a deterministic function of the parameters, not a sampled action) have no
+probability ratio PPO's clip could apply to, so nothing else protects them.
+Treating each step's state as the mean of a fixed-variance isotropic
+Gaussian, `KL(N(new, sigma^2 I) || N(old, sigma^2 I)) = ||new - old||^2 /
+(2 * sigma^2)`, so an L2 penalty on `(new_latent_states - old_latent_states)`
+*is* such a KL penalty, with `latent_kl_coef = 1 / (2 * sigma^2)`. Both
+`old`/`new` come from replay-mode passes (`states_history`, see
+`stoix.networks.torso_compute`/`torso_compute_transformer`) at the same
+`compute_time` trajectory - `old_latent_states` is read off the same
+rollout-time replay pass that produces `halting_log_prob` above (no extra
+forward pass), `new_latent_states` off the same per-epoch replay pass that
+produces `halting_log_prob` in `_actor_loss_fn`. Averaged only over steps
+actually
+taken (`step_idx < compute_time`) across the whole minibatch, matching how
+`ff_ppo_explicit_cot.py` averages its per-step CoT terms. Clipping (rather
+than a soft penalty) was considered and rejected for this term - see the
+design discussion this was drafted from: because the "sample" and the
+Gaussian's mean coincide (there's no injected noise), the resulting ratio is
+bounded in (0, 1], which makes PPO's two-sided clip degenerate and, for
+negative-advantage examples, creates an unbounded incentive to blow up the
+state.
 
 Like `ff_reinforce.py`/`ff_qac.py`, and unlike `stoix.systems.vpg.ff_ppo`,
 this file does not implement truncation-aware bootstrapping (`done` is
@@ -118,6 +154,10 @@ def get_learner_fn(
 
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
+
+    # Needed to build the "was this pondering step actually taken" mask used
+    # by the optional latent KL penalty below - see `_actor_loss_fn`.
+    max_steps = config.network.actor_network.pre_torso.max_steps
 
     qac_variant = config.system.qac_variant
     assert qac_variant in (
@@ -200,13 +240,17 @@ def get_learner_fn(
             env_log_prob = actor_policy.log_prob(action)
 
             # Second replay-mode pass to get halting_log_prob at these same
-            # (rollout-time) params, giving PPO a fixed "old" log_prob.
-            _, halting_log_prob = actor_apply_fn(
+            # (rollout-time) params, giving PPO a fixed "old" per-step
+            # log_prob (the summed scalar is discarded - PPO clips each
+            # step individually, see module docstring). `old_latent_states`
+            # (the per-step "thought" states from this same pass) is only
+            # used by the optional latent KL penalty - harmless to always
+            # compute, since it's read off a pass already being made.
+            _, _, old_latent_states, halting_log_prob = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_compute_time": compute_time},
             )
-            log_prob = env_log_prob + halting_log_prob
 
             if is_qac:
                 value = critic_apply_fn(
@@ -253,7 +297,9 @@ def get_learner_fn(
                 compute_time,
                 first_convergence_step,
                 num_close_steps,
-                log_prob,
+                env_log_prob,
+                halting_log_prob,
+                old_latent_states,
             )
             learner_state = RamdpOnPolicyLearnerState(
                 params,
@@ -324,38 +370,118 @@ def get_learner_fn(
                     traj_batch: PPOTransition,
                     advantage: chex.Array,
                 ) -> Tuple:
-                    """Calculate the actor loss."""
+                    """Calculate the actor loss.
+
+                    Per-decision PPO clipping (see module docstring): the
+                    environment action and each pondering step get their own
+                    ratio/clip against the shared, trajectory-level
+                    `advantage` - rather than summing `env_log_prob` and
+                    `halting_log_prob` into one joint log-prob and clipping a
+                    single ratio over that sum.
+                    """
                     # Replay the halting trajectory actually taken during
                     # rollout, mirroring log_prob(traj_batch.action) below.
-                    actor_policy, halting_log_prob = actor_apply_fn(
+                    # `new_latent_states` is this epoch's per-step "thought"
+                    # states at the same trajectory - only used by the
+                    # optional latent KL penalty below (see module docstring).
+                    actor_policy, _, new_latent_states, halting_log_prob = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_compute_time": traj_batch.compute_time},
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
-                    log_prob = env_log_prob + halting_log_prob
 
-                    loss_actor = ppo_clip_loss(
-                        log_prob, traj_batch.log_prob, advantage, config.system.clip_eps
+                    action_loss = ppo_clip_loss(
+                        env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
+                    )
+                    action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
+                    action_clip_fraction = jnp.mean(
+                        (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(
+                            jnp.float32
+                        )
                     )
                     entropy = actor_policy.entropy().mean()
 
-                    # Fraction of samples whose ratio fell outside the clip
-                    # range - the standard PPO clip diagnostic.
-                    ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                    clip_fraction = jnp.mean(
-                        (jnp.abs(ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
+                    # `halting_log_prob`/`traj_batch.halting_log_prob`:
+                    # `(*batch, max_steps)`, zeroed at forced steps or past
+                    # the step each example actually halted at. A step is
+                    # "actually taken" iff its index is before
+                    # `compute_time` - reconstructed here (not passed through
+                    # the transition) since it's a fixed function of
+                    # `compute_time` alone (same at rollout time and at every
+                    # replay), unlike the log-probs, which change with
+                    # `actor_params` each epoch. Reused below for the latent
+                    # KL penalty's masking too.
+                    step_idx = jnp.arange(max_steps)
+                    valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(
+                        jnp.float32
+                    )
+                    num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
+
+                    halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
+                    advantage_per_step = advantage[..., None]
+                    halting_surrogate1 = halting_ratio * advantage_per_step
+                    halting_surrogate2 = (
+                        jnp.clip(
+                            halting_ratio,
+                            1.0 - config.system.clip_eps,
+                            1.0 + config.system.clip_eps,
+                        )
+                        * advantage_per_step
+                    )
+                    # Masked mean over every pondering step actually taken
+                    # across the whole minibatch (not a per-example mean
+                    # averaged over examples), so trajectories with more
+                    # valid steps don't get down-weighted relative to
+                    # shorter ones.
+                    halting_loss = (
+                        jnp.sum(
+                            -jnp.minimum(halting_surrogate1, halting_surrogate2) * valid_step
+                        )
+                        / num_valid_steps
+                    )
+                    halting_clip_fraction = (
+                        jnp.sum(
+                            (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(
+                                jnp.float32
+                            )
+                            * valid_step
+                        )
+                        / num_valid_steps
                     )
 
-                    total_loss_actor = loss_actor - config.system.ent_coef * entropy
+                    loss_actor = action_loss + halting_loss
+
+                    # Optional latent trust-region penalty (see module
+                    # docstring): KL(N(new, sigma^2 I) || N(old, sigma^2 I))
+                    # = ||new - old||^2 / (2 sigma^2), i.e. a plain L2 penalty
+                    # with latent_kl_coef playing the role of 1/(2 sigma^2).
+                    # `latent_kl_coef=0.0` (the default) makes this an exact
+                    # no-op - `new_latent_states`/`old_latent_states` are
+                    # still computed either way, since they're read off
+                    # passes already being made for `halting_log_prob`.
+                    sq_dist = jnp.sum(
+                        (new_latent_states - traj_batch.old_latent_states) ** 2, axis=-1
+                    )
+                    latent_kl_penalty = jnp.sum(sq_dist * valid_step) / num_valid_steps
+
+                    total_loss_actor = (
+                        loss_actor
+                        - config.system.ent_coef * entropy
+                        + config.system.latent_kl_coef * latent_kl_penalty
+                    )
                     loss_info = {
                         "actor_loss": loss_actor,
+                        "action_loss": action_loss,
+                        "halting_loss": halting_loss,
                         "entropy": entropy,
                         "advantages": advantage,
                         "compute_time": traj_batch.compute_time,
                         "first_convergence_step": traj_batch.first_convergence_step,
                         "num_close_steps": traj_batch.num_close_steps,
-                        "clip_fraction": clip_fraction,
+                        "action_clip_fraction": action_clip_fraction,
+                        "halting_clip_fraction": halting_clip_fraction,
+                        "latent_kl_penalty": latent_kl_penalty,
                     }
                     return total_loss_actor, loss_info
 

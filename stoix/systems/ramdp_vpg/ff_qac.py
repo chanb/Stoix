@@ -238,7 +238,10 @@ def get_learner_fn(
             """Calculate the actor loss."""
             # Replay the halting trajectory actually taken during rollout,
             # mirroring log_prob(actions) evaluating the stored action.
-            actor_policy, halting_log_prob = actor_apply_fn(
+            # `states_history`/`per_step_halting_log_prob` (only needed for
+            # PPO's latent trust-region penalty/per-step clip, see
+            # `ff_ppo.py`) are ignored here.
+            actor_policy, halting_log_prob, _, _ = actor_apply_fn(
                 actor_params, observations, torso_kwargs={"target_compute_time": compute_times}
             )
             env_log_prob = actor_policy.log_prob(actions)

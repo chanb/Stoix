@@ -212,6 +212,8 @@ class _CoTStep(nn.Module):
             prev_state,
             rng,
             target_compute_time,
+            states_history,
+            per_step_halting_log_prob,
         ) = carry
 
         pos_embedding = self.param(
@@ -239,6 +241,10 @@ class _CoTStep(nn.Module):
         state = x
         cached_keys = new_cached_keys
         cached_values = new_cached_values
+        if self.replaying:
+            # Only ever populated when replaying - see
+            # `TransformerChainOfThoughtTorso`'s docstring for `states_history`.
+            states_history = states_history.at[..., step_idx, :].set(state)
 
         halting_prob = nn.sigmoid(halting_head(nn.LayerNorm()(state)))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
@@ -294,9 +300,12 @@ class _CoTStep(nn.Module):
         # contribute no log prob: the true probability of a forced outcome
         # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
         # reflect a "choice" the policy never actually got to make.
-        halting_log_prob = halting_log_prob + jnp.where(
-            still_running & (~is_forced_step), step_log_prob, 0.0
-        )
+        step_contribution = jnp.where(still_running & (~is_forced_step), step_log_prob, 0.0)
+        halting_log_prob = halting_log_prob + step_contribution
+        if self.replaying:
+            per_step_halting_log_prob = per_step_halting_log_prob.at[..., step_idx].set(
+                step_contribution
+            )
         num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
         final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -316,6 +325,8 @@ class _CoTStep(nn.Module):
             prev_state,
             rng,
             target_compute_time,
+            states_history,
+            per_step_halting_log_prob,
         )
         return new_carry, None
 
@@ -330,7 +341,21 @@ class TransformerChainOfThoughtTorso(nn.Module):
         halting trajectory and returns `(embedding, compute_time)`.
       - Replay mode (`target_compute_time=<array>`): deterministically
         replays exactly that many CoT steps (no rng) and returns
-        `(embedding, halting_log_prob)` - use this in loss functions.
+        `(embedding, halting_log_prob, states_history,
+        per_step_halting_log_prob)` - use `halting_log_prob` in a
+        REINFORCE-style loss; `states_history` (shape `(*batch, max_steps,
+        hidden_dim)`) is the "thought" at every step, including steps past
+        the one the trajectory actually halted at (mask by `step_idx <
+        compute_time` before using it, same as the convergence diagnostics
+        below already implicitly do). Meant for comparing the state
+        trajectory produced by two parameter sets while replaying the same
+        halting trajectory - e.g. a PPO trust-region penalty on the
+        "thoughts" themselves, not just the halting decision - see
+        `ff_ppo.py`. `per_step_halting_log_prob` (shape `(*batch,
+        max_steps)`) is `halting_log_prob` left unsummed, one entry per CoT
+        step, zeroed at forced steps or past the actual halt - for PPO to
+        clip each step's ratio individually instead of one joint ratio over
+        the trajectory's summed log-prob (also see `ff_ppo.py`).
       - Deterministic mode (`deterministic=True`): halts as soon as the
         halting probability crosses 0.5, for greedy evaluation.
 
@@ -396,8 +421,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
         Returns:
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
-            `(embedding, halting_log_prob)` when replaying a known
-            trajectory (see class docstring for the convergence diagnostics).
+            `(embedding, halting_log_prob, states_history,
+            per_step_halting_log_prob)` when replaying a known trajectory
+            (see class docstring for the convergence diagnostics,
+            `states_history` and `per_step_halting_log_prob`).
         """
         batch_shape = observation.shape[:-1]
         replaying = target_compute_time is not None
@@ -436,6 +463,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
         final_state = initial_token
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
+        # Only ever written when replaying (see `_CoTStep`); carried
+        # regardless of mode since `nn.scan` needs a fixed carry structure.
+        states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
+        per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
         # Unused (never read) unless sampling, but must still be a concrete
         # array: it's carried through every scan step regardless of mode.
         step_rng = rng if rng is not None else jax.random.PRNGKey(0)
@@ -471,6 +502,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
             initial_token,  # prev_state
             step_rng,
             target_compute_time,
+            states_history,
+            per_step_halting_log_prob,
         )
         (
             _,
@@ -485,8 +518,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
             _,
             _,
             _,
+            states_history,
+            per_step_halting_log_prob,
         ), _ = cot_step(initial_carry, jnp.arange(self.max_steps))
 
         if replaying:
-            return final_state, halting_log_prob
+            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
         return final_state, num_steps_taken, first_convergence_step, num_close_steps

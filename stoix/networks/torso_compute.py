@@ -22,10 +22,31 @@ module has two modes:
     convergence diagnostics, see `AdaptiveComputationTimeTorso`'s docstring.
   - Replay mode (`target_compute_time=<array from a stored transition>`):
     deterministically replays exactly that many steps (no sampling/rng
-    needed) and returns the log-probability, under the current parameters,
-    of having produced that exact halting trajectory. This is what the loss
-    function should use, mirroring how `distribution.log_prob(stored_action)`
+    needed) and returns `(embedding, halting_log_prob, states_history,
+    per_step_halting_log_prob)`:
+    `halting_log_prob` is the log-probability, under the current parameters,
+    of having produced that exact halting trajectory - what a REINFORCE-style
+    loss should use, mirroring how `distribution.log_prob(stored_action)`
     is used for the environment action rather than re-sampling it.
+    `states_history` (shape `(*batch, max_steps, hidden_dim)`) is the running
+    state at every pondering step, including steps past the one the
+    trajectory actually halted at (those are the same "discarded
+    continuation" states the latent-convergence diagnostics below already
+    ignore - mask by `step_idx < compute_time` before using them). This
+    lets a caller compare the state trajectory produced by two different
+    parameter sets while replaying the *same* halting trajectory - e.g. a
+    trust-region penalty on how far PPO is allowed to move the "thoughts"
+    themselves across epochs, not just the halting decision (see
+    `ff_ppo.py`). `per_step_halting_log_prob` (shape `(*batch, max_steps)`)
+    is `halting_log_prob` left unsummed, one entry per pondering step
+    (`halting_log_prob == per_step_halting_log_prob.sum(-1)`), zeroed at
+    steps that were forced (before `min_steps`, or the forced halt at
+    `max_steps` - see below) or past the step the trajectory actually
+    halted at - for a caller that wants to PPO-clip each pondering step's
+    ratio individually instead of one joint ratio over the trajectory's
+    summed log-prob (see `ff_ppo.py`). Rollout mode's return is unchanged -
+    both of these are only available when replaying, since they're only ever
+    compared against another replay pass at the same `target_compute_time`.
 
 A transformer-with-chain-of-thought torso would plug into the same
 interface: sample whether to keep "thinking" after each CoT step, with
@@ -157,8 +178,10 @@ class AdaptiveComputationTimeTorso(nn.Module):
         Returns:
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
-            `(embedding, halting_log_prob)` when replaying a known
-            trajectory (see class docstring for the convergence diagnostics).
+            `(embedding, halting_log_prob, states_history,
+            per_step_halting_log_prob)` when replaying a known trajectory
+            (see class docstring for the convergence diagnostics, module
+            docstring for `states_history`/`per_step_halting_log_prob`).
         """
         batch_shape = observation.shape[:-1]
         replaying = target_compute_time is not None
@@ -196,10 +219,16 @@ class AdaptiveComputationTimeTorso(nn.Module):
         final_state = state
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
+        # Only ever populated when replaying - see module docstring.
+        if replaying:
+            states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
+            per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
             state, halting_prob = step_fn(state)
+            if replaying:
+                states_history = states_history.at[..., step, :].set(state)
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
@@ -249,16 +278,21 @@ class AdaptiveComputationTimeTorso(nn.Module):
             # contribute no log prob: the true probability of a forced outcome
             # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
             # reflect a "choice" the policy never actually got to make.
-            halting_log_prob = halting_log_prob + jnp.where(
+            step_contribution = jnp.where(
                 jnp.logical_and(still_running, not is_forced_step), step_log_prob, 0.0
             )
+            halting_log_prob = halting_log_prob + step_contribution
+            if replaying:
+                per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
+                    step_contribution
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
             still_running = still_running & (~halts_this_step)
 
         if replaying:
-            return final_state, halting_log_prob
+            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
@@ -379,8 +413,10 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         Returns:
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
-            `(embedding, halting_log_prob)` when replaying a known
-            trajectory (see class docstring for the convergence diagnostics).
+            `(embedding, halting_log_prob, states_history,
+            per_step_halting_log_prob)` when replaying a known trajectory
+            (see class docstring for the convergence diagnostics, module
+            docstring for `states_history`/`per_step_halting_log_prob`).
         """
         batch_shape = observation.shape[:-1]
         replaying = target_compute_time is not None
@@ -419,11 +455,19 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = state
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
+        # Only ever populated when replaying - see module docstring. Records
+        # the pre-`tanh` top-layer carry, matching what the convergence
+        # diagnostics above already compare step-to-step.
+        if replaying:
+            states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
+            per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
             carry, halting_prob = step_fn(carry, input_embedding)
             state = carry[-1]
+            if replaying:
+                states_history = states_history.at[..., step, :].set(state)
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
@@ -474,9 +518,14 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
             # contribute no log prob: the true probability of a forced outcome
             # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
             # reflect a "choice" the policy never actually got to make.
-            halting_log_prob = halting_log_prob + jnp.where(
+            step_contribution = jnp.where(
                 jnp.logical_and(still_running, not is_forced_step), step_log_prob, 0.0
             )
+            halting_log_prob = halting_log_prob + step_contribution
+            if replaying:
+                per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
+                    step_contribution
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -485,7 +534,7 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = jnp.tanh(final_state)
 
         if replaying:
-            return final_state, halting_log_prob
+            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
@@ -628,8 +677,10 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         Returns:
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
-            `(embedding, halting_log_prob)` when replaying a known
-            trajectory (see class docstring for the convergence diagnostics).
+            `(embedding, halting_log_prob, states_history,
+            per_step_halting_log_prob)` when replaying a known trajectory
+            (see class docstring for the convergence diagnostics, module
+            docstring for `states_history`/`per_step_halting_log_prob`).
         """
         batch_shape = observation.shape[:-1]
         replaying = target_compute_time is not None
@@ -668,11 +719,19 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = state
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
+        # Only ever populated when replaying - see module docstring. Records
+        # the pre-`tanh` top-layer carry, matching what the convergence
+        # diagnostics above already compare step-to-step.
+        if replaying:
+            states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
+            per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
             carry, halting_prob = step_fn(carry, input_embedding)
             state = carry[-1]
+            if replaying:
+                states_history = states_history.at[..., step, :].set(state)
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
@@ -723,9 +782,14 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
             # contribute no log prob: the true probability of a forced outcome
             # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
             # reflect a "choice" the policy never actually got to make.
-            halting_log_prob = halting_log_prob + jnp.where(
+            step_contribution = jnp.where(
                 jnp.logical_and(still_running, not is_forced_step), step_log_prob, 0.0
             )
+            halting_log_prob = halting_log_prob + step_contribution
+            if replaying:
+                per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
+                    step_contribution
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -734,7 +798,7 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = jnp.tanh(final_state)
 
         if replaying:
-            return final_state, halting_log_prob
+            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
@@ -807,8 +871,10 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
         Returns:
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
-            `(embedding, halting_log_prob)` when replaying a known
-            trajectory (see class docstring for the convergence diagnostics).
+            `(embedding, halting_log_prob, states_history,
+            per_step_halting_log_prob)` when replaying a known trajectory
+            (see class docstring for the convergence diagnostics, module
+            docstring for `states_history`/`per_step_halting_log_prob`).
         """
         batch_shape = observation.shape[:-1]
         replaying = target_compute_time is not None
@@ -845,6 +911,12 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = state
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
+        # Only ever populated when replaying - see module docstring. Records
+        # the pre-`tanh` top-layer carry, matching what the convergence
+        # diagnostics above already compare step-to-step.
+        if replaying:
+            states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
+            per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
@@ -860,6 +932,8 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
             )
             carry, halting_prob = step_fn(carry, input_embedding)
             state = carry[-1]
+            if replaying:
+                states_history = states_history.at[..., step, :].set(state)
             step_count = step + 1
             is_final_step = step_count == self.max_steps
             can_halt = step_count >= self.min_steps
@@ -910,9 +984,14 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
             # contribute no log prob: the true probability of a forced outcome
             # is 1, so log(1) = 0 - not `step_log_prob`, which would otherwise
             # reflect a "choice" the policy never actually got to make.
-            halting_log_prob = halting_log_prob + jnp.where(
+            step_contribution = jnp.where(
                 jnp.logical_and(still_running, not is_forced_step), step_log_prob, 0.0
             )
+            halting_log_prob = halting_log_prob + step_contribution
+            if replaying:
+                per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
+                    step_contribution
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -921,5 +1000,5 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = jnp.tanh(final_state)
 
         if replaying:
-            return final_state, halting_log_prob
+            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
