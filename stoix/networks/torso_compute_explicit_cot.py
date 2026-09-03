@@ -31,9 +31,16 @@ different at the next step:
     replaying halts at the same step that produced them (the first "act now"
     token in the sequence).
   - Replay mode (`target_tokens=<array>`): deterministically replays exactly
-    that token trajectory (no rng) and returns `(embedding, log_prob)`: the
-    log-probability, under the current parameters, of the whole trajectory
-    (thought choices and the halting choice together). Attention within a
+    that token trajectory (no rng) and returns `(embedding, log_prob,
+    per_step_log_prob)`: `log_prob` is the log-probability, under the
+    current parameters, of the whole trajectory (thought choices and the
+    halting choice together, i.e. `per_step_log_prob.sum(-1)`);
+    `per_step_log_prob` (shape `(*batch, max_steps)`) is that same quantity
+    left unsummed, one entry per step, zeroed past the step the trajectory
+    actually halted at - callers that need a per-decision (rather than
+    per-trajectory) PPO ratio, e.g. to clip each step's importance ratio
+    individually instead of one joint ratio over the summed log-prob, use
+    this instead of `log_prob`. Attention within a
     step is causally masked (see `TransformerBlock`), so - unlike the
     latent-CoT torso, where the scratchpad entry fed back in is the model's
     own hidden state and therefore only knowable by actually running the
@@ -82,7 +89,7 @@ though the tokens themselves are already known. See the `replaying` branch
 below.
 """
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import chex
 import jax
@@ -255,7 +262,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         rng: Optional[chex.PRNGKey] = None,
         target_tokens: Optional[chex.Array] = None,
         deterministic: bool = False,
-    ) -> Union[Tuple[chex.Array, chex.Array], Tuple[chex.Array, chex.Array, chex.Array]]:
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
         Args:
             observation: the input embedding to think about; becomes the
@@ -271,7 +278,8 @@ class TransformerExplicitCoTTorso(nn.Module):
 
         Returns:
             `(embedding, compute_time, thought_tokens)` when not replaying,
-            or `(embedding, log_prob)` when replaying a known trajectory.
+            or `(embedding, log_prob, per_step_log_prob)` when replaying a
+            known trajectory - see module docstring for `per_step_log_prob`.
         """
         batch_shape = observation.shape[:-1]
         replaying = target_tokens is not None
@@ -382,7 +390,8 @@ class TransformerExplicitCoTTorso(nn.Module):
                 jnp.int32
             )
             still_running = earlier_halts == 0
-            log_prob = jnp.sum(jnp.where(still_running, token_log_prob, 0.0), axis=-1)
+            per_step_log_prob = jnp.where(still_running, token_log_prob, 0.0)
+            log_prob = jnp.sum(per_step_log_prob, axis=-1)
 
             # The final state is read off at the first "act now" token (the
             # forced halt at max_steps guarantees there always is one).
@@ -391,7 +400,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 states, halt_step[..., None, None], axis=-2
             ).squeeze(axis=-2)
 
-            return final_state, log_prob
+            return final_state, log_prob, per_step_log_prob
 
         # KV-cached step-by-step build, shared by rollout mode and (when
         # `use_latent_feedback=True`) replay mode: with latent feedback, each
@@ -416,6 +425,9 @@ class TransformerExplicitCoTTorso(nn.Module):
         num_steps_taken = jnp.zeros(batch_shape)
         emitted_tokens = jnp.zeros(batch_shape + (self.max_steps,), dtype=jnp.int32)
         log_prob = jnp.zeros(batch_shape)
+        # Only ever written when replaying (see `step_fn`); carried
+        # regardless of mode since `nn.scan` needs a fixed carry structure.
+        per_step_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
         # Unused (never read) unless sampling, but must still be a concrete
         # array: it's carried through every scan step regardless of mode.
         step_rng = rng if rng is not None else jax.random.PRNGKey(0)
@@ -431,6 +443,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 num_steps_taken,
                 emitted_tokens,
                 log_prob,
+                per_step_log_prob,
                 final_state,
                 rng,
             ) = carry
@@ -446,7 +459,12 @@ class TransformerExplicitCoTTorso(nn.Module):
                 token_log_prob = jnp.take_along_axis(
                     log_token_probs, token_id[..., None], axis=-1
                 ).squeeze(axis=-1)
-                log_prob = log_prob + jnp.where(still_running, token_log_prob, 0.0)
+                # Zeroed (not merely left unwritten) past the step the
+                # trajectory actually halted at, matching the parallel
+                # (`run`-based) replay path's masking - see module docstring.
+                step_log_prob = jnp.where(still_running, token_log_prob, 0.0)
+                log_prob = log_prob + step_log_prob
+                per_step_log_prob = per_step_log_prob.at[..., step_idx].set(step_log_prob)
             elif deterministic:
                 token_id = jnp.argmax(token_logits, axis=-1)
             else:
@@ -482,6 +500,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 num_steps_taken,
                 emitted_tokens,
                 log_prob,
+                per_step_log_prob,
                 final_state,
                 rng,
             )
@@ -501,6 +520,7 @@ class TransformerExplicitCoTTorso(nn.Module):
             num_steps_taken,
             emitted_tokens,
             log_prob,
+            per_step_log_prob,
             final_state,
             step_rng,
         )
@@ -512,10 +532,11 @@ class TransformerExplicitCoTTorso(nn.Module):
             num_steps_taken,
             emitted_tokens,
             log_prob,
+            per_step_log_prob,
             final_state,
             _,
         ), _ = scan_step(backbone, initial_carry, jnp.arange(self.max_steps))
 
         if replaying:
-            return final_state, log_prob
+            return final_state, log_prob, per_step_log_prob
         return final_state, num_steps_taken, emitted_tokens

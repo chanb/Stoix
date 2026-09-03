@@ -30,7 +30,15 @@ class PPOExplicitCoTTransition(NamedTuple):
     in place of `first_convergence_step`/`num_close_steps` (which
     `TransformerExplicitCoTTorso` has no equivalent of), so the exact token
     trajectory can be replayed when computing the actor loss at each PPO
-    epoch's parameters."""
+    epoch's parameters.
+
+    `env_log_prob` and `cot_log_prob` are kept separate (rather than summed
+    into one joint `log_prob`, as earlier versions of this transition did)
+    so `ff_ppo_explicit_cot.py` can clip the environment action's ratio and
+    each CoT step's ratio individually instead of one ratio over their sum -
+    see that file's module docstring. `cot_log_prob` has shape
+    `(*batch, max_steps)`, one entry per CoT step (zeroed past the step the
+    trajectory actually halted at - see `TransformerExplicitCoTTorso`)."""
 
     done: Done
     action: Action
@@ -41,4 +49,5 @@ class PPOExplicitCoTTransition(NamedTuple):
     info: Dict
     compute_time: chex.Array
     thought_tokens: chex.Array
-    log_prob: chex.Array
+    env_log_prob: chex.Array
+    cot_log_prob: chex.Array

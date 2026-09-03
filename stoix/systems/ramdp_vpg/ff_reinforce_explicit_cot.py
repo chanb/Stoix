@@ -222,7 +222,10 @@ def get_learner_fn(
             """Calculate the actor loss."""
             # Replay the halting-and-token trajectory actually taken during
             # rollout, mirroring log_prob(actions) evaluating the stored action.
-            actor_policy, cot_log_prob = actor_apply_fn(
+            # Plain REINFORCE wants the joint trajectory log-prob (`log_prob`);
+            # the per-step breakdown is only needed for per-decision PPO
+            # clipping (see `ff_ppo_explicit_cot.py`), so it's ignored here.
+            actor_policy, cot_log_prob, _ = actor_apply_fn(
                 actor_params,
                 observations,
                 torso_kwargs={"target_tokens": thought_tokens},

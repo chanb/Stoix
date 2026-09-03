@@ -18,9 +18,24 @@ Everything about *how* this is trained follows `ff_ppo.py`, unmodified:
     same four Q-V variants ("fac"/"naive"/"cond_naive"/"cond_fac", all using
     `stoix.networks.base_qac.ValueAndQCritic`) plus "reinforce" (G-V, using
     `stoix.networks.base.FeedForwardCritic`).
-  - PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is applied to the
-    *joint* log-probability `log_prob = env_log_prob + cot_log_prob`, across
-    several epochs of minibatch gradient steps per rollout.
+  - PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is applied
+    *per decision*, not once over the joint trajectory: the environment
+    action gets its own ratio/clip (`env_log_prob` vs. its rollout-time
+    value), and each CoT step (every thought token and the halting token)
+    gets its own ratio/clip too (`cot_log_prob`, shape `(*batch, max_steps)`,
+    vs. its rollout-time value), masked to the steps actually taken and
+    averaged over them. This mirrors how token-level PPO/GRPO clips each
+    generated token in LLM RL, rather than summing log-probs into one ratio
+    for the whole sequence first: summing `max_steps` weight-tied CoT terms
+    before exponentiating would make the *effective* per-step trust region
+    shrink as `max_steps` grows (weight-tying, see
+    `stoix.networks.torso_compute_transformer.TransformerBlock`, makes
+    per-step log-prob shifts from one gradient step highly correlated, so
+    the unnormalized sum grows roughly linearly with `max_steps` rather than
+    with its square root), clipping longer-budget runs far more readily than
+    short ones for reasons unrelated to whether the update is actually good.
+    The two clipped surrogates are added together (each already an average
+    over its own decisions) before the entropy bonus.
   - The critic (V, and Q for "naive"/"fac") is trained with PPO's own clipped
     value loss against the `old` value/Q estimate recorded at rollout time by
     default, or with plain L2 regression when `config.system.clip_value_loss
@@ -105,6 +120,10 @@ def get_learner_fn(
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
 
+    # Needed to build the "was this CoT step actually taken" mask used by
+    # the per-step clip below - see `_actor_loss_fn`.
+    max_steps = config.network.actor_network.pre_torso.max_steps
+
     qac_variant = config.system.qac_variant
     assert qac_variant in (
         "naive",
@@ -186,13 +205,14 @@ def get_learner_fn(
             env_log_prob = actor_policy.log_prob(action)
 
             # Second replay-mode pass to get cot_log_prob at these same
-            # (rollout-time) params, giving PPO a fixed "old" log_prob.
-            _, cot_log_prob = actor_apply_fn(
+            # (rollout-time) params, giving PPO a fixed "old" log_prob -
+            # per-step (not summed), so each CoT step can be ratio/clipped
+            # individually rather than as one joint trajectory ratio.
+            _, _, cot_log_prob = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_tokens": thought_tokens},
             )
-            log_prob = env_log_prob + cot_log_prob
 
             if is_qac:
                 value = critic_apply_fn(
@@ -238,7 +258,8 @@ def get_learner_fn(
                 info,
                 compute_time,
                 thought_tokens,
-                log_prob,
+                env_log_prob,
+                cot_log_prob,
             )
             learner_state = RamdpOnPolicyLearnerState(
                 params,
@@ -311,36 +332,89 @@ def get_learner_fn(
                     traj_batch: PPOExplicitCoTTransition,
                     advantage: chex.Array,
                 ) -> Tuple:
-                    """Calculate the actor loss."""
+                    """Calculate the actor loss.
+
+                    Per-decision PPO clipping (see module docstring): the
+                    environment action and each CoT step get their own
+                    ratio/clip against the shared, trajectory-level
+                    `advantage` - rather than summing `env_log_prob` and
+                    `cot_log_prob` into one joint log-prob and clipping a
+                    single ratio over that sum.
+                    """
                     # Replay the token trajectory actually taken during
                     # rollout, mirroring log_prob(traj_batch.action) below.
-                    actor_policy, cot_log_prob = actor_apply_fn(
+                    actor_policy, _, cot_log_prob = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_tokens": traj_batch.thought_tokens},
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
-                    log_prob = env_log_prob + cot_log_prob
 
-                    loss_actor = ppo_clip_loss(
-                        log_prob, traj_batch.log_prob, advantage, config.system.clip_eps
+                    action_loss = ppo_clip_loss(
+                        env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
                     )
+                    action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
+                    action_clip_fraction = jnp.mean(
+                        (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(
+                            jnp.float32
+                        )
+                    )
+
+                    # `cot_log_prob`/`traj_batch.cot_log_prob`: `(*batch,
+                    # max_steps)`, zeroed past the step each example actually
+                    # halted at (see `TransformerExplicitCoTTorso`). A step
+                    # is "actually taken" iff its index is before
+                    # `compute_time` - reconstructed here rather than passed
+                    # through the transition since it's a fixed function of
+                    # `compute_time` alone (same at rollout time and at every
+                    # replay), unlike the log-probs, which change with
+                    # `actor_params` each epoch.
+                    step_idx = jnp.arange(max_steps)
+                    valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(
+                        jnp.float32
+                    )
+                    num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
+
+                    cot_ratio = jnp.exp(cot_log_prob - traj_batch.cot_log_prob)
+                    advantage_per_step = advantage[..., None]
+                    cot_surrogate1 = cot_ratio * advantage_per_step
+                    cot_surrogate2 = (
+                        jnp.clip(
+                            cot_ratio, 1.0 - config.system.clip_eps, 1.0 + config.system.clip_eps
+                        )
+                        * advantage_per_step
+                    )
+                    # Masked mean over every CoT step actually taken across
+                    # the whole minibatch (not a per-example mean averaged
+                    # over examples), so trajectories with more valid steps
+                    # don't get down-weighted relative to shorter ones.
+                    cot_loss = (
+                        jnp.sum(-jnp.minimum(cot_surrogate1, cot_surrogate2) * valid_step)
+                        / num_valid_steps
+                    )
+                    cot_clip_fraction = (
+                        jnp.sum(
+                            (jnp.abs(cot_ratio - 1.0) > config.system.clip_eps).astype(
+                                jnp.float32
+                            )
+                            * valid_step
+                        )
+                        / num_valid_steps
+                    )
+
+                    loss_actor = action_loss + cot_loss
                     entropy = actor_policy.entropy().mean()
-
-                    # Fraction of samples whose ratio fell outside the clip
-                    # range - the standard PPO clip diagnostic.
-                    ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                    clip_fraction = jnp.mean(
-                        (jnp.abs(ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
-                    )
 
                     total_loss_actor = loss_actor - config.system.ent_coef * entropy
                     loss_info = {
                         "actor_loss": loss_actor,
+                        "action_loss": action_loss,
+                        "cot_loss": cot_loss,
                         "entropy": entropy,
                         "advantages": advantage,
                         "compute_time": traj_batch.compute_time,
-                        "clip_fraction": clip_fraction,
+                        "action_clip_fraction": action_clip_fraction,
+                        "cot_clip_fraction": cot_clip_fraction,
                     }
                     return total_loss_actor, loss_info
 

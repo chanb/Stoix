@@ -304,7 +304,7 @@ Try different grid size:
 - Seems like 5x5 is sufficiently large for the problem to be difficult for budget = 1
 ```
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 16 --num-minibatches 4 --grid-sizes 4x6,5x5,6x5 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-maze_search --runs-per-gpu 3 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --yes
-# tmux attach -t2: running, gpus 0 1 2
+# tmux attach -t2: done, gpus 0 1 2
 ```
 
 
@@ -317,14 +317,24 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explic
 5x5 maze (salient3)
 ```
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01
-# tmux attach -t11, gpus 0 1 2, salient3
+# tmux attach -t11: done, gpus 0 1 2, salient3
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 8,16 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01
+# tmux attach -t11: running, gpus 0 1 2, salient3
 ```
 
 5x5 maze (salient4)
+- For explicit CoT, maybe the clipping needs to be less aggressive?
+  - It is also the case that we clip based on the (unnormalized) sequence-level probability rather than per-token level, so that might be too aggressive as well.
+    - XXX: CHANGING THIS TO BE PER TOKEN LEVEL
 ```
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --vocab-size=1 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 3,4,5 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --yes
-# tmux attach -t1: running, gpus 3 4 5
+# tmux attach -t1: done, gpus 3 4 5
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --yes
-# tmux attach -t1: PENDING, gpus 3 4 5 6 7
+# tmux attach -t1: done, gpus 3 4 5 6 7 (per-sequence clip)
+
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 2,4,8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --vocab-size=2,4,8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --yes
+# tmux attach -t1: done, gpus 0 .. 7 (per-token clip)
 ```
