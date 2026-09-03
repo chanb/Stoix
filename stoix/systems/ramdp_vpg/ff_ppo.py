@@ -616,11 +616,11 @@ def learner_setup(
 
     actor_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(actor_lr, eps=1e-5),
+        optax.adamw(actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay),
     )
     critic_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(critic_lr, eps=1e-5),
+        optax.adamw(critic_lr, eps=1e-5, weight_decay=config.system.critic_weight_decay),
     )
 
     init_x = env.observation_space().generate_value()

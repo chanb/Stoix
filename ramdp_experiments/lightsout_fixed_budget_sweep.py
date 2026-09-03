@@ -357,6 +357,8 @@ class Job:
     hidden_dim: int
     lr: float
     critic_lr: float
+    actor_weight_decay: float
+    critic_weight_decay: float
     ent_coef: float
     delightful: bool
     delightful_eta: float
@@ -432,6 +434,10 @@ class Job:
         extra = []
         if self.delightful:
             extra.append(f"deta{self.delightful_eta:g}")
+        if self.actor_weight_decay:
+            extra.append(f"wd{self.actor_weight_decay:g}")
+        if self.critic_weight_decay:
+            extra.append(f"cwd{self.critic_weight_decay:g}")
         if self.use_layer_norm:
             extra.append("ln")
         if self.use_input_layer_norm:
@@ -487,6 +493,8 @@ class Job:
             f"network.actor_network.pre_torso.min_steps={self.budget}",
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
+            f"system.actor_weight_decay={self.actor_weight_decay:g}",
+            f"system.critic_weight_decay={self.critic_weight_decay:g}",
             f"system.ent_coef={self.ent_coef:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
@@ -694,6 +702,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         hidden_dim,
         lr,
         critic_lr,
+        actor_weight_decay,
+        critic_weight_decay,
         ent_coef,
         (delightful, delightful_eta),
         (epochs, num_minibatches, clip_eps, clip_value_loss),
@@ -705,6 +715,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.hidden_dim,
         args.lr,
         args.critic_lr,
+        args.actor_weight_decay,
+        args.critic_weight_decay,
         args.ent_coef,
         delightful_combos,
         ppo_combos,
@@ -728,6 +740,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 hidden_dim=hidden_dim,
                 lr=lr,
                 critic_lr=critic_lr,
+                actor_weight_decay=actor_weight_decay,
+                critic_weight_decay=critic_weight_decay,
                 ent_coef=ent_coef,
                 delightful=delightful,
                 delightful_eta=delightful_eta,
@@ -899,6 +913,18 @@ def main() -> None:
         default="1e-4,3e-4,1e-3",
         help="Comma-separated system.critic_lr values, swept independently of --lr "
         "(full cross product).",
+    )
+    parser.add_argument(
+        "--actor-weight-decay",
+        default="0.0",
+        help="Comma-separated system.actor_weight_decay values (AdamW weight decay for the "
+        "actor; 0.0 recovers plain Adam), swept independently of --critic-weight-decay.",
+    )
+    parser.add_argument(
+        "--critic-weight-decay",
+        default="0.0",
+        help="Comma-separated system.critic_weight_decay values (AdamW weight decay for the "
+        "critic; 0.0 recovers plain Adam), swept independently of --actor-weight-decay.",
     )
     parser.add_argument(
         "--ent-coef",
@@ -1105,6 +1131,8 @@ def main() -> None:
     args.hidden_dim = [int(x) for x in args.hidden_dim.split(",")]
     args.lr = [float(x) for x in args.lr.split(",")]
     args.critic_lr = [float(x) for x in args.critic_lr.split(",")]
+    args.actor_weight_decay = [float(x) for x in args.actor_weight_decay.split(",")]
+    args.critic_weight_decay = [float(x) for x in args.critic_weight_decay.split(",")]
     args.ent_coef = [float(x) for x in args.ent_coef.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
@@ -1199,6 +1227,7 @@ def main() -> None:
     print(f"  systems={args.systems} architectures={args.architectures}")
     print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
     print(f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef}")
+    print(f"  actor_weight_decay={args.actor_weight_decay} critic_weight_decay={args.critic_weight_decay}")
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "

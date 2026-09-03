@@ -5,6 +5,8 @@ system_name: ramdp_ff_reinforce # Name of the system.
 # --- RL hyperparameters ---
 actor_lr: 3e-4 # Learning rate for actor network
 critic_lr: 3e-4 # Learning rate for critic network
+actor_weight_decay: 0.0 # AdamW weight decay coefficient for the actor. 0.0 recovers plain Adam.
+critic_weight_decay: 0.0 # AdamW weight decay coefficient for the critic. 0.0 recovers plain Adam.
 rollout_length: 32 # Number of environment steps per vectorised environment.
 gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition that
   # took `compute_time` pondering steps discounts through `gamma ** compute_time`

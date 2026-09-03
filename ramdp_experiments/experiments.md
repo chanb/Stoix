@@ -251,3 +251,13 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explic
 # Comments on Sept 3:
 - It seems like when `hidden-dim=16`, the performances with `c=1` is around 0.55 (worse than `hidden-dim=32`)
 - Unfortunately it seems like for `c=8` this is significantly worse as well.
+- Idea: Use 4x4 grid, add weight decay (this also encourages grokking)
+
+```
+# IMPLICIT CoT
+# Check architecture with budget of 1
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 4x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-4x4_weight_decay_search --runs-per-gpu 6 --gpus 0,1 --no-skip-existing --ent-coef 0.001 --vulcan --actor-weight-decay 0.0,0.1,0.01
+
+# Check architecture with budget of 8
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 4x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-4x4_weight_decay_search --runs-per-gpu 4 --gpus 0 --no-skip-existing --ent-coef 0.0001 --vulcan --actor-weight-decay 0.0,0.1,0.01
+```
