@@ -155,6 +155,18 @@ EXPLICIT_COT_PPO_SYSTEMS = (
     "ff_ppo_explicit_cond_fac",
     "ff_ppo_explicit_reinforce",
 )
+# PPO_SYSTEMS minus EXPLICIT_COT_PPO_SYSTEMS: the systems trained by
+# ff_ppo.py (implicit/latent CoT) rather than ff_ppo_explicit_cot.py. Only
+# these have a system.latent_kl_coef knob (see stoix/configs/system/ramdp_vpg/
+# ff_ppo.yaml) - an optional trust-region penalty on how far the actor
+# torso's per-step "thought" states (a continuous latent, unlike explicit
+# CoT's discrete tokens) are allowed to drift across a PPO update; see
+# ff_ppo.py's module docstring. ff_ppo_explicit_cot.py's system config has no
+# such knob (its "thoughts" are discrete tokens, already covered by its own
+# per-token PPO clip), so --latent-kl-coef is forced to its first value (and
+# omitted from the command) for EXPLICIT_COT_PPO_SYSTEMS, same as every
+# non-PPO system - see build_grid()/Job.command().
+LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_PPO_SYSTEMS)
 # The four ff_ppo_explicit_* systems above whose critic is a genuine Q-V
 # critic (separate V and Q torsos, see EXPLICIT_COT_NETWORK_BY_SYSTEM) -
 # ff_ppo_explicit_reinforce uses a plain V-only critic instead. Used in
@@ -441,6 +453,7 @@ class Job:
     num_minibatches: int
     clip_eps: float
     clip_value_loss: bool
+    latent_kl_coef: float
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -498,6 +511,8 @@ class Job:
         extra = []
         if self.delightful:
             extra.append(f"deta{self.delightful_eta:g}")
+        if self.latent_kl_coef:
+            extra.append(f"lkl{self.latent_kl_coef:g}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}")
         if self.critic_weight_decay:
@@ -571,6 +586,10 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            if self.system in LATENT_KL_PPO_SYSTEMS:
+                # Latent trust-region penalty - ff_ppo.py (implicit CoT)
+                # only, see LATENT_KL_PPO_SYSTEMS.
+                cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
@@ -783,6 +802,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ent_coef,
             (delightful, delightful_eta),
             (epochs, num_minibatches, clip_eps, clip_value_loss),
+            latent_kl_coef,
             seed,
         ) in itertools.product(
             difficulty_combos,
@@ -796,6 +816,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.ent_coef,
             delightful_combos,
             ppo_combos,
+            args.latent_kl_coef,
             range(args.seeds),
         ):
             if arch in CNN_ARCHES and not ENV_SUPPORTS_CNN[env]:
@@ -805,6 +826,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 delightful, delightful_eta = False, args.delightful_eta[0]
             else:
                 epochs, num_minibatches, clip_eps, clip_value_loss = ppo_combos[0]
+            # latent_kl_coef only exists on ff_ppo.py's own systems
+            # (LATENT_KL_PPO_SYSTEMS) - forced to the first requested value
+            # for every other system (including explicit-CoT PPO systems).
+            if system not in LATENT_KL_PPO_SYSTEMS:
+                latent_kl_coef = args.latent_kl_coef[0]
             jobs.append(
                 Job(
                     env=env,
@@ -825,6 +851,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_minibatches=num_minibatches,
                     clip_eps=clip_eps,
                     clip_value_loss=clip_value_loss,
+                    latent_kl_coef=latent_kl_coef,
                     use_layer_norm=use_layer_norm,
                     use_input_layer_norm=use_input_layer_norm,
                     num_layers=num_layers,
@@ -998,6 +1025,14 @@ def main() -> None:
     parser.add_argument("--num-minibatches", default="16", help="Comma-separated system.num_minibatches values (PPO only).")
     parser.add_argument("--clip-eps", default="0.2", help="Comma-separated system.clip_eps values (PPO only).")
     parser.add_argument("--clip-value-loss", default="true", help="Comma-separated bools (PPO only).")
+    parser.add_argument(
+        "--latent-kl-coef",
+        default="0.0",
+        help="Comma-separated system.latent_kl_coef values - optional trust-region penalty on "
+        "how far the actor torso's per-step latent 'thought' states may drift across a PPO "
+        "update (0.0 disables it, see ff_ppo.py's module docstring). ff_ppo.py's own systems "
+        "only (LATENT_KL_PPO_SYSTEMS), not ff_ppo_explicit_*.",
+    )
     parser.add_argument("--use-layer-norm", default="false", help="Comma-separated bools (mlp/cnn+mlp only).")
     parser.add_argument("--use-input-layer-norm", default="false", help="Comma-separated bools.")
     parser.add_argument("--num-layers", default="1", help="Comma-separated ints - sub-layers per pondering step.")
@@ -1104,6 +1139,7 @@ def main() -> None:
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
     args.clip_value_loss = [x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")]
+    args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
@@ -1179,6 +1215,10 @@ def main() -> None:
     )
     print(f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef}")
     print(f"  actor_weight_decay={args.actor_weight_decay} critic_weight_decay={args.critic_weight_decay}")
+    print(
+        f"  latent_kl_coef={args.latent_kl_coef} "
+        f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
+    )
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
     print(f"  knapsack_num_items={args.knapsack_num_items} knapsack_total_budget={args.knapsack_total_budget}")

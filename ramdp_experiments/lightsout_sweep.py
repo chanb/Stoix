@@ -104,6 +104,13 @@ Grid axes:
                  (Q - V or G - V, depending on qac_variant) is standardized
                  (zero mean, unit variance) across the rollout before being used
                  in the PPO clipped surrogate. ff_ppo_* systems only, see epochs.
+  - latent_kl_coef: system.latent_kl_coef - optional trust-region penalty on how far
+                 the actor torso's per-step latent "thought" states may drift across a
+                 PPO update (0.0 disables it) - see ff_ppo.py's module docstring. Only
+                 applies to ff_ppo.py's own systems (ff_ppo_fac/ff_ppo_naive/
+                 ff_ppo_cond_naive/ff_ppo_cond_fac/ff_ppo_reinforce, i.e.
+                 LATENT_KL_PPO_SYSTEMS) - not the ff_ppo_explicit_* systems, whose
+                 discrete-token "thoughts" have no such continuous-state knob.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
                  cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
@@ -290,6 +297,18 @@ EXPLICIT_COT_PPO_SYSTEMS = (
     "ff_ppo_explicit_cond_fac",
     "ff_ppo_explicit_reinforce",
 )
+# PPO_SYSTEMS minus EXPLICIT_COT_PPO_SYSTEMS: the systems trained by
+# ff_ppo.py (implicit/latent CoT) rather than ff_ppo_explicit_cot.py. Only
+# these have a system.latent_kl_coef knob (see stoix/configs/system/ramdp_vpg/
+# ff_ppo.yaml) - an optional trust-region penalty on how far the actor
+# torso's per-step "thought" states (a continuous latent, unlike explicit
+# CoT's discrete tokens) are allowed to drift across a PPO update; see
+# ff_ppo.py's module docstring. ff_ppo_explicit_cot.py's system config has no
+# such knob (its "thoughts" are discrete tokens, already covered by its own
+# per-token PPO clip), so --latent-kl-coef is forced to its first value (and
+# omitted from the command) for EXPLICIT_COT_PPO_SYSTEMS, same as every
+# non-PPO system - see build_grid()/Job.command().
+LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_PPO_SYSTEMS)
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
@@ -429,6 +448,7 @@ class Job:
     num_minibatches: int
     clip_eps: float
     clip_value_loss: bool
+    latent_kl_coef: float
     standardize_advantages: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
@@ -505,6 +525,8 @@ class Job:
         extra = []
         if self.delightful:
             extra.append(f"deta{self.delightful_eta:g}")
+        if self.latent_kl_coef:
+            extra.append(f"lkl{self.latent_kl_coef:g}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}")
         if self.critic_weight_decay:
@@ -583,6 +605,10 @@ class Job:
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
             cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
+            if self.system in LATENT_KL_PPO_SYSTEMS:
+                # Latent trust-region penalty - ff_ppo.py (implicit CoT)
+                # only, see LATENT_KL_PPO_SYSTEMS.
+                cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
@@ -826,6 +852,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         ent_coef,
         (delightful, delightful_eta),
         (epochs, num_minibatches, clip_eps, clip_value_loss, standardize_advantages),
+        latent_kl_coef,
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -839,6 +866,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.ent_coef,
         delightful_combos,
         ppo_combos,
+        args.latent_kl_coef,
         range(args.seeds),
     ):
         # Neither axis applies to both kinds of system at once (see
@@ -850,6 +878,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             epochs, num_minibatches, clip_eps, clip_value_loss, standardize_advantages = (
                 ppo_combos[0]
             )
+        # latent_kl_coef only exists on ff_ppo.py's own systems
+        # (LATENT_KL_PPO_SYSTEMS) - forced to the first requested value for
+        # every other system (including explicit-CoT PPO systems), same
+        # collapsing pattern as delightful/ppo_combos above.
+        if system not in LATENT_KL_PPO_SYSTEMS:
+            latent_kl_coef = args.latent_kl_coef[0]
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         jobs.append(
@@ -871,6 +905,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches=num_minibatches,
                 clip_eps=clip_eps,
                 clip_value_loss=clip_value_loss,
+                latent_kl_coef=latent_kl_coef,
                 standardize_advantages=standardize_advantages,
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
@@ -1114,6 +1149,18 @@ def main() -> None:
         "--clip-eps/--clip-value-loss. PPO systems only, see --epochs.",
     )
     parser.add_argument(
+        "--latent-kl-coef",
+        default="0.0",
+        help="Comma-separated system.latent_kl_coef values - an optional trust-region penalty on "
+        "how far the actor torso's per-step latent 'thought' states may drift across a PPO "
+        "update, on top of the existing per-step halting-log-prob clip (which only bounds the "
+        "halting decision, not the continuous states themselves). Interpretable as 1/(2*sigma^2) "
+        "of an isotropic Gaussian centered at each step's state - see ff_ppo.py's module "
+        "docstring. 0.0 (default) disables it. Swept independently of the other PPO axes. Only "
+        "applies to ff_ppo.py's own systems (LATENT_KL_PPO_SYSTEMS, i.e. PPO_SYSTEMS minus "
+        "EXPLICIT_COT_PPO_SYSTEMS) - forced to the first value for every other system.",
+    )
+    parser.add_argument(
         "--use-layer-norm",
         default="false",
         help="Comma-separated bools (true/false) - LayerNorm inside AdaptiveComputationTimeTorso's "
@@ -1288,6 +1335,7 @@ def main() -> None:
     args.standardize_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
     ]
+    args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
@@ -1384,6 +1432,10 @@ def main() -> None:
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
         f"clip_value_loss={args.clip_value_loss} standardize_advantages={args.standardize_advantages} "
         f"(PPO systems only: {PPO_SYSTEMS})"
+    )
+    print(
+        f"  latent_kl_coef={args.latent_kl_coef} "
+        f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
     )
     print(
         f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "
