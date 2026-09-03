@@ -419,6 +419,11 @@ def get_learner_fn(
                     axis_name="device",
                 )
 
+                # Norm of the gradient actually applied by the optimizer,
+                # i.e. after averaging but before clipping.
+                actor_loss_info["actor_grad_norm"] = optax.global_norm(actor_grads)
+                critic_loss_info["critic_grad_norm"] = optax.global_norm(critic_grads)
+
                 actor_updates, actor_new_opt_state = actor_update_fn(
                     actor_grads, opt_states.actor_opt_state, params.actor_params
                 )
@@ -431,6 +436,9 @@ def get_learner_fn(
 
                 new_params = ActorCriticParams(actor_new_params, critic_new_params)
                 new_opt_state = ActorCriticOptStates(actor_new_opt_state, critic_new_opt_state)
+
+                actor_loss_info["actor_param_norm"] = optax.global_norm(actor_new_params)
+                critic_loss_info["critic_param_norm"] = optax.global_norm(critic_new_params)
 
                 loss_info = {
                     **actor_loss_info,

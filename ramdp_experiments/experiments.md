@@ -229,7 +229,7 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 
 # Check architecture with budget of 8
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 8 --seeds 3 --architectures transformer --hidden-dim 16 --mlp-dim 16,32 --num-layers 2,4 --num-heads 2,4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 2 --gpus 6,7 --no-skip-existing --ent-coef 0.0001 --yes
-# tmux attach -t2: running, gpus 6 7
+# tmux attach -t2: CANCELLED, gpus 6 7
 
 
 # EXPLICIT CoT
@@ -237,14 +237,14 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explic
 # tmux attach -t1: DONE, gpus 4 5
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 16 --mlp-dim 16,32 --num-layers 2,4 --num-heads 2,4 --vocab-size=2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 3 --gpus 0,1 --no-skip-existing --ent-coef 0.0001 --yes
-# tmux attach -t0: running, gpus 0 1
+# tmux attach -t0: CANCELLED, gpus 0 1
 
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 16 --mlp-dim 16,32 --num-layers 2,4 --num-heads 2,4 --vocab-size=4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 3 --gpus 2,3 --no-skip-existing --ent-coef 0.0001 --yes
-# tmux attach -t8: PENDING, gpus 2 3
+# tmux attach -t8: CANCELLED, gpus 2 3
 
 python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 8 --seeds 3 --architectures transformer_explicit_cot --hidden-dim 16 --mlp-dim 16,32 --num-layers 2,4 --num-heads 2,4 --vocab-size=8 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --use-latent-feedback false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_2-architecture_search --runs-per-gpu 3 --gpus 4,5 --no-skip-existing --ent-coef 0.0001 --yes
-# tmux attach -t1: PENDING, gpus 4 5
+# tmux attach -t1: CANCELLED, gpus 4 5
 ```
 
 
@@ -252,12 +252,29 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explic
 - It seems like when `hidden-dim=16`, the performances with `c=1` is around 0.55 (worse than `hidden-dim=32`)
 - Unfortunately it seems like for `c=8` this is significantly worse as well.
 - Idea: Use 4x4 grid, add weight decay (this also encourages grokking)
+  - Weight decay = 0.1 is too strong, 0.05 has a visible effect already
 
 ```
 # IMPLICIT CoT
-# Check architecture with budget of 1
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 4x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-4x4_weight_decay_search --runs-per-gpu 6 --gpus 0,1 --no-skip-existing --ent-coef 0.001 --vulcan --actor-weight-decay 0.0,0.1,0.01
+#### Check architecture with budget of 1
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x4_weight_decay_search --runs-per-gpu 3 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.0,0.1,0.01
+# tmux attach -t0: done, gpus 0 1 2
 
-# Check architecture with budget of 8
-python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 8 --seeds 3 --architectures transformer --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 4x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-4x4_weight_decay_search --runs-per-gpu 4 --gpus 0 --no-skip-existing --ent-coef 0.0001 --vulcan --actor-weight-decay 0.0,0.1,0.01
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x4_weight_decay_search --runs-per-gpu 3 --gpus 6,7 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.02,0.05
+# tmux attach -t2: done, gpus 6 7
+
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x4_weight_decay_search --runs-per-gpu 3 --gpus 6,7 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.0,0.01
+# tmux attach -t2: running, gpus 6 7
+
+
+#### Check architecture with budget of 2
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x4_weight_decay_search --runs-per-gpu 3 --gpus 0,1,2 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.0,0.1,0.01
+# tmux attach -t0: running, gpus 0 1 2
+
+
+
+#### Check architecture with budget of 8
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 4 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 8 --num-minibatches 16 --grid-sizes 5x4 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x4_weight_decay_search --runs-per-gpu 3 --gpus 3,4,5 --no-skip-existing --ent-coef 0.0001 --actor-weight-decay 0.0,0.1,0.01
+# tmux attach -t1: running, gpus 3 4 5
 ```
