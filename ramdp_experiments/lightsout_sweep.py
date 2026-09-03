@@ -204,6 +204,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import queue
@@ -428,6 +429,42 @@ ARCH_SHORT_TAG = {
     EXPLICIT_COT_ARCH: "TF-eCoT",
 }
 
+# W&B's "group" field (and, in practice, run IDs) are capped at 128
+# characters - Job.group_tag_parts enforces this (with room held back for
+# run_name's "-seed_N" suffix, see _SEED_SUFFIX_RESERVE), rather than
+# leaving it to come out under the limit by luck: a handful of extra flags
+# (weight decay, delightful, latent_kl_coef, ...) stacked on top of a
+# transformer/explicit-CoT run's already-long net/ppo segments can push the
+# un-capped tag past 128.
+MAX_GROUP_TAG_LEN = 128
+_SEED_SUFFIX_RESERVE = len("-seed_9999")  # generous - --seeds never gets near 4 digits
+
+
+def _cap_tag_length(parts: List[str], max_len: int) -> List[str]:
+    """Cap the "-"-joined (equivalently "_"-joined, same length) length of
+    `parts` at `max_len` chars, keeping as many whole leading parts (env,
+    system/arch, budget, network/PPO hparams - the parts most useful for
+    identifying a run at a glance) as fit, then replacing everything after
+    that with a single short hash of the *full*, untruncated tag - so two
+    configs that would otherwise collide after truncation (e.g. differing
+    only in a dropped trailing flag) still get distinct group tags/run names
+    (needed for the run_name dedup in build_grid(), and to avoid two jobs
+    silently writing to the same output directory)."""
+    full = "-".join(parts)
+    if len(full) <= max_len:
+        return parts
+    digest = hashlib.sha1(full.encode()).hexdigest()[:8]
+    kept: List[str] = []
+    length = 0
+    for part in parts:
+        added = len(part) + (1 if kept else 0)  # +1 for the joining separator
+        if length + added + 1 + len(digest) > max_len:  # +1 for the separator before digest
+            break
+        kept.append(part)
+        length += added
+    kept.append(digest)
+    return kept
+
 
 @dataclass
 class Job:
@@ -489,7 +526,9 @@ class Job:
         iln/stdadv) rather than run_name's full field names, and
         ARCH_SHORT_TAG/expl/reinf abbreviations, since W&B's group field (the
         parts joined by "_", see WandBLogger) gets unwieldy at run_name's
-        length otherwise."""
+        length otherwise. Capped at MAX_GROUP_TAG_LEN (see _cap_tag_length)
+        so a config with several optional flags set at once can't silently
+        exceed W&B's 128-char group-field limit."""
         system_short = self.system.removeprefix("ff_").replace("explicit", "expl").replace(
             "reinforce", "reinf"
         )
@@ -540,7 +579,7 @@ class Job:
         if extra:
             parts.append("-".join(extra))
 
-        return parts
+        return _cap_tag_length(parts, MAX_GROUP_TAG_LEN - _SEED_SUFFIX_RESERVE)
 
     @property
     def group_tag(self) -> str:
