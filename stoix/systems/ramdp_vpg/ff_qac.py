@@ -337,12 +337,12 @@ def get_learner_fn(
         )
 
         actor_updates, actor_new_opt_state = actor_update_fn(
-            actor_grads, opt_states.actor_opt_state
+            actor_grads, opt_states.actor_opt_state, params.actor_params
         )
         actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
         critic_updates, critic_new_opt_state = critic_update_fn(
-            critic_grads, opt_states.critic_opt_state
+            critic_grads, opt_states.critic_opt_state, params.critic_params
         )
         critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
 
