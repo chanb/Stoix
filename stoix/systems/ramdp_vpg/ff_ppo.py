@@ -66,6 +66,36 @@ has no such fixed baseline to preserve - both G and V are outputs of the one
 critic being trained, so both are refreshed together each epoch and the
 advantage is `targets - new_value` throughout.
 
+`config.system.critic_before_actor` (default `False`) replaces the joint
+per-minibatch actor+critic update above with two fully sequential phases:
+`config.system.epochs` epochs of critic-only minibatch updates (actor
+params/opt_state untouched), followed by `config.system.epochs` epochs of
+actor-only minibatch updates (critic params/opt_state untouched) - i.e.
+
+    for each epoch: for each minibatch: update critic
+    for each epoch: for each minibatch: update actor
+
+instead of updating both networks together in every minibatch. This targets
+the cold-start failure mode where the Q-V variants' advantage is
+`Q(s,a,c) - V(s)` with both freshly initialised: until the critic has
+learned to differentiate actions, that advantage is ~0 everywhere, so the
+actor gets essentially no gradient (near-max entropy, near-zero
+`actor_grad_norm`) for a long stretch of training. Training the critic to
+(approximate) convergence first, then handing the actor a properly
+differentiated advantage, is meant to shorten or remove that dead zone.
+Regardless of `config.system.recompute_advantages`, `advantages`/`targets`
+are always refreshed once from the fully-trained critic params at the
+boundary between the two phases, right before the actor-only phase starts -
+otherwise the actor would train against the same stale, rollout-time
+advantage the critic phase was specifically meant to improve on.
+`recompute_advantages` still independently controls whether `targets` (and,
+harmlessly, `advantages`) are also refreshed epoch-to-epoch *within* the
+critic-only phase; the actor-only phase never recomputes either, since the
+critic is frozen by then and doing so would be a no-op. Doubles the number
+of gradient-epoch passes over each rollout relative to the joint default
+(`epochs` for the critic, then another `epochs` for the actor), so it costs
+roughly 2x the per-rollout update compute when enabled.
+
 Whichever variant, PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is
 applied *per decision*, not once over the joint trajectory: the environment
 action gets its own ratio/clip (`env_log_prob` vs. its rollout-time value),
@@ -391,6 +421,295 @@ def get_learner_fn(
         if config.system.standardize_advantages:
             advantages = jax.nn.standardize(advantages, axis=(0, 1))
 
+        # --- config.system.critic_before_actor machinery (see module
+        # docstring) - `_actor_loss_fn`/`_critic_loss_fn` below are exact
+        # copies of the ones nested inside the joint `_update_minibatch`
+        # further down, hoisted to this scope so both the sequential path
+        # here and the joint path below can each use their own copy without
+        # the two paths depending on one another. ---
+
+        def _actor_loss_fn(
+            actor_params: FrozenDict,
+            traj_batch: PPOTransition,
+            advantage: chex.Array,
+        ) -> Tuple:
+            """Calculate the actor loss (see the identical copy nested in
+            the joint `_update_minibatch` below for the full explanation)."""
+            actor_policy, _, new_latent_states, halting_log_prob = actor_apply_fn(
+                actor_params,
+                traj_batch.obs,
+                torso_kwargs={"target_compute_time": traj_batch.compute_time},
+            )
+            env_log_prob = actor_policy.log_prob(traj_batch.action)
+
+            action_loss = ppo_clip_loss(
+                env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
+            )
+            action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
+            action_clip_fraction = jnp.mean(
+                (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
+            )
+            entropy = actor_policy.entropy().mean()
+
+            step_idx = jnp.arange(max_steps)
+            valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(jnp.float32)
+            num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
+
+            halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
+            advantage_per_step = advantage[..., None]
+            halting_surrogate1 = halting_ratio * advantage_per_step
+            halting_surrogate2 = (
+                jnp.clip(
+                    halting_ratio, 1.0 - config.system.clip_eps, 1.0 + config.system.clip_eps
+                )
+                * advantage_per_step
+            )
+            halting_loss = (
+                jnp.sum(-jnp.minimum(halting_surrogate1, halting_surrogate2) * valid_step)
+                / num_valid_steps
+            )
+            halting_clip_fraction = (
+                jnp.sum(
+                    (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
+                    * valid_step
+                )
+                / num_valid_steps
+            )
+
+            loss_actor = action_loss + halting_loss
+
+            sq_dist = jnp.sum(
+                (new_latent_states - traj_batch.old_latent_states) ** 2, axis=-1
+            )
+            latent_kl_penalty = jnp.sum(sq_dist * valid_step) / num_valid_steps
+
+            total_loss_actor = (
+                loss_actor
+                - config.system.ent_coef * entropy
+                + config.system.latent_kl_coef * latent_kl_penalty
+            )
+            loss_info = {
+                "actor_loss": loss_actor,
+                "action_loss": action_loss,
+                "halting_loss": halting_loss,
+                "entropy": entropy,
+                "advantages": advantage,
+                "compute_time": traj_batch.compute_time,
+                "first_convergence_step": traj_batch.first_convergence_step,
+                "num_close_steps": traj_batch.num_close_steps,
+                "action_clip_fraction": action_clip_fraction,
+                "halting_clip_fraction": halting_clip_fraction,
+                "latent_kl_penalty": latent_kl_penalty,
+            }
+            return total_loss_actor, loss_info
+
+        def _critic_loss_fn(
+            critic_params: FrozenDict,
+            traj_batch: PPOTransition,
+            targets: chex.Array,
+        ) -> Tuple:
+            """Calculate the critic loss (see the identical copy nested in
+            the joint `_update_minibatch` below for the full explanation)."""
+            if is_qac:
+                value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
+                value_loss = _value_loss_fn(value, traj_batch.value, targets)
+
+                q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
+                if qac_variant == "fac":
+                    q_pred = jnp.take_along_axis(
+                        q_output, traj_batch.action[..., jnp.newaxis], axis=-1
+                    ).squeeze(-1)
+                    q_targets = targets / config.system.gamma ** (traj_batch.compute_time - 1)
+                else:  # "naive", "cond_naive", "cond_fac"
+                    q_pred = _q_at_action_and_compute_time(
+                        q_output, traj_batch.action, traj_batch.compute_time
+                    )
+                    q_targets = targets
+                q_loss = _value_loss_fn(q_pred, traj_batch.q_value, q_targets)
+
+                critic_total_loss = config.system.vf_coef * (value_loss + q_loss)
+                loss_info = {"value_loss": value_loss, "q_loss": q_loss}
+            else:  # "reinforce"
+                value = critic_apply_fn(critic_params, traj_batch.obs)
+                value_loss = _value_loss_fn(value, traj_batch.value, targets)
+
+                critic_total_loss = config.system.vf_coef * value_loss
+                loss_info = {"value_loss": value_loss}
+            return critic_total_loss, loss_info
+
+        def _apply_actor_update(
+            params: ActorCriticParams,
+            opt_states: ActorCriticOptStates,
+            traj_batch: PPOTransition,
+            advantage: chex.Array,
+        ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
+            """Actor-only minibatch update - critic params/opt_state pass
+            through unchanged."""
+            actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
+            actor_grads, actor_loss_info = actor_grad_fn(
+                params.actor_params, traj_batch, advantage
+            )
+            actor_grads, actor_loss_info = jax.lax.pmean(
+                (actor_grads, actor_loss_info), axis_name="batch"
+            )
+            actor_grads, actor_loss_info = jax.lax.pmean(
+                (actor_grads, actor_loss_info), axis_name="device"
+            )
+            actor_loss_info["actor_grad_norm"] = optax.global_norm(actor_grads)
+
+            actor_updates, actor_new_opt_state = actor_update_fn(
+                actor_grads, opt_states.actor_opt_state, params.actor_params
+            )
+            actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+            actor_loss_info["actor_param_norm"] = optax.global_norm(actor_new_params)
+
+            new_params = ActorCriticParams(actor_new_params, params.critic_params)
+            new_opt_state = ActorCriticOptStates(actor_new_opt_state, opt_states.critic_opt_state)
+            return new_params, new_opt_state, actor_loss_info
+
+        def _apply_critic_update(
+            params: ActorCriticParams,
+            opt_states: ActorCriticOptStates,
+            traj_batch: PPOTransition,
+            targets: chex.Array,
+        ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
+            """Critic-only minibatch update - actor params/opt_state pass
+            through unchanged."""
+            critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
+            critic_grads, critic_loss_info = critic_grad_fn(
+                params.critic_params, traj_batch, targets
+            )
+            critic_grads, critic_loss_info = jax.lax.pmean(
+                (critic_grads, critic_loss_info), axis_name="batch"
+            )
+            critic_grads, critic_loss_info = jax.lax.pmean(
+                (critic_grads, critic_loss_info), axis_name="device"
+            )
+            critic_loss_info["critic_grad_norm"] = optax.global_norm(critic_grads)
+
+            critic_updates, critic_new_opt_state = critic_update_fn(
+                critic_grads, opt_states.critic_opt_state, params.critic_params
+            )
+            critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
+            critic_loss_info["critic_param_norm"] = optax.global_norm(critic_new_params)
+
+            new_params = ActorCriticParams(params.actor_params, critic_new_params)
+            new_opt_state = ActorCriticOptStates(opt_states.actor_opt_state, critic_new_opt_state)
+            return new_params, new_opt_state, critic_loss_info
+
+        def _refresh_targets_and_advantages(
+            critic_params: FrozenDict,
+        ) -> Tuple[chex.Array, chex.Array]:
+            """Recompute `targets`/`advantages` from `critic_params`,
+            mirroring the joint path's `recompute_advantages` refresh
+            further down. Used by `critic_before_actor`'s critic-only epochs
+            (gated by `recompute_advantages`, as usual) and, unconditionally,
+            once at the critic-to-actor phase boundary - see module
+            docstring."""
+            if is_qac:
+                new_value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
+                new_last_val = critic_apply_fn(
+                    critic_params, last_timestep.observation, method="value"
+                )
+            else:  # "reinforce"
+                new_value = critic_apply_fn(critic_params, traj_batch.obs)
+                new_last_val = critic_apply_fn(critic_params, last_timestep.observation)
+
+            v_t = jnp.concatenate([new_value, new_last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
+            refreshed_targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+
+            if is_qac:
+                q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
+                q_value = _q_at_action_and_compute_time(
+                    q_output, traj_batch.action, traj_batch.compute_time
+                )
+                refreshed_advantages = q_value - traj_batch.value
+            else:  # "reinforce"
+                refreshed_advantages = refreshed_targets - new_value
+
+            if config.system.standardize_advantages:
+                refreshed_advantages = jax.nn.standardize(refreshed_advantages, axis=(0, 1))
+            return refreshed_targets, refreshed_advantages
+
+        def _update_minibatch_critic_only(train_state: Tuple, batch_info: Tuple) -> Tuple:
+            """`critic_before_actor`'s critic-only minibatch step."""
+            params, opt_states = train_state
+            mb_traj_batch, mb_targets = batch_info
+            params, opt_states, critic_loss_info = _apply_critic_update(
+                params, opt_states, mb_traj_batch, mb_targets
+            )
+            return (params, opt_states), critic_loss_info
+
+        def _update_minibatch_actor_only(train_state: Tuple, batch_info: Tuple) -> Tuple:
+            """`critic_before_actor`'s actor-only minibatch step."""
+            params, opt_states = train_state
+            mb_traj_batch, mb_advantages = batch_info
+            params, opt_states, actor_loss_info = _apply_actor_update(
+                params, opt_states, mb_traj_batch, mb_advantages
+            )
+            return (params, opt_states), actor_loss_info
+
+        def _update_epoch_critic_only(update_state: Tuple, _: Any) -> Tuple:
+            """`critic_before_actor`'s critic-only epoch: one full shuffled
+            pass over the rollout's minibatches, critic params only."""
+            params, opt_states, epoch_traj_batch, epoch_targets, key = update_state
+            key, shuffle_key = jax.random.split(key)
+
+            batch_size = config.system.rollout_length * config.arch.num_envs
+            permutation = jax.random.permutation(shuffle_key, batch_size)
+            batch = (epoch_traj_batch, epoch_targets)
+            batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
+            shuffled_batch = jax.tree_util.tree_map(
+                lambda x: jnp.take(x, permutation, axis=0), batch
+            )
+            minibatches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, [config.system.num_minibatches, -1] + list(x.shape[1:])),
+                shuffled_batch,
+            )
+
+            (params, opt_states), loss_info = jax.lax.scan(
+                _update_minibatch_critic_only, (params, opt_states), minibatches
+            )
+
+            if config.system.recompute_advantages:
+                # Mirrors the joint path's per-epoch refresh further down -
+                # only `targets` actually feeds the critic loss here;
+                # `advantages` is unused until the actor-only phase but
+                # cheap/harmless to keep refreshed too, for consistency.
+                epoch_targets, _ = _refresh_targets_and_advantages(params.critic_params)
+
+            update_state = (params, opt_states, epoch_traj_batch, epoch_targets, key)
+            return update_state, loss_info
+
+        def _update_epoch_actor_only(update_state: Tuple, _: Any) -> Tuple:
+            """`critic_before_actor`'s actor-only epoch: one full shuffled
+            pass over the rollout's minibatches, actor params only. No
+            recompute here - the critic is frozen through this phase, so
+            `advantages` would not change even if refreshed."""
+            params, opt_states, epoch_traj_batch, epoch_advantages, key = update_state
+            key, shuffle_key = jax.random.split(key)
+
+            batch_size = config.system.rollout_length * config.arch.num_envs
+            permutation = jax.random.permutation(shuffle_key, batch_size)
+            batch = (epoch_traj_batch, epoch_advantages)
+            batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
+            shuffled_batch = jax.tree_util.tree_map(
+                lambda x: jnp.take(x, permutation, axis=0), batch
+            )
+            minibatches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, [config.system.num_minibatches, -1] + list(x.shape[1:])),
+                shuffled_batch,
+            )
+
+            (params, opt_states), loss_info = jax.lax.scan(
+                _update_minibatch_actor_only, (params, opt_states), minibatches
+            )
+
+            update_state = (params, opt_states, epoch_traj_batch, epoch_advantages, key)
+            return update_state, loss_info
+
+        # --- end config.system.critic_before_actor machinery ---
+
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
             """Update the network for a single epoch."""
 
@@ -715,20 +1034,49 @@ def get_learner_fn(
             )
             return update_state, loss_info
 
-        update_state = (
-            params,
-            opt_states,
-            traj_batch,
-            advantages,
-            targets,
-            key,
-        )
+        if config.system.critic_before_actor:
+            # Phase 1: `epochs` epochs of critic-only updates (see module
+            # docstring). `advantages` isn't threaded through here - unused
+            # until the actor-only phase.
+            critic_update_state = (params, opt_states, traj_batch, targets, key)
+            critic_update_state, critic_loss_info = jax.lax.scan(
+                _update_epoch_critic_only, critic_update_state, None, config.system.epochs
+            )
+            params, opt_states, traj_batch, targets, key = critic_update_state
 
-        update_state, loss_info = jax.lax.scan(
-            _update_epoch, update_state, None, config.system.epochs
-        )
+            # Unconditional refresh at the phase boundary, regardless of
+            # `recompute_advantages`: the actor-only phase must see an
+            # advantage informed by the now-trained critic, not the stale
+            # rollout-time one - otherwise this option would do nothing for
+            # the actor. See module docstring.
+            targets, advantages = _refresh_targets_and_advantages(params.critic_params)
 
-        params, opt_states, traj_batch, advantages, targets, key = update_state
+            # Phase 2: `epochs` epochs of actor-only updates against that
+            # fixed advantage - the critic no longer moves, so there is
+            # nothing to recompute epoch-to-epoch here.
+            actor_update_state = (params, opt_states, traj_batch, advantages, key)
+            actor_update_state, actor_loss_info = jax.lax.scan(
+                _update_epoch_actor_only, actor_update_state, None, config.system.epochs
+            )
+            params, opt_states, traj_batch, advantages, key = actor_update_state
+
+            loss_info = {**critic_loss_info, **actor_loss_info}
+        else:
+            update_state = (
+                params,
+                opt_states,
+                traj_batch,
+                advantages,
+                targets,
+                key,
+            )
+
+            update_state, loss_info = jax.lax.scan(
+                _update_epoch, update_state, None, config.system.epochs
+            )
+
+            params, opt_states, traj_batch, advantages, targets, key = update_state
+
         learner_state = RamdpOnPolicyLearnerState(
             params,
             opt_states,

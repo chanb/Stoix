@@ -31,7 +31,8 @@ max_steps replacing budget - see that script's docstring for the full
 system/architecture/PPO-knob/env-difficulty-knob descriptions):
   - env, <env>-specific difficulty knobs, system, architecture, hidden_dim,
     lr, critic_lr, delightful, delightful_eta, epochs, num_minibatches,
-    clip_eps, clip_value_loss, recompute_advantages, use_layer_norm, use_input_layer_norm,
+    clip_eps, clip_value_loss, recompute_advantages, critic_before_actor, use_layer_norm,
+    use_input_layer_norm,
     num_layers, num_heads, mlp_dim, vocab_size, use_latent_feedback, seed: identical semantics to
     jumanji_fixed_budget_sweep.py, including its five ff_ppo_explicit_*
     systems and its transformer_explicit_cot/cnn+transformer_explicit_cot
@@ -495,6 +496,7 @@ class Job:
     clip_value_loss: bool
     latent_kl_coef: float
     recompute_advantages: bool
+    critic_before_actor: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -552,6 +554,8 @@ class Job:
                 ppo += "-l2c"
             if self.recompute_advantages:
                 ppo += "-radv"
+            if self.critic_before_actor:
+                ppo += "-cba"
             parts.append(ppo)
 
         extra = []
@@ -633,6 +637,7 @@ class Job:
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
+            cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
             if self.system in LATENT_KL_PPO_SYSTEMS:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
@@ -727,6 +732,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.clip_eps,
             args.clip_value_loss,
             args.recompute_advantages,
+            args.critic_before_actor,
         )
     )
 
@@ -854,7 +860,14 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             critic_weight_decay,
             ent_coef,
             (delightful, delightful_eta),
-            (epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages),
+            (
+                epochs,
+                num_minibatches,
+                clip_eps,
+                clip_value_loss,
+                recompute_advantages,
+                critic_before_actor,
+            ),
             latent_kl_coef,
             seed,
         ) in itertools.product(
@@ -878,9 +891,14 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             if system in PPO_SYSTEMS:
                 delightful, delightful_eta = False, args.delightful_eta[0]
             else:
-                epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages = (
-                    ppo_combos[0]
-                )
+                (
+                    epochs,
+                    num_minibatches,
+                    clip_eps,
+                    clip_value_loss,
+                    recompute_advantages,
+                    critic_before_actor,
+                ) = ppo_combos[0]
             # latent_kl_coef only exists on ff_ppo.py's own systems
             # (LATENT_KL_PPO_SYSTEMS) - forced to the first requested value
             # for every other system (including explicit-CoT PPO systems).
@@ -908,6 +926,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     clip_value_loss=clip_value_loss,
                     latent_kl_coef=latent_kl_coef,
                     recompute_advantages=recompute_advantages,
+                    critic_before_actor=critic_before_actor,
                     use_layer_norm=use_layer_norm,
                     use_input_layer_norm=use_input_layer_norm,
                     num_layers=num_layers,
@@ -1091,6 +1110,14 @@ def main() -> None:
         "the default). PPO systems only.",
     )
     parser.add_argument(
+        "--critic-before-actor",
+        default="false",
+        help="Comma-separated bools (true/false) - system.critic_before_actor: replaces the "
+        "joint per-minibatch actor+critic update with two fully sequential phases, `epochs` "
+        "epochs of critic-only updates followed by `epochs` epochs of actor-only updates - see "
+        "ff_ppo.py's module docstring. PPO systems only.",
+    )
+    parser.add_argument(
         "--latent-kl-coef",
         default="0.0",
         help="Comma-separated system.latent_kl_coef values - optional trust-region penalty on "
@@ -1206,6 +1233,9 @@ def main() -> None:
     args.clip_value_loss = [x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")]
     args.recompute_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.recompute_advantages.split(",")
+    ]
+    args.critic_before_actor = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]

@@ -57,5 +57,10 @@ recompute_advantages: False # Whether the advantage's "what changed" term (Q(s,a
   # (vanilla-PPO style, the default here). False also skips the extra critic forward passes
   # that only feed this refresh, saving compute.
 standardize_advantages: False # Whether to standardize the advantages.
+critic_before_actor: False # Whether to replace the joint per-minibatch actor+critic
+  # update with two fully sequential phases: `epochs` epochs of critic-only minibatch
+  # updates, followed by `epochs` epochs of actor-only minibatch updates - instead of
+  # updating both networks together in every minibatch. See ff_ppo.py's module
+  # docstring. Roughly doubles the per-rollout update compute when enabled.
 max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
 decay_learning_rates: False # Whether learning rates should be linearly decayed during training.

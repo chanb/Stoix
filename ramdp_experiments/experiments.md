@@ -356,11 +356,13 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
     - Running 797795_[1] on vulcan with larger model + try smaller critic LR (1e-5)
       - Smaller critic LR just learns too slow
   - Try 2 layers: 797917
+    - It learns now, but unfortunately performance is poorer than G - V
   
 
-- Somewhat a similar story for IRU, 5x4 is a good spot. The increasing budget -> increasing performance trend is there however.
+- For unshared IRU, somewhat a similar story for IRU, 5x4 is a good spot. The increasing budget -> increasing performance trend is there however.
   - Q - V is still worse than G - V. In 5x5 the former never learns
   - Try 2 layers: 797911
+    - Same as shared IRU
 
 - For eCoT,
   - with input layer norm
@@ -390,8 +392,35 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
     - `none`: 798747_1
     - `naive`: 798746_1
     - `fac`: 798745_1
-  - iCoT:
+  - eCoT (vs=32):
     - Fixed budget: 798678_1
     - `none`: 798754_1
     - `naive`: 798751_1
     - `fac`: 798748_1
+  - iCoT:
+    - Fixed budget: 803346_1
+    - `none`: 803339_1
+    - `naive`: 803343_1
+    - `fac`: 803345_1
+
+  - It seems like the Q-function is stalling the learning for naive and fac.
+    - Update critic before policy test: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.01 --recompute-advantages true --yes --critic-before-actor true`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+      - Doesn't seem to impact much arguably even worse...
+    - Smaller actor weight decay: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+      - All performs better, but the trend is still the same as before
+    - Larger critic learning rate: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 5e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.01 --recompute-advantages true --yes --critic-before-actor false`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+      - Worse.
+    - Larger entropy coef: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.005 --gamma 0.999 --actor-weight-decay 0.01 --recompute-advantages true --yes --critic-before-actor false`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+    - Just train for longer: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+    - Just train for longer w/ larger ent coef: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.005 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+    - Just train for longer + standardize advantage: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false --standardize-advantages true`
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
+      - HORRIBLE PERFORMANCE
+    - Just train for longer + standardize advantage + more layers: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 64 --num-layers 1,2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false --standardize-advantages false,true`
+      - tmux attach -t0, RUNNING, gpus 0 .. 7 (salient4)
