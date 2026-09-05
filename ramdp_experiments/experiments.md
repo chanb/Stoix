@@ -381,4 +381,17 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 
 
 - NEW IDEA: We should be recomputing the advantage per epoch, especially for Q - V variants because otherwise the bias is too high in the beginning
-  - TO RUN TONIGHT!!!
+  - Unshared IRU:
+    - ALL: 798656_1
+  - IRU:
+    - ALL: 798663_1
+  - eCoT:
+    - Fixed budget: 798681_1
+    - `none`: 798747_1
+    - `naive`: 798746_1
+    - `fac`: 798745_1
+  - iCoT:
+    - Fixed budget: 798678_1
+    - `none`: 798754_1
+    - `naive`: 798751_1
+    - `fac`: 798748_1
