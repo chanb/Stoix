@@ -81,6 +81,13 @@ Grid axes:
                  or plain L2 regression instead (False, as in ff_reinforce.py/
                  ff_qac.py) - see stoix/systems/ramdp_vpg/ff_ppo.py's module
                  docstring. ff_ppo_* systems only, see epochs.
+  - recompute_advantages: system.recompute_advantages - whether the advantage's
+                 "what changed" term (Q(s,a,c) for the four Q-V variants, V(s) for
+                 "reinforce") and the critic's own regression target are recomputed
+                 at the end of every PPO epoch from that epoch's just-updated critic
+                 params, rather than staying pinned at their rollout-time values for
+                 the whole update (vanilla-PPO style, the default). ff_ppo_* systems
+                 only, see epochs.
   - latent_kl_coef: system.latent_kl_coef - optional trust-region penalty on how far
                  the actor torso's per-step latent "thought" states may drift across a
                  PPO update (0.0 disables it) - see ff_ppo.py's module docstring. Only
@@ -160,6 +167,8 @@ Usage:
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
       --clip-value-loss true,false                       # PPO clipped vs. L2 critic loss
+  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
+      --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
       --architectures mlp                          # compare conditioned Q-V variants, same capacity
   python ramdp_experiments/lightsout_fixed_budget_sweep.py \\
@@ -425,6 +434,7 @@ class Job:
     clip_eps: float
     clip_value_loss: bool
     latent_kl_coef: float
+    recompute_advantages: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -460,7 +470,7 @@ class Job:
         list is for `logger.loggers.wandb.group_tag`, which Neptune stores as
         a real list of tags (see stoix/utils/logger.py) so each axis stays
         independently filterable instead of buried in one long string. Uses
-        short axis prefixes (b/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/iln)
+        short axis prefixes (b/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/iln/radv)
         rather than run_name's full field names, and ARCH_SHORT_TAG/expl/reinf
         abbreviations, since W&B's group field (the parts joined by "_", see
         WandBLogger) gets unwieldy at run_name's length otherwise. Capped at
@@ -491,6 +501,8 @@ class Job:
             ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
+            if self.recompute_advantages:
+                ppo += "-radv"
             parts.append(ppo)
 
         extra = []
@@ -572,6 +584,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             if self.system in LATENT_KL_PPO_SYSTEMS:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
@@ -653,13 +666,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
-    # (epochs, num_minibatches, clip_eps, clip_value_loss) combos: only meaningful
-    # for PPO_SYSTEMS (ff_ppo.py/ff_ppo_explicit_cot.py) - forced to the first
-    # requested value for every other system in the main product loop below, then
-    # deduplicated by run_name, mirroring how delightful_combos/num_heads_options
-    # collapse axes that don't apply.
+    # (epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages)
+    # combos: only meaningful for PPO_SYSTEMS (ff_ppo.py/ff_ppo_explicit_cot.py) -
+    # forced to the first requested value for every other system in the main
+    # product loop below, then deduplicated by run_name, mirroring how
+    # delightful_combos/num_heads_options collapse axes that don't apply.
     ppo_combos = list(
-        itertools.product(args.epochs, args.num_minibatches, args.clip_eps, args.clip_value_loss)
+        itertools.product(
+            args.epochs,
+            args.num_minibatches,
+            args.clip_eps,
+            args.clip_value_loss,
+            args.recompute_advantages,
+        )
     )
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
@@ -774,7 +793,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         critic_weight_decay,
         ent_coef,
         (delightful, delightful_eta),
-        (epochs, num_minibatches, clip_eps, clip_value_loss),
+        (epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages),
         latent_kl_coef,
         seed,
     ) in itertools.product(
@@ -798,7 +817,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         if system in PPO_SYSTEMS:
             delightful, delightful_eta = False, args.delightful_eta[0]
         else:
-            epochs, num_minibatches, clip_eps, clip_value_loss = ppo_combos[0]
+            epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages = (
+                ppo_combos[0]
+            )
         # latent_kl_coef only exists on ff_ppo.py's own systems
         # (LATENT_KL_PPO_SYSTEMS) - forced to the first requested value for
         # every other system (including explicit-CoT PPO systems), same
@@ -826,6 +847,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 clip_eps=clip_eps,
                 clip_value_loss=clip_value_loss,
                 latent_kl_coef=latent_kl_coef,
+                recompute_advantages=recompute_advantages,
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
                 num_layers=num_layers,
@@ -1050,6 +1072,16 @@ def main() -> None:
         "independently of --epochs/--num-minibatches/--clip-eps. PPO systems only, see --epochs.",
     )
     parser.add_argument(
+        "--recompute-advantages",
+        default="false",
+        help="Comma-separated bools (true/false) - system.recompute_advantages: whether the "
+        "advantage's 'what changed' term and the critic's own regression target are recomputed "
+        "at the end of every PPO epoch from that epoch's just-updated critic params, rather than "
+        "staying pinned at their rollout-time values for the whole update (vanilla-PPO style, "
+        "the default). Swept independently of --epochs/--num-minibatches/--clip-eps/"
+        "--clip-value-loss. PPO systems only, see --epochs.",
+    )
+    parser.add_argument(
         "--latent-kl-coef",
         default="0.0",
         help="Comma-separated system.latent_kl_coef values - an optional trust-region penalty on "
@@ -1231,6 +1263,9 @@ def main() -> None:
     args.clip_value_loss = [
         x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")
     ]
+    args.recompute_advantages = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.recompute_advantages.split(",")
+    ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
@@ -1321,7 +1356,8 @@ def main() -> None:
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
-        f"clip_value_loss={args.clip_value_loss} (PPO systems only: {PPO_SYSTEMS})"
+        f"clip_value_loss={args.clip_value_loss} "
+        f"recompute_advantages={args.recompute_advantages} (PPO systems only: {PPO_SYSTEMS})"
     )
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "

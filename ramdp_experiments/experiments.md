@@ -381,3 +381,4 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 
 
 - NEW IDEA: We should be recomputing the advantage per epoch, especially for Q - V variants because otherwise the bias is too high in the beginning
+  - TO RUN TONIGHT!!!

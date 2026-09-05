@@ -103,7 +103,7 @@ script's behavior differs):
     job's grid - see build_grid()).
   - system, architecture, budget, hidden_dim, lr, critic_lr, delightful,
     delightful_eta, epochs, num_minibatches, clip_eps, clip_value_loss,
-    use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim,
+    recompute_advantages, use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim,
     vocab_size, use_latent_feedback, seed: identical semantics to minatar_fixed_budget_sweep.py,
     including its
     five ff_ppo_explicit_* systems (explicit chain-of-thought PPO, trains
@@ -148,6 +148,8 @@ Usage:
       --envs sokoban,slidingtile,maze  # CNN-input sweep (sokoban/slidingtile/maze, via jumanji/*_grid)
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac \\
+      --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs sokoban,slidingtile,maze \\
       --systems ff_ppo_explicit_fac --architectures cnn+transformer_explicit_cot  # CNN-input explicit-CoT sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py \\
@@ -565,6 +567,7 @@ class Job:
     clip_eps: float
     clip_value_loss: bool
     latent_kl_coef: float
+    recompute_advantages: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
     num_layers: int
@@ -620,6 +623,8 @@ class Job:
             ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
+            if self.recompute_advantages:
+                ppo += "-radv"
             parts.append(ppo)
 
         extra = []
@@ -697,6 +702,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             if self.system in LATENT_KL_PPO_SYSTEMS:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
@@ -785,7 +791,13 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
     ppo_combos = list(
-        itertools.product(args.epochs, args.num_minibatches, args.clip_eps, args.clip_value_loss)
+        itertools.product(
+            args.epochs,
+            args.num_minibatches,
+            args.clip_eps,
+            args.clip_value_loss,
+            args.recompute_advantages,
+        )
     )
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
@@ -895,7 +907,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             critic_weight_decay,
             ent_coef,
             (delightful, delightful_eta),
-            (epochs, num_minibatches, clip_eps, clip_value_loss),
+            (epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages),
             latent_kl_coef,
             seed,
         ) in itertools.product(
@@ -919,7 +931,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             if system in PPO_SYSTEMS:
                 delightful, delightful_eta = False, args.delightful_eta[0]
             else:
-                epochs, num_minibatches, clip_eps, clip_value_loss = ppo_combos[0]
+                epochs, num_minibatches, clip_eps, clip_value_loss, recompute_advantages = (
+                    ppo_combos[0]
+                )
             # latent_kl_coef only exists on ff_ppo.py's own systems
             # (LATENT_KL_PPO_SYSTEMS) - forced to the first requested value
             # for every other system (including explicit-CoT PPO systems).
@@ -945,6 +959,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     clip_eps=clip_eps,
                     clip_value_loss=clip_value_loss,
                     latent_kl_coef=latent_kl_coef,
+                    recompute_advantages=recompute_advantages,
                     use_layer_norm=use_layer_norm,
                     use_input_layer_norm=use_input_layer_norm,
                     num_layers=num_layers,
@@ -1109,6 +1124,15 @@ def main() -> None:
     parser.add_argument("--clip-eps", default="0.2", help="Comma-separated system.clip_eps values (PPO only).")
     parser.add_argument("--clip-value-loss", default="true", help="Comma-separated bools (PPO only).")
     parser.add_argument(
+        "--recompute-advantages",
+        default="false",
+        help="Comma-separated bools (true/false) - system.recompute_advantages: whether the "
+        "advantage's 'what changed' term and the critic's own regression target are recomputed "
+        "at the end of every PPO epoch from that epoch's just-updated critic params, rather than "
+        "staying pinned at their rollout-time values for the whole update (vanilla-PPO style, "
+        "the default). PPO systems only.",
+    )
+    parser.add_argument(
         "--latent-kl-coef",
         default="0.0",
         help="Comma-separated system.latent_kl_coef values - optional trust-region penalty on "
@@ -1221,6 +1245,9 @@ def main() -> None:
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
     args.clip_value_loss = [x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")]
+    args.recompute_advantages = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.recompute_advantages.split(",")
+    ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]

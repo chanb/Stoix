@@ -42,6 +42,12 @@ clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"
   # ratio is always clipped regardless of this setting.
 ent_coef: 0.01 # Entropy regularisation term for loss function.
 vf_coef: 0.5 # Critic weight.
+recompute_advantages: False # Whether the advantage's "what changed" term (Q(s,a,c) for the
+  # four Q-V variants, V(s) for "reinforce") and the critic's own regression target are
+  # recomputed at the end of every PPO epoch from that epoch's just-updated critic params,
+  # rather than staying pinned at their rollout-time values for the whole update
+  # (vanilla-PPO style, the default here). False also skips the extra critic forward passes
+  # that only feed this refresh, saving compute.
 standardize_advantages: False # Whether to standardize the advantages.
 max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
 decay_learning_rates: False # Whether learning rates should be linearly decayed during training.
