@@ -378,3 +378,6 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
   - `python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,4,8 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --latent-kl-coef 5e-5 --yes`
   - tmux attach -t1: done, gpus 0 .. 7 (kl penalty, salient4)
   - But the trend is still not monotonically increasing
+
+
+- NEW IDEA: We should be recomputing the advantage per epoch, especially for Q - V variants because otherwise the bias is too high in the beginning
