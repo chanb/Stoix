@@ -350,11 +350,18 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 
 
 # Comments on Sept 5:
+- Both shared and unshared IRU runs can be done within 3 hours of vulcan server.
 - For shared IRU, 5x4 seems like a good spot. The current model still fails to follow the increasing budget -> increasing performance trend
   - Q - V estimators are worse than G - V. The former never learns to get positive return (critic converges too quickly?)
-  - Running 797795_[1] on vulcan
+    - Running 797795_[1] on vulcan with larger model + try smaller critic LR (1e-5)
+      - Smaller critic LR just learns too slow
+  - Try 2 layers: 797917
+  
+
 - Somewhat a similar story for IRU, 5x4 is a good spot. The increasing budget -> increasing performance trend is there however.
   - Q - V is still worse than G - V. In 5x5 the former never learns
+  - Try 2 layers: 797911
+
 - For eCoT,
   - with input layer norm
     - FAC seems to be get non-trivial return
@@ -367,4 +374,7 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
     - Running 797853_1
     - Fixed budget: 797858_1
 
-- For iCoT, latent KL penalty seems good with range ~1e-5 to ~1e-4
+- For iCoT, latent KL penalty seems good with range ~1e-5 to ~1e-4:
+  - `python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,4,8 --seeds 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 5x5 --use-input-layer-norm false --episode-length 10 --wandb true --wandb-project lightsout_sweep-ppo_only-tf_test-sep_3-salient-5x5_weight_decay_search --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --actor-weight-decay 0.01 --latent-kl-coef 5e-5 --yes`
+  - tmux attach -t1: done, gpus 0 .. 7 (kl penalty, salient4)
+  - But the trend is still not monotonically increasing
