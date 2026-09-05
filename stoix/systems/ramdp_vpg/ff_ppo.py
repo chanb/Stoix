@@ -31,6 +31,35 @@ values:
 The four Q-V variants all use `stoix.networks.base_qac.ValueAndQCritic` (a
 shared torso with a V head and a Q head).
 
+Two quantities derived from the critic are not frozen at their rollout-time
+values for the whole update, but recomputed at the end of every PPO epoch
+from that epoch's just-updated critic params - otherwise both would go
+increasingly stale by the later epochs as the critic (`_critic_loss_fn`)
+keeps moving underneath a fixed snapshot:
+
+  - `targets`, the n-step return (`g_targets`) that trains the critic
+    itself, bootstraps off a per-step value estimate at the tail of each
+    n-step window (`v_t`). That bootstrap is rebuilt each epoch from the
+    updated critic (`new_value`/`new_last_val` below), reusing the same
+    rewards/discounts (`r_t`/`d_t`, unaffected by the critic) - otherwise
+    the critic would spend every epoch regressing towards a target that is
+    itself built from an increasingly outdated value function.
+  - The advantage's "what changed" term - Q(s,a,c) for the four Q-V
+    variants, V(s) for "reinforce" - is likewise recomputed each epoch (same
+    readouts as at rollout time, see `_q_at_action_and_compute_time`), so
+    the actor trains against an increasingly accurate estimate as the
+    critic learns.
+
+The advantage's *other* term - the fixed baseline it's compared against -
+is deliberately NOT refreshed alongside it, unlike the two quantities above:
+for the four Q-V variants, V stays fixed at `traj_batch.value` (the
+rollout-time estimate) rather than the epoch's `new_value`, so the actor's
+signal reflects only "how has the critic's opinion of this action's Q-value
+changed since rollout", not drift from Q and V moving together. "reinforce"
+has no such fixed baseline to preserve - both G and V are outputs of the one
+critic being trained, so both are refreshed together each epoch and the
+advantage is `targets - new_value` throughout.
+
 Whichever variant, PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is
 applied *per decision*, not once over the joint trajectory: the environment
 action gets its own ratio/clip (`env_log_prob` vs. its rollout-time value),
@@ -605,6 +634,59 @@ def get_learner_fn(
             (params, opt_states), loss_info = jax.lax.scan(
                 _update_minibatch, (params, opt_states), minibatches
             )
+
+            if is_qac:
+                new_value = critic_apply_fn(
+                    params.critic_params, traj_batch.obs, method="value"
+                )
+                new_last_val = critic_apply_fn(
+                    params.critic_params, last_timestep.observation, method="value"
+                )
+            else:  # "reinforce"
+                new_value = critic_apply_fn(params.critic_params, traj_batch.obs)
+                new_last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
+
+            # `targets` (the n-step return that trains the critic in
+            # `_critic_loss_fn`) bootstraps off the value estimate at the
+            # tail of each n-step window (`v_t` below, mirroring the
+            # pre-epoch-loop computation above) - holding it fixed at its
+            # rollout-time bootstrap across every epoch would leave the
+            # critic regressing towards a target built from an increasingly
+            # stale value function as the critic itself moves epoch to
+            # epoch. So it's rebuilt here from this epoch's updated critic
+            # params, reusing `r_t`/`d_t` (rewards/discounts, unaffected by
+            # the critic) from the original computation.
+            v_t = jnp.concatenate([new_value, new_last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
+            targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+
+            if is_qac:
+                # Refresh the advantage's Q term with this epoch's
+                # just-updated critic params before the next epoch trains on
+                # it - the critic moves every epoch, so the rollout-time
+                # `traj_batch.q_value` baked into `advantages` before the
+                # epoch loop would otherwise go increasingly stale by the
+                # later epochs. `traj_batch.value` is deliberately used here
+                # instead of `new_value` above: holding the V baseline fixed
+                # at its rollout-time estimate isolates the actor's signal
+                # to "how has the critic's opinion of this action changed
+                # since rollout", rather than mixing in drift from Q and V
+                # moving together epoch to epoch. (`new_value` above only
+                # feeds the target's bootstrap, a separate use of V.)
+                q_output = _q_output(
+                    params.critic_params, traj_batch.obs, traj_batch.compute_time
+                )
+                q_value = _q_at_action_and_compute_time(
+                    q_output, traj_batch.action, traj_batch.compute_time
+                )
+                advantages = q_value - traj_batch.value
+            else:  # "reinforce"
+                # Both terms of G - V are this epoch's fresh critic output:
+                # `new_value` for V, and `targets` above (itself bootstrapped
+                # off `new_value`/`new_last_val`) for G.
+                advantages = targets - new_value
+
+            if config.system.standardize_advantages:
+                advantages = jax.nn.standardize(advantages, axis=(0, 1))
 
             update_state = (
                 params,
