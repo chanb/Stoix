@@ -488,6 +488,7 @@ class Job:
     actor_weight_decay: float
     critic_weight_decay: float
     ent_coef: float
+    max_grad_norm: float
     delightful: bool
     delightful_eta: float
     epochs: int
@@ -538,7 +539,7 @@ class Job:
 
         net = (
             f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-ec{self.ent_coef:g}"
-            f"-nl{self.num_layers}"
+            f"-mgn{self.max_grad_norm:g}-nl{self.num_layers}"
         )
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             net += f"-nh{self.num_heads}-md{self.mlp_dim}"
@@ -626,6 +627,7 @@ class Job:
             f"system.actor_weight_decay={self.actor_weight_decay:g}",
             f"system.critic_weight_decay={self.critic_weight_decay:g}",
             f"system.ent_coef={self.ent_coef:g}",
+            f"system.max_grad_norm={self.max_grad_norm:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
@@ -859,6 +861,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             actor_weight_decay,
             critic_weight_decay,
             ent_coef,
+            max_grad_norm,
             (delightful, delightful_eta),
             (
                 epochs,
@@ -880,6 +883,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.actor_weight_decay,
             args.critic_weight_decay,
             args.ent_coef,
+            args.max_grad_norm,
             delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
@@ -918,6 +922,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     actor_weight_decay=actor_weight_decay,
                     critic_weight_decay=critic_weight_decay,
                     ent_coef=ent_coef,
+                    max_grad_norm=max_grad_norm,
                     delightful=delightful,
                     delightful_eta=delightful_eta,
                     epochs=epochs,
@@ -1094,6 +1099,11 @@ def main() -> None:
         "--ent-coef", default="0.01",
         help="Comma-separated system.ent_coef values (entropy bonus coefficient).",
     )
+    parser.add_argument(
+        "--max-grad-norm", default="0.5",
+        help="Comma-separated system.max_grad_norm values (global gradient-clipping norm, "
+        "applied before the optimizer update). Default 0.5, matching the yaml default.",
+    )
     parser.add_argument("--delightful", default="false", help="Comma-separated bools - system.delightful (not PPO).")
     parser.add_argument("--delightful-eta", default="1.0", help="Comma-separated system.delightful_eta values.")
     parser.add_argument("--epochs", default="4", help="Comma-separated system.epochs values (PPO only).")
@@ -1225,6 +1235,7 @@ def main() -> None:
     args.actor_weight_decay = [float(x) for x in args.actor_weight_decay.split(",")]
     args.critic_weight_decay = [float(x) for x in args.critic_weight_decay.split(",")]
     args.ent_coef = [float(x) for x in args.ent_coef.split(",")]
+    args.max_grad_norm = [float(x) for x in args.max_grad_norm.split(",")]
     args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
     args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
     args.epochs = [int(x) for x in args.epochs.split(",")]
@@ -1311,7 +1322,10 @@ def main() -> None:
         f"  min_steps={args.min_steps} max_steps={args.max_steps} hidden_dim={args.hidden_dim} "
         f"seeds=0..{args.seeds - 1}"
     )
-    print(f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef}")
+    print(
+        f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef} "
+        f"max_grad_norm={args.max_grad_norm}"
+    )
     print(f"  actor_weight_decay={args.actor_weight_decay} critic_weight_decay={args.critic_weight_decay}")
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "
