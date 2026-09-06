@@ -427,9 +427,9 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
     - Just train for longer + more layers for fixed budget: `python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,4,8,16 --seeds 5 --architectures iru --hidden-dim 64 --num-layers 2 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false`
       - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
     - Just train for longer + standardize advantage + more layers: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 2,4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --recompute-advantages true --yes --critic-before-actor false --standardize-advantages false,true`
-      - tmux attach -t0, RUNNING, gpus 0 .. 7 (salient4)
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
     - Just train for longer + standardize advantage + larger critic learning rate: `python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --architectures iru --hidden-dim 32 --num-layers 1 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 5e-4 --epochs 4 --num-minibatches 16 --grid-sizes 4x5 --use-input-layer-norm true --episode-length 10 --wandb true --wandb-project lightsout-iru-sep5-recompute_adv --runs-per-gpu 1 --gpus 0,1,2,3,4,5,6,7 --no-skip-existing --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.01 --recompute-advantages true --yes --critic-before-actor false --standardize-advantages false,true`
-      - tmux attach -t0, PENDING, gpus 0 .. 7 (salient4)
+      - tmux attach -t0, DONE, gpus 0 .. 7 (salient4)
 
 # Comments on Sept 6:
 - Don't use standardized advantage (even though it gives a bit of signal to learn even before critic is good)
@@ -438,3 +438,12 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 - It's better to set `actor_weight_decay=0.005`
 - Increase max grad norm: 811267_1
 - Critic before actor, no recompute advantage: 811268_1
+
+## Knapsack
+```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 100 --knapsack-total-budget 12.5 --gpus 0,1,2,3 --rollout-length 64 --epochs 4 --num-minibatches 16 --ent-coef 0.001 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --yes
+
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 2,4,8,16 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size 2,4,8 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 100 --knapsack-total-budget 12.5 --gpus 0,1,2,3 --rollout-length 64 --epochs 4 --num-minibatches 16 --ent-coef 0.001 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --yes
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_explicit_cond_fac,ff_ppo_explicit_cond_naive,ff_ppo_explicit_reinforce --max-steps 16 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size 2,4,8 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 100 --knapsack-total-budget 12.5 --gpus 4,5,6,7 --rollout-length 64 --epochs 4 --num-minibatches 16 --ent-coef 0.001 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --no-skip-existing --yes
+```
