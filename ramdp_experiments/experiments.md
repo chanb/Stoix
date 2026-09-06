@@ -440,6 +440,7 @@ python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinfo
 - Critic before actor, no recompute advantage: 811268_1
 
 ## Knapsack
+### eCoT
 ```
 python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 100 --knapsack-total-budget 12.5 --gpus 0,1,2,3 --rollout-length 64 --epochs 4 --num-minibatches 16 --ent-coef 0.001 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --yes
 
@@ -447,3 +448,10 @@ python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit
 
 python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_explicit_cond_fac,ff_ppo_explicit_cond_naive,ff_ppo_explicit_reinforce --max-steps 16 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 64 --num-layers 2 --num-heads 4 --vocab-size 2,4,8 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 100 --knapsack-total-budget 12.5 --gpus 4,5,6,7 --rollout-length 64 --epochs 4 --num-minibatches 16 --ent-coef 0.001 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --no-skip-existing --yes
 ```
+
+### iCoT
+813538_1
+
+
+### IRU
+813539_1
