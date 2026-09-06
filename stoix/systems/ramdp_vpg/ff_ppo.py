@@ -518,8 +518,8 @@ def get_learner_fn(
                 if qac_variant == "fac":
                     q_pred = jnp.take_along_axis(
                         q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                    ).squeeze(-1)
-                    q_targets = targets / config.system.gamma ** (traj_batch.compute_time - 1)
+                    ).squeeze(-1) * config.system.gamma ** (traj_batch.compute_time - 1)
+                    q_targets = targets
                 else:  # "naive", "cond_naive", "cond_fac"
                     q_pred = _q_at_action_and_compute_time(
                         q_output, traj_batch.action, traj_batch.compute_time
@@ -859,10 +859,10 @@ def get_learner_fn(
                             # the realised compute time.
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                            ).squeeze(-1)
-                            q_targets = targets / config.system.gamma ** (
+                            ).squeeze(-1) * config.system.gamma ** (
                                 traj_batch.compute_time - 1
                             )
+                            q_targets = targets
                         else:  # "naive", "cond_naive", "cond_fac"
                             # Already in the true Q(s,a,c) scale, so regress
                             # directly against targets.
