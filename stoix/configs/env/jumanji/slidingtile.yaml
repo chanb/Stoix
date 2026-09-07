@@ -1,8 +1,9 @@
 # ---Environment Configs---
 # Sliding Tile Puzzle (8-/15-puzzle): a permutation puzzle in the same family
-# as Lights Out (stoix/envs/lightsout/lightsout_env.py), but with a *dense*
-# reward by default (DenseRewardFn: +1/-1 per tile that becomes newly
-# correct/incorrect each step) rather than Lights Out's sparse terminal-only
+# as Lights Out (stoix/envs/lightsout/lightsout_env.py). jumanji's own default
+# is DenseRewardFn (+1/-1 per tile that becomes newly correct/incorrect each
+# step) - overridden below to SparseRewardFn (1.0 only when the puzzle is
+# fully solved, 0.0 otherwise) to match Lights Out's sparse terminal-only
 # reward - see jumanji.environments.logic.sliding_tile_puzzle.reward.
 #
 # Difficulty knobs (env.kwargs.generator):
@@ -29,6 +30,8 @@ kwargs:
     _target_: jumanji.environments.logic.sliding_tile_puzzle.generator.RandomWalkGenerator
     grid_size: 3
     num_random_moves: 10
+  reward_fn:
+    _target_: jumanji.environments.logic.sliding_tile_puzzle.reward.SparseRewardFn
 
 # Defines the metric that will be used to evaluate the performance of the agent.
 # This metric is returned at the end of an experiment and can be used for hyperparameter tuning.

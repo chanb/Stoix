@@ -8,6 +8,12 @@
 # alone is sufficient here (the blank tile's position is recoverable from it -
 # see slidingtile.yaml). Plain MLP-based networks (mlp_compute etc.) should
 # keep using env=jumanji/slidingtile.
+#
+# reward_fn is overridden to SparseRewardFn (1.0 only when the puzzle is
+# fully solved, 0.0 otherwise), matching slidingtile.yaml - jumanji's own
+# default here is DenseRewardFn (+1/-1 per tile that becomes newly
+# correct/incorrect each step), see
+# jumanji.environments.logic.sliding_tile_puzzle.reward.
 env_name: jumanji
 observation_attribute: puzzle
 multi_agent: False
@@ -21,6 +27,8 @@ kwargs:
     _target_: jumanji.environments.logic.sliding_tile_puzzle.generator.RandomWalkGenerator
     grid_size: 3
     num_random_moves: 10
+  reward_fn:
+    _target_: jumanji.environments.logic.sliding_tile_puzzle.reward.SparseRewardFn
 
 # Defines the metric that will be used to evaluate the performance of the agent.
 # This metric is returned at the end of an experiment and can be used for hyperparameter tuning.

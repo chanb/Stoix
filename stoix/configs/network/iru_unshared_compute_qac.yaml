@@ -29,6 +29,6 @@ critic_network:
     _target_: stoix.networks.heads.ScalarCriticHead
   q_head:
     _target_: stoix.networks.heads.MLPHead
-    hidden_sizes: []
+    hidden_sizes: [64]
     activation: relu
     use_layer_norm: False

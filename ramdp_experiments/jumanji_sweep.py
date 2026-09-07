@@ -33,10 +33,13 @@ system/architecture/PPO-knob/env-difficulty-knob descriptions):
     lr, critic_lr, delightful, delightful_eta, epochs, num_minibatches,
     clip_eps, clip_value_loss, recompute_advantages, critic_before_actor, use_layer_norm,
     use_input_layer_norm,
-    num_layers, num_heads, mlp_dim, vocab_size, use_latent_feedback, seed: identical semantics to
-    jumanji_fixed_budget_sweep.py, including its five ff_ppo_explicit_*
+    num_layers, num_heads, mlp_dim, vocab_size, use_latent_feedback, qv_critic, seed: identical
+    semantics to jumanji_fixed_budget_sweep.py, including its five ff_ppo_explicit_*
     systems and its transformer_explicit_cot/cnn+transformer_explicit_cot
-    architectures (see EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS).
+    architectures (see EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS). qv_critic
+    (--qv-critic, default sweeps both "shared"/"separate") only applies to
+    systems with a genuine Q-V critic (QAC_SYSTEMS) - see
+    QV_CRITIC_CHOICES/Job.command()'s `_qv_network_name`.
   - min_steps:   forbids halting (voluntarily, in replay, or greedily) before
                  this many pondering steps - see the compute torsos'
                  min_steps mechanism, stoix/networks/torso_compute*.py.
@@ -171,20 +174,39 @@ EXPLICIT_COT_PPO_SYSTEMS = (
 # omitted from the command) for EXPLICIT_COT_PPO_SYSTEMS, same as every
 # non-PPO system - see build_grid()/Job.command().
 LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_PPO_SYSTEMS)
-# The four ff_ppo_explicit_* systems above whose critic is a genuine Q-V
-# critic (separate V and Q torsos, see EXPLICIT_COT_NETWORK_BY_SYSTEM) -
-# ff_ppo_explicit_reinforce uses a plain V-only critic instead. Used in
-# Job.command() to target the right critic network override keys for CNN
-# architectures. Unlike lightsout/minatar, jumanji's *non*-explicit-CoT Q-V
-# systems (ff_qac_fac/ff_qac_naive/ff_ppo_fac/...) still use a shared-torso
-# critic (see ARCH_TO_NETWORK) - only the newly-added explicit-CoT ones use
-# separate torsos here.
-EXPLICIT_COT_QAC_SYSTEMS = (
-    "ff_ppo_explicit_fac",
-    "ff_ppo_explicit_naive",
-    "ff_ppo_explicit_cond_naive",
-    "ff_ppo_explicit_cond_fac",
+# Every system with a genuine Q-V critic (a q_head alongside value_head),
+# i.e. every key of SYSTEM_TO_QAC_VARIANT except the "reinforce" variants
+# (ff_ppo_reinforce/ff_ppo_explicit_reinforce use a plain V-only critic, see
+# SYSTEM_TO_QAC_VARIANT) - covers both the non-explicit-CoT systems
+# (ff_qac_fac/ff_qac_naive/ff_ppo_fac/ff_ppo_naive/ff_ppo_cond_naive/
+# ff_ppo_cond_fac) and the four ff_ppo_explicit_* QAC systems. Only these
+# have a shared-vs-separate-torso choice at all (see QV_CRITIC_CHOICES/
+# Job.qv_critic below) - every network in ARCH_TO_NETWORK/
+# EXPLICIT_COT_NETWORK_BY_SYSTEM for these systems is a *shared*-torso base
+# name (matching stoix.networks.base_qac.ValueAndQCritic);
+# `_qv_network_name` appends "_separate_qv" to switch to the separate-torso
+# SeparateValueAndQCritic variant (see
+# stoix/configs/network/*_qac_separate_qv.yaml) when Job.qv_critic ==
+# "separate". Used in Job.command() to also target the right critic network
+# override keys for CNN architectures.
+QAC_SYSTEMS = tuple(
+    system for system, variant in SYSTEM_TO_QAC_VARIANT.items() if variant != "reinforce"
 )
+QV_CRITIC_CHOICES = ("shared", "separate")
+QV_CRITIC_SHORT = {"shared": "sharedqv", "separate": "sepqv"}
+
+
+def _qv_network_name(base_network: str, system: str, qv_critic: str) -> str:
+    """`base_network` is always a shared-torso (ValueAndQCritic) network name
+    - append "_separate_qv" to switch to the separate-torso
+    (SeparateValueAndQCritic) variant, only meaningful (and only ever
+    requested, see build_grid's forcing of qv_critic for non-QAC systems)
+    for `system in QAC_SYSTEMS`."""
+    if system in QAC_SYSTEMS and qv_critic == "separate":
+        return f"{base_network}_separate_qv"
+    return base_network
+
+
 ARCH_TO_NETWORK = {
     "ff_reinforce": {
         "mlp": "mlp_compute",
@@ -248,31 +270,33 @@ EXPLICIT_COT_SCRIPT_BY_SYSTEM.update(
 )
 # Network name depends on both system (which qac_variant, or plain V-only for
 # ff_reinforce/ff_ppo_explicit_reinforce) and arch (flattened observation vs
-# CNN input) - nested the same way ARCH_TO_NETWORK is. ff_ppo_explicit_fac/
-# naive/cond_naive/cond_fac (EXPLICIT_COT_QAC_SYSTEMS) use the separate-torso
-# Q-V critic network; ff_ppo_explicit_reinforce/ff_reinforce use the plain
-# V-only network - see ff_ppo_explicit_cot.py's/ff_reinforce_explicit_cot.py's
-# learner_setup.
+# CNN input) - nested the same way ARCH_TO_NETWORK is. Every value here is a
+# shared-torso base name - ff_ppo_explicit_fac/naive/cond_naive/cond_fac
+# (in QAC_SYSTEMS) go through `_qv_network_name` in Job.command() to
+# optionally switch to the separate-torso variant (Job.qv_critic ==
+# "separate"); ff_ppo_explicit_reinforce/ff_reinforce use the plain V-only
+# network unconditionally (no Q-V choice at all, see QAC_SYSTEMS) - see
+# ff_ppo_explicit_cot.py's/ff_reinforce_explicit_cot.py's learner_setup.
 EXPLICIT_COT_NETWORK_BY_SYSTEM = {
     "ff_reinforce": {
         EXPLICIT_COT_ARCH: "transformer_explicit_cot",
         CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot",
     },
     "ff_ppo_explicit_fac": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
     },
     "ff_ppo_explicit_naive": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
     },
     "ff_ppo_explicit_cond_naive": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
     },
     "ff_ppo_explicit_cond_fac": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac_separate_qv",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac_separate_qv",
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
     },
     "ff_ppo_explicit_reinforce": {
         EXPLICIT_COT_ARCH: "transformer_explicit_cot",
@@ -344,6 +368,62 @@ ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.it
 # must NOT also append the +env.wrapper._target_=stoa.FlattenObservationWrapper
 # override lightsout/minatar-style jobs use, which would conflict.
 ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": True, "maze": True}
+
+# Per-env CNN architecture - env-specific rather than one shared CNN, since
+# the three CNN-capable envs (see ENV_SUPPORTS_CNN) differ substantially in
+# per-cell channel semantics:
+#   - sokoban:     fixed 10x10 grid, 2 channels bundling walls/boxes/targets/
+#                  player (see stoix/configs/env/jumanji/sokoban_grid.yaml) -
+#                  the richest per-cell semantics of the three, so gets the
+#                  deepest conv stack and widest MLPs (matches
+#                  cnn_mlp_compute.yaml's own defaults throughout).
+#   - slidingtile: small grid (--slidingtile-grid-size, typically 3-5), a
+#                  single channel (tile id, see slidingtile_grid.yaml) - the
+#                  smallest stack/MLPs of the three is enough.
+#   - maze:        --maze-size grid, 3 channels (walls plus one-hot
+#                  agent/target positions, see stoix/wrappers/maze_grid.py) -
+#                  a 2-layer conv stack gives the larger receptive field
+#                  useful for reasoning about paths around walls, with MLPs
+#                  between sokoban's and slidingtile's.
+# nn.Conv uses SAME padding (see stoix/networks/torso.py CNNTorso), so
+# stacking multiple stride-1 layers never shrinks the grid below the kernel
+# size - safe even for slidingtile/maze's smallest configured grid sizes.
+#
+# `hidden_sizes` is the actor input_layer's post-conv MLP (replaces the old
+# hidden_dim-driven value - the CNN's output width is now fixed per env
+# rather than tracking the --hidden-dim sweep, which still separately
+# controls the compute torso's own pondering width via
+# network.actor_network.pre_torso.hidden_dim). `critic_hidden_sizes` is the
+# analogous post-conv MLP on the critic's input_layer(s), and
+# `critic_layer_sizes` is the critic's pre_torso.layer_sizes (or
+# value_pre_torso/q_pre_torso.layer_sizes for the separate-torso Q-V critic,
+# see QAC_SYSTEMS/Job.qv_critic) - the MLP that follows the CNN embedding.
+ENV_CNN_ARCH = {
+    "sokoban": {
+        "channel_sizes": (256, 256, 512, 512),
+        "kernel_sizes": (3, 3, 3, 3),
+        "strides": (1, 1, 1, 1),
+        "hidden_sizes": (64,),
+        "critic_hidden_sizes": (128,),
+        "critic_layer_sizes": (128, 128),
+    },
+    "slidingtile": {
+        "channel_sizes": (32,),
+        "kernel_sizes": (3,),
+        "strides": (1,),
+        "hidden_sizes": (128,),
+        "critic_hidden_sizes": (256,),
+        "critic_layer_sizes": (256, 256),
+    },
+    "maze": {
+        "channel_sizes": (32, 8),
+        "kernel_sizes": (3, 3),
+        "strides": (1, 1),
+        "hidden_sizes": (64,),
+        "critic_hidden_sizes": (128,),
+        "critic_layer_sizes": (128, 128),
+    },
+}
 
 SOKOBAN_GENERATOR_CHOICES = (
     "default",
@@ -505,6 +585,7 @@ class Job:
     mlp_dim: int
     vocab_size: int
     use_latent_feedback: bool
+    qv_critic: str
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -547,6 +628,10 @@ class Job:
         # any other architecture, see EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
             net += f"-vs{self.vocab_size}"
+        # Only shown for systems with a genuine Q-V critic - meaningless for
+        # the "reinforce" (V-only) systems, see QAC_SYSTEMS/QV_CRITIC_SHORT.
+        if self.system in QAC_SYSTEMS:
+            net += f"-{QV_CRITIC_SHORT[self.qv_critic]}"
         parts.append(net)
 
         if self.system in PPO_SYSTEMS:
@@ -590,10 +675,11 @@ class Job:
     def command(self, python_bin: str) -> List[str]:
         if self.arch in EXPLICIT_COT_ARCHES:
             script = EXPLICIT_COT_SCRIPT_BY_SYSTEM[self.system]
-            network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system][self.arch]
+            base_network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system][self.arch]
         else:
             script = SYSTEM_TO_SCRIPT[self.system]
-            network = ARCH_TO_NETWORK[self.system][self.arch]
+            base_network = ARCH_TO_NETWORK[self.system][self.arch]
+        network = _qv_network_name(base_network, self.system, self.qv_critic)
         is_cnn = self.arch in CNN_ARCHES
         flat_scenario, grid_scenario = ENV_SCENARIOS[self.env]
         if is_cnn:
@@ -686,25 +772,36 @@ class Job:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
 
         if is_cnn:
-            cmd.append(f"network.actor_network.input_layer.channel_sizes=[8]")
-            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
-            cmd.append(f"network.actor_network.input_layer.strides=[1]")
-            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{self.hidden_dim}]")
-            if self.system in EXPLICIT_COT_QAC_SYSTEMS:
+            cnn_arch = ENV_CNN_ARCH[self.env]
+            channel_sizes = ",".join(str(c) for c in cnn_arch["channel_sizes"])
+            kernel_sizes = ",".join(str(k) for k in cnn_arch["kernel_sizes"])
+            strides = ",".join(str(s) for s in cnn_arch["strides"])
+            hidden_sizes = ",".join(str(h) for h in cnn_arch["hidden_sizes"])
+            critic_hidden_sizes = ",".join(str(h) for h in cnn_arch["critic_hidden_sizes"])
+            critic_layer_sizes = ",".join(str(h) for h in cnn_arch["critic_layer_sizes"])
+            cmd.append(f"network.actor_network.input_layer.channel_sizes=[{channel_sizes}]")
+            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[{kernel_sizes}]")
+            cmd.append(f"network.actor_network.input_layer.strides=[{strides}]")
+            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{hidden_sizes}]")
+            if self.system in QAC_SYSTEMS and self.qv_critic == "separate":
                 # Separate-torso Q-V critic (value_input_layer/q_input_layer +
                 # value_pre_torso/q_pre_torso), not a single input_layer/pre_torso.
                 for head in ("value", "q"):
-                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[16]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[3]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[1]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.hidden_sizes=[256]")
-                    cmd.append(f"network.critic_network.{head}_pre_torso.layer_sizes=[256]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[{channel_sizes}]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[{kernel_sizes}]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[{strides}]")
+                    cmd.append(
+                        f"network.critic_network.{head}_input_layer.hidden_sizes=[{critic_hidden_sizes}]"
+                    )
+                    cmd.append(
+                        f"network.critic_network.{head}_pre_torso.layer_sizes=[{critic_layer_sizes}]"
+                    )
             else:
-                cmd.append(f"network.critic_network.input_layer.channel_sizes=[16]")
-                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[3]")
-                cmd.append(f"network.critic_network.input_layer.strides=[1]")
-                cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
-                cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
+                cmd.append(f"network.critic_network.input_layer.channel_sizes=[{channel_sizes}]")
+                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[{kernel_sizes}]")
+                cmd.append(f"network.critic_network.input_layer.strides=[{strides}]")
+                cmd.append(f"network.critic_network.input_layer.hidden_sizes=[{critic_hidden_sizes}]")
+                cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{critic_layer_sizes}]")
         elif not ENV_HAS_BUILTIN_WRAPPER[self.env]:
             # sokoban (non-CNN)/slidingtile: native observation is a single
             # multi-dim array (grid/puzzle) that needs flattening for
@@ -872,6 +969,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_before_actor,
             ),
             latent_kl_coef,
+            qv_critic,
             seed,
         ) in itertools.product(
             difficulty_combos,
@@ -887,6 +985,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
+            args.qv_critic,
             range(args.seeds),
         ):
             if arch in CNN_ARCHES and not ENV_SUPPORTS_CNN[env]:
@@ -908,6 +1007,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for every other system (including explicit-CoT PPO systems).
             if system not in LATENT_KL_PPO_SYSTEMS:
                 latent_kl_coef = args.latent_kl_coef[0]
+            # qv_critic (shared vs separate-torso Q-V critic) only exists on
+            # systems with a genuine Q-V critic (QAC_SYSTEMS) - forced to the
+            # first requested value for "reinforce" systems (V-only critic,
+            # no shared-vs-separate choice at all).
+            if system not in QAC_SYSTEMS:
+                qv_critic = args.qv_critic[0]
             jobs.append(
                 Job(
                     env=env,
@@ -939,6 +1044,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     mlp_dim=mlp_dim,
                     vocab_size=vocab_size,
                     use_latent_feedback=use_latent_feedback,
+                    qv_critic=qv_critic,
                     seed=seed,
                     total_timesteps=args.total_timesteps,
                     total_num_envs=args.total_num_envs,
@@ -1135,6 +1241,18 @@ def main() -> None:
         "update (0.0 disables it, see ff_ppo.py's module docstring). ff_ppo.py's own systems "
         "only (LATENT_KL_PPO_SYSTEMS), not ff_ppo_explicit_*.",
     )
+    parser.add_argument(
+        "--qv-critic",
+        default="shared",
+        help=f"Comma-separated subset of {{{','.join(QV_CRITIC_CHOICES)}}} - whether the critic's "
+        "V(s) and Q(s,a,c) heads share one torso (stoix.networks.base_qac.ValueAndQCritic) or "
+        "each get their own, independently-initialised torso "
+        "(SeparateValueAndQCritic, see stoix/configs/network/*_qac_separate_qv.yaml). Only "
+        "applies to systems with a genuine Q-V critic (QAC_SYSTEMS - every system in "
+        "SYSTEM_TO_QAC_VARIANT except the 'reinforce' variants); ignored (forced to the first "
+        "value) for ff_reinforce/ff_ppo_reinforce/ff_ppo_explicit_reinforce, which use a plain "
+        "V-only critic with no such choice. Defaults to sweeping both, to directly compare them.",
+    )
     parser.add_argument("--use-layer-norm", default="false", help="Comma-separated bools (mlp/cnn+mlp only).")
     parser.add_argument("--use-input-layer-norm", default="false", help="Comma-separated bools.")
     parser.add_argument("--num-layers", default="1", help="Comma-separated ints - sub-layers per pondering step.")
@@ -1249,6 +1367,7 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
+    args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
@@ -1275,6 +1394,8 @@ def main() -> None:
         assert s >= 1, f"min_steps must be >= 1, got {s}"
     for s in args.max_steps:
         assert s >= 1, f"max_steps must be >= 1, got {s}"
+    for q in args.qv_critic:
+        assert q in QV_CRITIC_CHOICES, f"unknown qv_critic {q!r}, expected one of {QV_CRITIC_CHOICES}"
     for c in args.sokoban_generator:
         assert c in SOKOBAN_GENERATOR_CHOICES, f"unknown sokoban generator {c!r}, expected one of {SOKOBAN_GENERATOR_CHOICES}"
 
@@ -1331,6 +1452,7 @@ def main() -> None:
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
     )
+    print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
     print(f"  knapsack_num_items={args.knapsack_num_items} knapsack_total_budget={args.knapsack_total_budget}")
