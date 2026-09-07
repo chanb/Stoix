@@ -246,6 +246,17 @@ ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 NO_LAYER_NORM_ARCHES = ("transformer", "cnn+transformer", "gru", "cnn+gru", "iru", "cnn+iru")
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
+# Architectures whose pre_torso is IRUStep-based (IRUAdaptiveComputationTimeTorso,
+# see stoix/networks/torso_compute.py).
+IRU_ARCHES = ("iru", "cnn+iru")
+# Architectures whose pre_torso has a stop_gradient_halting_input param -
+# IRUStep-based torsos (IRU_ARCHES) and TransformerChainOfThoughtTorso
+# (TRANSFORMER_ARCHES; *not* TransformerExplicitCoTTorso/EXPLICIT_COT_ARCHES,
+# which has no such param) - see stoix/networks/torso_compute.py's IRUStep
+# and stoix/networks/torso_compute_transformer.py's _CoTStep docstrings.
+# Used to pick whether --stop-gradient-halting-input is swept for a given
+# architecture in build_grid() and applied in Job.command().
+STOP_GRADIENT_HALTING_ARCHES = IRU_ARCHES + TRANSFORMER_ARCHES
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
 
@@ -580,6 +591,7 @@ class Job:
     critic_before_actor: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
+    stop_gradient_halting_input: bool
     num_layers: int
     num_heads: int
     mlp_dim: int
@@ -657,6 +669,8 @@ class Job:
             extra.append("ln")
         if self.use_input_layer_norm:
             extra.append("iln")
+        if self.stop_gradient_halting_input:
+            extra.append("sgh")
         if self.use_latent_feedback:
             extra.append("lf")
         if extra:
@@ -768,6 +782,19 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
+        if self.arch in STOP_GRADIENT_HALTING_ARCHES:
+            # Detaches the state fed into the halting head (IRUStep's or
+            # _CoTStep's) so the halting REINFORCE loss can't backprop into
+            # the shared recurrent/transformer weights that also produce the
+            # action head's representation - see
+            # stoix.networks.torso_compute.IRUStep's and
+            # stoix.networks.torso_compute_transformer._CoTStep's
+            # docstrings. No such param on any other torso (`++`: not
+            # declared in the yaml).
+            cmd.append(
+                "++network.actor_network.pre_torso.stop_gradient_halting_input="
+                f"{self.stop_gradient_halting_input}"
+            )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
 
@@ -876,6 +903,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 if arch in EXPLICIT_COT_ARCHES
                 else [args.use_latent_feedback[0]]
             )
+            stop_gradient_halting_input_options = (
+                args.stop_gradient_halting_input
+                if arch in STOP_GRADIENT_HALTING_ARCHES
+                else [args.stop_gradient_halting_input[0]]
+            )
             if arch in EXPLICIT_COT_ARCHES:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
@@ -894,8 +926,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size, use_latent_feedback in itertools.product(
-                                vocab_size_options, use_latent_feedback_options
+                            for vocab_size, use_latent_feedback, stop_gradient_halting_input in (
+                                itertools.product(
+                                    vocab_size_options,
+                                    use_latent_feedback_options,
+                                    stop_gradient_halting_input_options,
+                                )
                             ):
                                 system_arch_ln_combos.append(
                                     (
@@ -908,6 +944,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         mlp_dim,
                                         vocab_size,
                                         use_latent_feedback,
+                                        stop_gradient_halting_input,
                                     )
                                 )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -950,6 +987,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 mlp_dim,
                 vocab_size,
                 use_latent_feedback,
+                stop_gradient_halting_input,
             ),
             (min_steps, max_steps),
             hidden_dim,
@@ -1039,6 +1077,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     critic_before_actor=critic_before_actor,
                     use_layer_norm=use_layer_norm,
                     use_input_layer_norm=use_input_layer_norm,
+                    stop_gradient_halting_input=stop_gradient_halting_input,
                     num_layers=num_layers,
                     num_heads=num_heads,
                     mlp_dim=mlp_dim,
@@ -1255,6 +1294,19 @@ def main() -> None:
     )
     parser.add_argument("--use-layer-norm", default="false", help="Comma-separated bools (mlp/cnn+mlp only).")
     parser.add_argument("--use-input-layer-norm", default="false", help="Comma-separated bools.")
+    parser.add_argument(
+        "--stop-gradient-halting-input",
+        default="false",
+        help="Comma-separated bools - network.actor_network.pre_torso.stop_gradient_halting_input: "
+        "detaches the state fed into the halting head (IRUStep's or _CoTStep's Dense(1)) before "
+        "it's read, so the halting REINFORCE loss can't backprop into the shared "
+        "recurrent/transformer weights that also produce the action head's representation - see "
+        "stoix.networks.torso_compute.IRUStep's and "
+        "stoix.networks.torso_compute_transformer._CoTStep's docstrings. Only applies to "
+        "architecture in {iru, cnn+iru, transformer, cnn+transformer} "
+        "(STOP_GRADIENT_HALTING_ARCHES); ignored (forced to the first value) for every other "
+        "architecture. A no-op when min_steps == max_steps.",
+    )
     parser.add_argument("--num-layers", default="1", help="Comma-separated ints - sub-layers per pondering step.")
     parser.add_argument("--num-heads", default="4", help="Comma-separated ints (transformer archs only).")
     parser.add_argument("--mlp-dim", default="256", help="Comma-separated ints (transformer archs only).")
@@ -1370,6 +1422,10 @@ def main() -> None:
     args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
+    args.stop_gradient_halting_input = [
+        x.strip().lower() in ("1", "true", "yes")
+        for x in args.stop_gradient_halting_input.split(",")
+    ]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]

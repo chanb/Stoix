@@ -194,6 +194,7 @@ class _CoTStep(nn.Module):
     convergence_threshold: float
     replaying: bool
     deterministic: bool
+    stop_gradient_halting_input: bool = False
 
     @nn.compact
     def __call__(
@@ -246,7 +247,10 @@ class _CoTStep(nn.Module):
             # `TransformerChainOfThoughtTorso`'s docstring for `states_history`.
             states_history = states_history.at[..., step_idx, :].set(state)
 
-        halting_prob = nn.sigmoid(halting_head(nn.LayerNorm()(state)))
+        halting_input = state
+        if self.stop_gradient_halting_input:
+            halting_input = jax.lax.stop_gradient(halting_input)
+        halting_prob = nn.sigmoid(halting_head(halting_input))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
 
         step_count = step_idx + 1
@@ -381,6 +385,16 @@ class TransformerChainOfThoughtTorso(nn.Module):
         it never does within the steps actually taken.
       - `num_close_steps`: how many steps (not necessarily consecutive) had
         a distance below `convergence_threshold`.
+
+    `stop_gradient_halting_input` (default `False`) detaches this step's
+    "thought" (`state`) before it's read by the halting head's `Dense(1)`,
+    mirroring `stoix.networks.torso_compute.IRUStep`'s knob of the same
+    name: the halting head's own weights still get trained via REINFORCE,
+    but that gradient can no longer backprop into the shared transformer
+    blocks that also produce the action head's representation - severing
+    that gradient-sharing channel between the two objectives. A no-op when
+    `min_steps == max_steps` (every step is already forced, so no
+    halting-loss gradient reaches the torso regardless).
     """
 
     hidden_dim: int
@@ -393,6 +407,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
+    stop_gradient_halting_input: bool = False
 
     @nn.compact
     def __call__(
@@ -487,6 +502,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.convergence_threshold,
             replaying,
             deterministic,
+            self.stop_gradient_halting_input,
         )
 
         initial_carry = (

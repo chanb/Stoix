@@ -582,11 +582,21 @@ class IRUStep(nn.Module):
     steps (so `carry` here is `(num_layers, ..., hidden_dim)`, not
     `(..., hidden_dim)`). The halting probability is predicted from the top
     (last) layer's new carry, which is also what gets used as this step's
-    "public" state - see `IRUAdaptiveComputationTimeTorso`."""
+    "public" state - see `IRUAdaptiveComputationTimeTorso`.
+
+    `stop_gradient_halting_input` (default `False`) detaches that new carry
+    before it's fed into the halting head's `Dense(1)`, so the halting
+    head's own loss (trained via REINFORCE - see
+    `IRUAdaptiveComputationTimeTorso`'s docstring) still updates the
+    `Dense(1)` layer's weights but can no longer backprop into the shared
+    `IRUCell` weights that also produce the state the action head reads -
+    severing that gradient-sharing channel between the two objectives while
+    leaving the halting head free to read (not shape) the state."""
 
     hidden_dim: int
     num_layers: int = 1
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    stop_gradient_halting_input: bool = False
 
     @nn.compact
     def __call__(
@@ -602,7 +612,10 @@ class IRUStep(nn.Module):
             x = jnp.tanh(layer_carry)
         new_carry = jnp.stack(new_carries, axis=0)
 
-        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(new_carries[-1]))
+        halting_input = new_carries[-1]
+        if self.stop_gradient_halting_input:
+            halting_input = jax.lax.stop_gradient(halting_input)
+        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(halting_input))
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
         return new_carry, halting_prob
 
@@ -639,6 +652,14 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
     keeps its own carry across pondering steps; the diagnostics/final
     embedding below use only the top layer's carry, matching what `IRUStep`
     returns as its halting-probability input.
+
+    `stop_gradient_halting_input` (default `False`) is forwarded to
+    `IRUStep`: detaches the state fed into the halting head so the halting
+    REINFORCE loss can no longer backprop into the shared `IRUCell` weights
+    that also produce the action head's representation - see `IRUStep`'s
+    docstring. With `min_steps == max_steps` this is a no-op regardless
+    (every step is already forced, so no halting-loss gradient ever reaches
+    `IRUStep` in the first place - see the forced-step handling below).
     """
 
     hidden_dim: int
@@ -648,6 +669,7 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
+    stop_gradient_halting_input: bool = False
 
     @nn.compact
     def __call__(
@@ -702,7 +724,12 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         input_embedding = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
             input_embedding = nn.LayerNorm()(input_embedding)
-        step_fn = IRUStep(self.hidden_dim, self.num_layers, self.kernel_init)
+        step_fn = IRUStep(
+            self.hidden_dim,
+            self.num_layers,
+            self.kernel_init,
+            stop_gradient_halting_input=self.stop_gradient_halting_input,
+        )
 
         # `carry` holds every stacked layer's own cell state
         # (`(num_layers, *batch_shape, hidden_dim)`), threaded between
@@ -833,6 +860,15 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
     `use_input_layer_norm` normalizes the encoded input embedding (after its
     `Linear` projection, before it's fed into the recurrent block every
     step).
+
+    `stop_gradient_halting_input` (default `False`) is forwarded to every
+    per-step `IRUStep`: detaches the state fed into that step's halting head
+    so the halting REINFORCE loss can no longer backprop into that step's
+    own `IRUCell` weights - see `IRUStep`'s docstring. Since each step's
+    parameters are already independent here (no weight sharing across
+    steps), this only isolates a given step's halting-loss gradient from
+    its own state-producing weights; it doesn't need to protect other
+    steps' weights the way it does in `IRUAdaptiveComputationTimeTorso`.
     """
 
     hidden_dim: int
@@ -842,6 +878,7 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
+    stop_gradient_halting_input: bool = False
 
     @nn.compact
     def __call__(
@@ -928,6 +965,7 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
                 self.hidden_dim,
                 self.num_layers,
                 self.kernel_init,
+                stop_gradient_halting_input=self.stop_gradient_halting_input,
                 name=f"iru_step_{step}",
             )
             carry, halting_prob = step_fn(carry, input_embedding)

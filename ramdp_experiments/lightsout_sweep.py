@@ -159,6 +159,21 @@ Grid axes:
                  only (every other architecture, including transformer/cnn+transformer,
                  has no such param, so this is forced to a single value for them). Default
                  32 (the network yaml default).
+  - stop_gradient_halting_input: whether IRUStep's halting head reads a
+                 detached (stop-gradient) copy of the step's state instead of
+                 the live one - see stoix/networks/torso_compute.py's
+                 IRUStep docstring. Severs the channel through which the
+                 halting REINFORCE loss's gradient would otherwise backprop
+                 into the shared IRUCell weights that also produce the
+                 action head's representation, isolating whether that
+                 gradient-sharing is what makes adaptive-budget (min_steps <
+                 max_steps) runs underperform a matched-capacity fixed-budget
+                 (min_steps == max_steps) run - for the latter this flag is a
+                 no-op, since every step is already forced (no halting-loss
+                 gradient reaches the torso at all regardless of this flag).
+                 iru/cnn+iru/iru_unshared/transformer/cnn+transformer only
+                 (STOP_GRADIENT_HALTING_ARCHES) - forced off for every other
+                 architecture, which has no such param.
   - use_latent_feedback: latent feedback decoding
                  (network.actor_network.pre_torso.use_latent_feedback) - fuses the
                  previous step's top-layer hidden state into the next scratchpad entry
@@ -203,6 +218,8 @@ Usage:
   python ramdp_experiments/lightsout_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
   python ramdp_experiments/lightsout_sweep.py --architectures cnn+mlp,cnn+transformer  # CNN-input sweep
   python ramdp_experiments/lightsout_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
+  python ramdp_experiments/lightsout_sweep.py --architectures iru --min-steps 1 --max-steps 5 \\
+      --stop-gradient-halting-input true,false  # isolate halting-head/torso gradient sharing
   python ramdp_experiments/lightsout_sweep.py --difficulty-threshold 0.3  # easier training goals
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
@@ -396,12 +413,23 @@ NO_LAYER_NORM_ARCHES = (
 # Architectures whose input_layer is a CNNTorso (need the CNN-specific
 # overrides below instead of the flatten-observation wrapper).
 CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
+# Architectures whose pre_torso is IRUStep-based (IRUAdaptiveComputationTimeTorso
+# or UnsharedIRUAdaptiveComputationTimeTorso, see stoix/networks/torso_compute.py).
+IRU_ARCHES = ("iru", "cnn+iru", "iru_unshared")
 # Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention
 # heads / transformer feedforward width) - TransformerChainOfThoughtTorso and
 # TransformerExplicitCoTTorso; every other torso has no such concept. Used to
 # pick whether --num-heads/--mlp-dim are swept for a given architecture in
 # build_grid() and applied in Job.command().
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
+# Architectures whose pre_torso has a stop_gradient_halting_input param -
+# IRUStep-based torsos (IRU_ARCHES) and TransformerChainOfThoughtTorso
+# (TRANSFORMER_ARCHES; *not* TransformerExplicitCoTTorso/EXPLICIT_COT_ARCH,
+# which has no such param) - see stoix/networks/torso_compute.py's IRUStep
+# and stoix/networks/torso_compute_transformer.py's _CoTStep docstrings.
+# Used to pick whether --stop-gradient-halting-input is swept for a given
+# architecture in build_grid() and applied in Job.command().
+STOP_GRADIENT_HALTING_ARCHES = IRU_ARCHES + TRANSFORMER_ARCHES
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
@@ -509,6 +537,7 @@ class Job:
     critic_before_actor: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
+    stop_gradient_halting_input: bool
     num_layers: int
     num_heads: int
     mlp_dim: int
@@ -601,6 +630,8 @@ class Job:
             extra.append("ln")
         if self.use_input_layer_norm:
             extra.append("iln")
+        if self.stop_gradient_halting_input:
+            extra.append("sgh")
         if self.use_latent_feedback:
             extra.append("lf")
         if extra:
@@ -730,6 +761,19 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
+        if self.arch in STOP_GRADIENT_HALTING_ARCHES:
+            # Detaches the state fed into the halting head (IRUStep's or
+            # _CoTStep's) so the halting REINFORCE loss can't backprop into
+            # the shared recurrent/transformer weights that also produce the
+            # action head's representation - see
+            # stoix.networks.torso_compute.IRUStep's and
+            # stoix.networks.torso_compute_transformer._CoTStep's
+            # docstrings. No such param on any other torso (`++`: not
+            # declared in the yaml).
+            cmd.append(
+                "++network.actor_network.pre_torso.stop_gradient_halting_input="
+                f"{self.stop_gradient_halting_input}"
+            )
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch not in CNN_ARCHES:
@@ -825,6 +869,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #  - use_latent_feedback (latent feedback decoding) likewise only exists on
     #    transformer_explicit_cot - swept only for that architecture, everything
     #    else forced to a single value.
+    #  - stop_gradient_halting_input (detaches the state fed into the halting
+    #    head, see stoix.networks.torso_compute.IRUStep's and
+    #    stoix.networks.torso_compute_transformer._CoTStep's docstrings) only
+    #    exists on IRUStep-based torsos and TransformerChainOfThoughtTorso
+    #    (STOP_GRADIENT_HALTING_ARCHES) - swept only for those, everything
+    #    else forced to a single value.
     # Unsupported axes are forced to a single default value rather than
     # needlessly duplicated per requested setting.
     system_arch_ln_combos = []
@@ -842,6 +892,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 args.use_latent_feedback
                 if arch == EXPLICIT_COT_ARCH
                 else [args.use_latent_feedback[0]]
+            )
+            stop_gradient_halting_input_options = (
+                args.stop_gradient_halting_input
+                if arch in STOP_GRADIENT_HALTING_ARCHES
+                else [args.stop_gradient_halting_input[0]]
             )
             if arch == EXPLICIT_COT_ARCH:
                 if system not in EXPLICIT_COT_SYSTEMS:
@@ -861,8 +916,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size, use_latent_feedback in itertools.product(
-                                vocab_size_options, use_latent_feedback_options
+                            for vocab_size, use_latent_feedback, stop_gradient_halting_input in (
+                                itertools.product(
+                                    vocab_size_options,
+                                    use_latent_feedback_options,
+                                    stop_gradient_halting_input_options,
+                                )
                             ):
                                 system_arch_ln_combos.append(
                                     (
@@ -875,6 +934,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         mlp_dim,
                                         vocab_size,
                                         use_latent_feedback,
+                                        stop_gradient_halting_input,
                                     )
                                 )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -914,6 +974,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             mlp_dim,
             vocab_size,
             use_latent_feedback,
+            stop_gradient_halting_input,
         ),
         (min_steps, max_steps),
         hidden_dim,
@@ -1000,6 +1061,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_before_actor=critic_before_actor,
                 use_layer_norm=use_layer_norm,
                 use_input_layer_norm=use_input_layer_norm,
+                stop_gradient_halting_input=stop_gradient_halting_input,
                 num_layers=num_layers,
                 num_heads=num_heads,
                 mlp_dim=mlp_dim,
@@ -1296,6 +1358,23 @@ def main() -> None:
         "transformer_explicit_cot}.",
     )
     parser.add_argument(
+        "--stop-gradient-halting-input",
+        default="false",
+        help="Comma-separated bools (true/false) - "
+        "network.actor_network.pre_torso.stop_gradient_halting_input: detaches the state fed "
+        "into the halting head (IRUStep's or _CoTStep's Dense(1)) before it's read, so the "
+        "halting REINFORCE loss can no longer backprop into the shared recurrent/transformer "
+        "weights that also produce the action head's representation - see "
+        "stoix.networks.torso_compute.IRUStep's and "
+        "stoix.networks.torso_compute_transformer._CoTStep's docstrings. Only applies to "
+        "architecture in {iru, cnn+iru, iru_unshared, transformer, cnn+transformer} "
+        "(STOP_GRADIENT_HALTING_ARCHES); ignored (forced to the first value) for every other "
+        "architecture (including transformer_explicit_cot, whose TransformerExplicitCoTTorso "
+        "has no such param), since no other torso has this param. A no-op when min_steps == "
+        "max_steps (every step is already forced, so no halting-loss gradient ever reaches the "
+        "torso regardless). Default false.",
+    )
+    parser.add_argument(
         "--num-layers",
         default="1",
         help="Comma-separated ints - how many sub-layers are stacked inside each shared pondering "
@@ -1465,6 +1544,10 @@ def main() -> None:
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
     ]
+    args.stop_gradient_halting_input = [
+        x.strip().lower() in ("1", "true", "yes")
+        for x in args.stop_gradient_halting_input.split(",")
+    ]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
@@ -1569,6 +1652,10 @@ def main() -> None:
     print(
         f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "
         f"use_input_layer_norm={args.use_input_layer_norm}"
+    )
+    print(
+        f"  stop_gradient_halting_input={args.stop_gradient_halting_input} "
+        f"(iru/cnn+iru/iru_unshared/transformer/cnn+transformer only)"
     )
     print(f"  num_layers={args.num_layers}")
     print(

@@ -467,27 +467,19 @@ Submitted batch job 814461
 
 
 # Comments on Sept 7
-- Knapsack has slightly nice trend, but they're all close to optimal:
-
+- Knapsack has slightly nice trend, but they're all close to optimal.
+- I think for lightsout and maze (with lower returns) we can just have larger models and decreasing the budget
+- Maybe it's worthwhile to think about whether the halting mechanism learns as quickly as the policy.
 
 ## Knapsack
-- Try smaller model
-### eCoT (TODO)
-```
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 128 --mlp-dim 128 --num-layers 2 --num-heads 8 --vocab-size 1 --total-timesteps 3e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 50 --knapsack-total-budget 12.5 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 8 --ent-coef 0.01 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --no-skip-existing --yes
-
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 2,4,8,16 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 128 --mlp-dim 128 --num-layers 2 --num-heads 8 --vocab-size 2,4,8 --total-timesteps 3e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 50 --knapsack-total-budget 12.5 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 8 --ent-coef 0.01 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --no-skip-existing --yes
-
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_explicit_cond_fac,ff_ppo_explicit_cond_naive,ff_ppo_explicit_reinforce --max-steps 16 --seeds 5 --runs-per-gpu 2 --architectures transformer_explicit_cot --hidden-dim 128 --mlp-dim 128 --num-layers 2 --num-heads 8 --vocab-size 2,4,8 --total-timesteps 3e7 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs knapsack --knapsack-num-items 50 --knapsack-total-budget 12.5 --gpus 4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 8 --ent-coef 0.01 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project knapsack-tf-sep6 --no-skip-existing --yes
-```
-
+TODO
 
 ## Maze
 ### IRU
 ```
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 5 --runs-per-gpu 1 --architectures iru --hidden-dim 32 --num-layers 2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 5 --runs-per-gpu 1 --architectures iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
 
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,4,8,16 --seeds 5 --runs-per-gpu 1 --architectures iru --hidden-dim 32 --num-layers 2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
 
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --runs-per-gpu 1 --architectures iru --hidden-dim 32 --num-layers 2 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
 ```
