@@ -40,7 +40,14 @@ clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"
   # (stoix.utils.loss.clipped_value_loss), or plain L2 regression to the target instead
   # (rlax.l2_loss, as in ff_reinforce.py/ff_qac.py). Only affects the critic - the actor's
   # ratio is always clipped regardless of this setting.
-ent_coef: 0.01 # Entropy regularisation term for loss function.
+ent_coef: 0.01 # Entropy regularisation term for the environment action's distribution.
+halting_ent_coef: 0.0 # Entropy regularisation term for the halting decision's own
+  # distribution (per-step Bernoulli halting probability), separate from ent_coef above
+  # since that only ever reaches the environment action's distribution - without this,
+  # nothing keeps the halting policy from collapsing to a degenerate, non-adaptive
+  # compute-time before discovering genuine per-example structure. 0.0 (default) disables
+  # it exactly, recovering the original ff_ppo.py behaviour. See ff_ppo.py's module
+  # docstring.
 latent_kl_coef: 0.0 # Coefficient on an optional trust-region penalty for how far the
   # actor torso's per-step "thought" states (states_history) may drift across a PPO
   # update, on top of the existing halting-log-prob ratio clip (which only bounds the

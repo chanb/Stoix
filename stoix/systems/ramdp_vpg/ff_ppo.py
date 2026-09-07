@@ -116,6 +116,20 @@ and Q for "naive"/"fac") is trained with PPO's own clipped value loss
 recorded at rollout time by default, or with plain L2 regression
 (`rlax.l2_loss`) when `config.system.clip_value_loss=False`.
 
+The entropy bonus itself has two independent terms: `config.system.ent_coef`
+on the environment action's distribution entropy (`actor_policy.entropy()`,
+as in any PPO), and `config.system.halting_ent_coef` on the halting
+decision's own entropy (`per_step_halting_entropy` from the torso, masked
+and averaged the same way as `halting_log_prob` above). The two are
+deliberately separate coefficients, not one shared `ent_coef`: without a
+dedicated halting term, nothing regularizes the halting head's own
+exploration - `ent_coef` never reaches it, since `actor_policy` is only the
+environment action's distribution - so the halting policy is otherwise free
+to collapse to a degenerate, non-adaptive compute-time (e.g. always halting
+at `min_steps`) before it ever discovers genuine per-example structure, no
+matter how large `ent_coef` is set. `halting_ent_coef=0.0` (the default)
+recovers the original behaviour exactly.
+
 Because PPO needs a fixed "old" log-probability to compute the ratio against
 across every epoch, and the Adaptive Computation Time torso's sampling pass
 does not itself report the log-probability of the halting trajectory it just
@@ -311,7 +325,7 @@ def get_learner_fn(
             # (the per-step "thought" states from this same pass) is only
             # used by the optional latent KL penalty - harmless to always
             # compute, since it's read off a pass already being made.
-            _, _, old_latent_states, halting_log_prob = actor_apply_fn(
+            _, _, old_latent_states, halting_log_prob, _ = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_compute_time": compute_time},
@@ -435,7 +449,13 @@ def get_learner_fn(
         ) -> Tuple:
             """Calculate the actor loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
-            actor_policy, _, new_latent_states, halting_log_prob = actor_apply_fn(
+            (
+                actor_policy,
+                _,
+                new_latent_states,
+                halting_log_prob,
+                per_step_halting_entropy,
+            ) = actor_apply_fn(
                 actor_params,
                 traj_batch.obs,
                 torso_kwargs={"target_compute_time": traj_batch.compute_time},
@@ -475,6 +495,18 @@ def get_learner_fn(
                 )
                 / num_valid_steps
             )
+            # Entropy bonus on the halting decision itself, mirroring
+            # `entropy` above for the environment action - `ent_coef` alone
+            # never reaches the halting head (`actor_policy.entropy()` is
+            # only the environment action's distribution), so without this
+            # nothing keeps the halting policy from collapsing to a
+            # degenerate, non-adaptive compute-time before it discovers any
+            # genuine per-example structure. Same `valid_step` masking as
+            # `halting_loss` above - `per_step_halting_entropy` is already
+            # zeroed at forced steps (before `min_steps`, or the forced halt
+            # at `max_steps`) and past each example's actual halt, see the
+            # torso's docstring.
+            halting_entropy = jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
 
             loss_actor = action_loss + halting_loss
 
@@ -486,6 +518,7 @@ def get_learner_fn(
             total_loss_actor = (
                 loss_actor
                 - config.system.ent_coef * entropy
+                - config.system.halting_ent_coef * halting_entropy
                 + config.system.latent_kl_coef * latent_kl_penalty
             )
             loss_info = {
@@ -493,6 +526,7 @@ def get_learner_fn(
                 "action_loss": action_loss,
                 "halting_loss": halting_loss,
                 "entropy": entropy,
+                "halting_entropy": halting_entropy,
                 "advantages": advantage,
                 "compute_time": traj_batch.compute_time,
                 "first_convergence_step": traj_batch.first_convergence_step,
@@ -738,7 +772,13 @@ def get_learner_fn(
                     # `new_latent_states` is this epoch's per-step "thought"
                     # states at the same trajectory - only used by the
                     # optional latent KL penalty below (see module docstring).
-                    actor_policy, _, new_latent_states, halting_log_prob = actor_apply_fn(
+                    (
+                        actor_policy,
+                        _,
+                        new_latent_states,
+                        halting_log_prob,
+                        per_step_halting_entropy,
+                    ) = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_compute_time": traj_batch.compute_time},
@@ -803,6 +843,22 @@ def get_learner_fn(
                         )
                         / num_valid_steps
                     )
+                    # Entropy bonus on the halting decision itself, mirroring
+                    # `entropy` above for the environment action - `ent_coef`
+                    # alone never reaches the halting head
+                    # (`actor_policy.entropy()` is only the environment
+                    # action's distribution), so without this nothing keeps
+                    # the halting policy from collapsing to a degenerate,
+                    # non-adaptive compute-time before it discovers any
+                    # genuine per-example structure. Same `valid_step`
+                    # masking as `halting_loss` above -
+                    # `per_step_halting_entropy` is already zeroed at forced
+                    # steps (before `min_steps`, or the forced halt at
+                    # `max_steps`) and past each example's actual halt, see
+                    # the torso's docstring.
+                    halting_entropy = (
+                        jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
+                    )
 
                     loss_actor = action_loss + halting_loss
 
@@ -822,6 +878,7 @@ def get_learner_fn(
                     total_loss_actor = (
                         loss_actor
                         - config.system.ent_coef * entropy
+                        - config.system.halting_ent_coef * halting_entropy
                         + config.system.latent_kl_coef * latent_kl_penalty
                     )
                     loss_info = {
@@ -829,6 +886,7 @@ def get_learner_fn(
                         "action_loss": action_loss,
                         "halting_loss": halting_loss,
                         "entropy": entropy,
+                        "halting_entropy": halting_entropy,
                         "advantages": advantage,
                         "compute_time": traj_batch.compute_time,
                         "first_convergence_step": traj_batch.first_convergence_step,

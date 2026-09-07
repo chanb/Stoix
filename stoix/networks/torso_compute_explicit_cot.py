@@ -32,15 +32,22 @@ different at the next step:
     token in the sequence).
   - Replay mode (`target_tokens=<array>`): deterministically replays exactly
     that token trajectory (no rng) and returns `(embedding, log_prob,
-    per_step_log_prob)`: `log_prob` is the log-probability, under the
-    current parameters, of the whole trajectory (thought choices and the
-    halting choice together, i.e. `per_step_log_prob.sum(-1)`);
+    per_step_log_prob, per_step_entropy)`: `log_prob` is the log-probability,
+    under the current parameters, of the whole trajectory (thought choices
+    and the halting choice together, i.e. `per_step_log_prob.sum(-1)`);
     `per_step_log_prob` (shape `(*batch, max_steps)`) is that same quantity
     left unsummed, one entry per step, zeroed past the step the trajectory
     actually halted at - callers that need a per-decision (rather than
     per-trajectory) PPO ratio, e.g. to clip each step's importance ratio
     individually instead of one joint ratio over the summed log-prob, use
-    this instead of `log_prob`. Attention within a
+    this instead of `log_prob`. `per_step_entropy` (same shape/masking) is
+    the entropy of the whole per-step categorical (thought tokens and "act
+    now" together) - there is no separate halting probability to isolate
+    here (halting *is* choosing the "act now" class, see above), so this
+    doubles as the entropy bonus a caller wants on the halting decision
+    itself, mirroring `stoix.networks.torso_compute.IRUStep`'s
+    `per_step_halting_entropy` for the latent-CoT/IRU torsos - see
+    `ff_ppo_explicit_cot.py`. Attention within a
     step is causally masked (see `TransformerBlock`), so - unlike the
     latent-CoT torso, where the scratchpad entry fed back in is the model's
     own hidden state and therefore only knowable by actually running the
@@ -102,6 +109,19 @@ from stoix.networks.torso_compute_transformer import TransformerBlock
 from stoix.networks.utils import parse_activation_fn
 
 _NEG_INF = jnp.finfo(jnp.float32).min
+
+
+def _categorical_entropy(log_probs: chex.Array) -> chex.Array:
+    """`-sum(p * log(p))` over the last axis, safe against `legal_mask`'s
+    illegal classes: those have `log_probs == -inf` (from `log_softmax` on a
+    `_NEG_INF`-substituted logit) and `p == exp(-inf) == 0.0` exactly, so a
+    naive `p * log(-inf)` would be `0 * -inf = nan`. Masking by `probs > 0`
+    (rather than by `legal_mask` directly, which isn't in scope here) drops
+    exactly those illegal-class terms instead, leaving the entropy of the
+    legal-class distribution unaffected (they'd have contributed `0 * finite
+    = 0` anyway - this only silences the `-inf` case)."""
+    probs = jnp.exp(log_probs)
+    return jnp.sum(jnp.where(probs > 0, -probs * log_probs, 0.0), axis=-1)
 
 
 class _ExplicitCoTBackbone(nn.Module):
@@ -262,7 +282,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         rng: Optional[chex.PRNGKey] = None,
         target_tokens: Optional[chex.Array] = None,
         deterministic: bool = False,
-    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+    ) -> Tuple[chex.Array, ...]:
         """
         Args:
             observation: the input embedding to think about; becomes the
@@ -278,8 +298,9 @@ class TransformerExplicitCoTTorso(nn.Module):
 
         Returns:
             `(embedding, compute_time, thought_tokens)` when not replaying,
-            or `(embedding, log_prob, per_step_log_prob)` when replaying a
-            known trajectory - see module docstring for `per_step_log_prob`.
+            or `(embedding, log_prob, per_step_log_prob, per_step_entropy)`
+            when replaying a known trajectory - see module docstring for
+            `per_step_log_prob`/`per_step_entropy`.
         """
         batch_shape = observation.shape[:-1]
         replaying = target_tokens is not None
@@ -392,6 +413,15 @@ class TransformerExplicitCoTTorso(nn.Module):
             still_running = earlier_halts == 0
             per_step_log_prob = jnp.where(still_running, token_log_prob, 0.0)
             log_prob = jnp.sum(per_step_log_prob, axis=-1)
+            # Entropy of the *whole* per-step categorical (thought tokens
+            # and "act now" together) - there's no separate halting
+            # probability to isolate here (see module docstring: halting
+            # *is* choosing the "act now" class), so this is the entropy
+            # bonus a caller wants on the halting decision, same masking as
+            # `per_step_log_prob` above.
+            per_step_entropy = jnp.where(
+                still_running, _categorical_entropy(log_token_probs), 0.0
+            )
 
             # The final state is read off at the first "act now" token (the
             # forced halt at max_steps guarantees there always is one).
@@ -400,7 +430,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 states, halt_step[..., None, None], axis=-2
             ).squeeze(axis=-2)
 
-            return final_state, log_prob, per_step_log_prob
+            return final_state, log_prob, per_step_log_prob, per_step_entropy
 
         # KV-cached step-by-step build, shared by rollout mode and (when
         # `use_latent_feedback=True`) replay mode: with latent feedback, each
@@ -428,6 +458,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         # Only ever written when replaying (see `step_fn`); carried
         # regardless of mode since `nn.scan` needs a fixed carry structure.
         per_step_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
+        per_step_entropy = jnp.zeros(batch_shape + (self.max_steps,))
         # Unused (never read) unless sampling, but must still be a concrete
         # array: it's carried through every scan step regardless of mode.
         step_rng = rng if rng is not None else jax.random.PRNGKey(0)
@@ -444,6 +475,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 emitted_tokens,
                 log_prob,
                 per_step_log_prob,
+                per_step_entropy,
                 final_state,
                 rng,
             ) = carry
@@ -465,6 +497,11 @@ class TransformerExplicitCoTTorso(nn.Module):
                 step_log_prob = jnp.where(still_running, token_log_prob, 0.0)
                 log_prob = log_prob + step_log_prob
                 per_step_log_prob = per_step_log_prob.at[..., step_idx].set(step_log_prob)
+                # Entropy of the whole per-step categorical - see the
+                # parallel replay path's identical comment above.
+                per_step_entropy = per_step_entropy.at[..., step_idx].set(
+                    jnp.where(still_running, _categorical_entropy(log_token_probs), 0.0)
+                )
             elif deterministic:
                 token_id = jnp.argmax(token_logits, axis=-1)
             else:
@@ -501,6 +538,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 emitted_tokens,
                 log_prob,
                 per_step_log_prob,
+                per_step_entropy,
                 final_state,
                 rng,
             )
@@ -521,6 +559,7 @@ class TransformerExplicitCoTTorso(nn.Module):
             emitted_tokens,
             log_prob,
             per_step_log_prob,
+            per_step_entropy,
             final_state,
             step_rng,
         )
@@ -533,10 +572,11 @@ class TransformerExplicitCoTTorso(nn.Module):
             emitted_tokens,
             log_prob,
             per_step_log_prob,
+            per_step_entropy,
             final_state,
             _,
         ), _ = scan_step(backbone, initial_carry, jnp.arange(self.max_steps))
 
         if replaying:
-            return final_state, log_prob, per_step_log_prob
+            return final_state, log_prob, per_step_log_prob, per_step_entropy
         return final_state, num_steps_taken, emitted_tokens

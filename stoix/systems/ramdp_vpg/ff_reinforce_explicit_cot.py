@@ -223,9 +223,10 @@ def get_learner_fn(
             # Replay the halting-and-token trajectory actually taken during
             # rollout, mirroring log_prob(actions) evaluating the stored action.
             # Plain REINFORCE wants the joint trajectory log-prob (`log_prob`);
-            # the per-step breakdown is only needed for per-decision PPO
-            # clipping (see `ff_ppo_explicit_cot.py`), so it's ignored here.
-            actor_policy, cot_log_prob, _ = actor_apply_fn(
+            # the per-step breakdown/entropy is only needed for per-decision
+            # PPO clipping/the halting entropy bonus (see
+            # `ff_ppo_explicit_cot.py`), so both are ignored here.
+            actor_policy, cot_log_prob, _, _ = actor_apply_fn(
                 actor_params,
                 observations,
                 torso_kwargs={"target_tokens": thought_tokens},

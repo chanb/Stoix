@@ -587,6 +587,7 @@ class Job:
     clip_eps: float
     clip_value_loss: bool
     latent_kl_coef: float
+    halting_ent_coef: float
     recompute_advantages: bool
     critic_before_actor: bool
     use_layer_norm: bool
@@ -661,6 +662,8 @@ class Job:
             extra.append(f"deta{self.delightful_eta:g}")
         if self.latent_kl_coef:
             extra.append(f"lkl{self.latent_kl_coef:g}")
+        if self.halting_ent_coef:
+            extra.append(f"hec{self.halting_ent_coef:g}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}")
         if self.critic_weight_decay:
@@ -744,6 +747,11 @@ class Job:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
                 cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
+            # Halting-decision entropy bonus - both ff_ppo.py's own systems
+            # and ff_ppo_explicit_* (unlike latent_kl_coef above, which only
+            # exists on ff_ppo.py's continuous "thought" states) - see
+            # ff_ppo.py's/ff_ppo_explicit_cot.py's module docstrings.
+            cmd.append(f"system.halting_ent_coef={self.halting_ent_coef:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
@@ -1007,6 +1015,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_before_actor,
             ),
             latent_kl_coef,
+            halting_ent_coef,
             qv_critic,
             seed,
         ) in itertools.product(
@@ -1023,6 +1032,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
+            args.halting_ent_coef,
             args.qv_critic,
             range(args.seeds),
         ):
@@ -1045,6 +1055,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for every other system (including explicit-CoT PPO systems).
             if system not in LATENT_KL_PPO_SYSTEMS:
                 latent_kl_coef = args.latent_kl_coef[0]
+            # halting_ent_coef exists on every PPO_SYSTEMS system (unlike
+            # latent_kl_coef above) - forced to the first requested value
+            # for ff_reinforce/ff_qac_*, which have no such config knob.
+            if system not in PPO_SYSTEMS:
+                halting_ent_coef = args.halting_ent_coef[0]
             # qv_critic (shared vs separate-torso Q-V critic) only exists on
             # systems with a genuine Q-V critic (QAC_SYSTEMS) - forced to the
             # first requested value for "reinforce" systems (V-only critic,
@@ -1073,6 +1088,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     clip_eps=clip_eps,
                     clip_value_loss=clip_value_loss,
                     latent_kl_coef=latent_kl_coef,
+                    halting_ent_coef=halting_ent_coef,
                     recompute_advantages=recompute_advantages,
                     critic_before_actor=critic_before_actor,
                     use_layer_norm=use_layer_norm,
@@ -1281,6 +1297,20 @@ def main() -> None:
         "only (LATENT_KL_PPO_SYSTEMS), not ff_ppo_explicit_*.",
     )
     parser.add_argument(
+        "--halting-ent-coef",
+        default="0.0",
+        help="Comma-separated system.halting_ent_coef values - entropy regularisation "
+        "coefficient for the halting decision itself (a per-step Bernoulli for the IRU/GRU/mlp/"
+        "latent-CoT torsos, or the whole per-step categorical - thought tokens plus 'act now' - "
+        "for the explicit-CoT torso), separate from --ent-coef, which only ever reaches the "
+        "environment action's distribution. Without this, nothing keeps the halting policy from "
+        "collapsing to a degenerate, non-adaptive compute-time before discovering genuine "
+        "per-example structure (0.0 disables it) - see ff_ppo.py's/ff_ppo_explicit_cot.py's "
+        "module docstrings. Applies to every system in PPO_SYSTEMS (unlike --latent-kl-coef "
+        "above, both ff_ppo.py's own systems and ff_ppo_explicit_*) - ff_reinforce/ff_qac_* "
+        "have no such config knob.",
+    )
+    parser.add_argument(
         "--qv-critic",
         default="shared",
         help=f"Comma-separated subset of {{{','.join(QV_CRITIC_CHOICES)}}} - whether the critic's "
@@ -1419,6 +1449,7 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
+    args.halting_ent_coef = [float(x) for x in args.halting_ent_coef.split(",")]
     args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
@@ -1508,6 +1539,7 @@ def main() -> None:
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
     )
+    print(f"  halting_ent_coef={args.halting_ent_coef} (PPO systems only: {PPO_SYSTEMS})")
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")

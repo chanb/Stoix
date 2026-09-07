@@ -73,7 +73,21 @@ Everything about *how* this is trained follows `ff_ppo.py`, unmodified:
     with its square root), clipping longer-budget runs far more readily than
     short ones for reasons unrelated to whether the update is actually good.
     The two clipped surrogates are added together (each already an average
-    over its own decisions) before the entropy bonus.
+    over its own decisions) before the entropy bonus. The entropy bonus
+    itself has two independent terms, mirroring `ff_ppo.py`:
+    `config.system.ent_coef` on the environment action's distribution
+    entropy, and `config.system.halting_ent_coef` on the CoT-step
+    distribution's own entropy (`per_step_entropy` from the torso - there's
+    no separate halting probability to isolate here, since halting *is*
+    choosing the "act now" class among the same per-step categorical, see
+    `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`'s
+    module docstring). `ent_coef` alone never reaches the CoT-step
+    distribution (`actor_policy` is only the environment action's), so
+    without a dedicated `halting_ent_coef` nothing regularizes the halting
+    decision's own exploration and it's otherwise free to collapse to a
+    degenerate, non-adaptive compute-time before discovering genuine
+    per-example structure. `halting_ent_coef=0.0` (the default) recovers the
+    original behaviour exactly.
   - The critic (V, and Q for "naive"/"fac") is trained with PPO's own clipped
     value loss against the `old` value/Q estimate recorded at rollout time by
     default, or with plain L2 regression when `config.system.clip_value_loss
@@ -246,7 +260,7 @@ def get_learner_fn(
             # (rollout-time) params, giving PPO a fixed "old" log_prob -
             # per-step (not summed), so each CoT step can be ratio/clipped
             # individually rather than as one joint trajectory ratio.
-            _, _, cot_log_prob = actor_apply_fn(
+            _, _, cot_log_prob, _ = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_tokens": thought_tokens},
@@ -370,7 +384,7 @@ def get_learner_fn(
         ) -> Tuple:
             """Calculate the actor loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
-            actor_policy, _, cot_log_prob = actor_apply_fn(
+            actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
                 actor_params,
                 traj_batch.obs,
                 torso_kwargs={"target_tokens": traj_batch.thought_tokens},
@@ -407,16 +421,35 @@ def get_learner_fn(
                 )
                 / num_valid_steps
             )
+            # Entropy bonus on the halting decision - there's no separate
+            # halting probability here (halting *is* choosing the "act now"
+            # class among the per-step categorical, see
+            # `TransformerExplicitCoTTorso`'s module docstring), so this is
+            # the entropy of that whole per-step distribution, same
+            # `valid_step` masking as `cot_loss` above. `ent_coef` alone
+            # never reaches it (`actor_policy.entropy()` is only the
+            # environment action's distribution), so without this nothing
+            # keeps the CoT policy from collapsing to a degenerate,
+            # non-adaptive compute-time before it discovers any genuine
+            # per-example structure - see `ff_ppo.py`'s module docstring for
+            # the same rationale (there, for a separate Bernoulli halting
+            # head instead of a folded-in categorical class).
+            cot_entropy_bonus = jnp.sum(cot_entropy * valid_step) / num_valid_steps
 
             loss_actor = action_loss + cot_loss
             entropy = actor_policy.entropy().mean()
 
-            total_loss_actor = loss_actor - config.system.ent_coef * entropy
+            total_loss_actor = (
+                loss_actor
+                - config.system.ent_coef * entropy
+                - config.system.halting_ent_coef * cot_entropy_bonus
+            )
             loss_info = {
                 "actor_loss": loss_actor,
                 "action_loss": action_loss,
                 "cot_loss": cot_loss,
                 "entropy": entropy,
+                "halting_entropy": cot_entropy_bonus,
                 "advantages": advantage,
                 "compute_time": traj_batch.compute_time,
                 "action_clip_fraction": action_clip_fraction,
@@ -656,7 +689,7 @@ def get_learner_fn(
                     """
                     # Replay the token trajectory actually taken during
                     # rollout, mirroring log_prob(traj_batch.action) below.
-                    actor_policy, _, cot_log_prob = actor_apply_fn(
+                    actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_tokens": traj_batch.thought_tokens},
@@ -714,16 +747,37 @@ def get_learner_fn(
                         )
                         / num_valid_steps
                     )
+                    # Entropy bonus on the halting decision - there's no
+                    # separate halting probability here (halting *is*
+                    # choosing the "act now" class among the per-step
+                    # categorical, see `TransformerExplicitCoTTorso`'s
+                    # module docstring), so this is the entropy of that
+                    # whole per-step distribution, same `valid_step` masking
+                    # as `cot_loss` above. `ent_coef` alone never reaches it
+                    # (`actor_policy.entropy()` is only the environment
+                    # action's distribution), so without this nothing keeps
+                    # the CoT policy from collapsing to a degenerate,
+                    # non-adaptive compute-time before it discovers any
+                    # genuine per-example structure - see `ff_ppo.py`'s
+                    # module docstring for the same rationale (there, for a
+                    # separate Bernoulli halting head instead of a
+                    # folded-in categorical class).
+                    cot_entropy_bonus = jnp.sum(cot_entropy * valid_step) / num_valid_steps
 
                     loss_actor = action_loss + cot_loss
                     entropy = actor_policy.entropy().mean()
 
-                    total_loss_actor = loss_actor - config.system.ent_coef * entropy
+                    total_loss_actor = (
+                        loss_actor
+                        - config.system.ent_coef * entropy
+                        - config.system.halting_ent_coef * cot_entropy_bonus
+                    )
                     loss_info = {
                         "actor_loss": loss_actor,
                         "action_loss": action_loss,
                         "cot_loss": cot_loss,
                         "entropy": entropy,
+                        "halting_entropy": cot_entropy_bonus,
                         "advantages": advantage,
                         "compute_time": traj_batch.compute_time,
                         "action_clip_fraction": action_clip_fraction,

@@ -40,7 +40,15 @@ clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"
   # (stoix.utils.loss.clipped_value_loss), or plain L2 regression to the target instead
   # (rlax.l2_loss, as in ff_reinforce.py/ff_qac.py). Only affects the critic - the actor's
   # ratio is always clipped regardless of this setting.
-ent_coef: 0.01 # Entropy regularisation term for loss function.
+ent_coef: 0.01 # Entropy regularisation term for the environment action's distribution.
+halting_ent_coef: 0.0 # Entropy regularisation term for the CoT-step distribution's own
+  # entropy (thought tokens and the halting "act now" class together - there's no separate
+  # halting probability to isolate, see TransformerExplicitCoTTorso's module docstring),
+  # separate from ent_coef above since that only ever reaches the environment action's
+  # distribution - without this, nothing keeps the halting decision from collapsing to a
+  # degenerate, non-adaptive compute-time before discovering genuine per-example structure.
+  # 0.0 (default) disables it exactly, recovering the original ff_ppo_explicit_cot.py
+  # behaviour. See ff_ppo_explicit_cot.py's module docstring.
 vf_coef: 0.5 # Critic weight.
 recompute_advantages: False # Whether the advantage's "what changed" term (Q(s,a,c) for the
   # four Q-V variants, V(s) for "reinforce") and the critic's own regression target are

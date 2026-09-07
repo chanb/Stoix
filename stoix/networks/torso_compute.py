@@ -23,7 +23,7 @@ module has two modes:
   - Replay mode (`target_compute_time=<array from a stored transition>`):
     deterministically replays exactly that many steps (no sampling/rng
     needed) and returns `(embedding, halting_log_prob, states_history,
-    per_step_halting_log_prob)`:
+    per_step_halting_log_prob, per_step_halting_entropy)`:
     `halting_log_prob` is the log-probability, under the current parameters,
     of having produced that exact halting trajectory - what a REINFORCE-style
     loss should use, mirroring how `distribution.log_prob(stored_action)`
@@ -44,8 +44,15 @@ module has two modes:
     `max_steps` - see below) or past the step the trajectory actually
     halted at - for a caller that wants to PPO-clip each pondering step's
     ratio individually instead of one joint ratio over the trajectory's
-    summed log-prob (see `ff_ppo.py`). Rollout mode's return is unchanged -
-    both of these are only available when replaying, since they're only ever
+    summed log-prob (see `ff_ppo.py`). `per_step_halting_entropy` (same
+    shape/masking as `per_step_halting_log_prob`) is the Bernoulli entropy
+    of each step's halting probability - for a caller that wants an entropy
+    *bonus* on the halting decision itself, on top of the usual entropy
+    bonus on the environment action (see `ff_ppo.py`); computed from the
+    live (non-stop-gradient'd) halting probability, so gradient flows into
+    the halting head the same way `actor_policy.entropy()` does for the
+    environment action. Rollout mode's return is unchanged - all three of
+    these are only available when replaying, since they're only ever
     compared against another replay pass at the same `target_compute_time`.
 
 A transformer-with-chain-of-thought torso would plug into the same
@@ -179,7 +186,8 @@ class AdaptiveComputationTimeTorso(nn.Module):
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
             `(embedding, halting_log_prob, states_history,
-            per_step_halting_log_prob)` when replaying a known trajectory
+            per_step_halting_log_prob, per_step_halting_entropy)` when
+            replaying a known trajectory
             (see class docstring for the convergence diagnostics, module
             docstring for `states_history`/`per_step_halting_log_prob`).
         """
@@ -223,6 +231,7 @@ class AdaptiveComputationTimeTorso(nn.Module):
         if replaying:
             states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
             per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
+            per_step_halting_entropy = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
@@ -286,13 +295,39 @@ class AdaptiveComputationTimeTorso(nn.Module):
                 per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
                     step_contribution
                 )
+                # Bernoulli entropy of this step's halting decision - masked
+                # identically to `step_contribution` above (zero before
+                # min_steps, at the forced max_steps halt, and once an
+                # example has already halted), since a forced decision isn't
+                # a "choice" to encourage exploration in. Uses `halting_prob`
+                # directly (not `halting_prob_for_log`): a caller after an
+                # entropy *bonus* wants gradient into the halting head here,
+                # exactly as `actor_policy.entropy()` does for the
+                # environment action - see ff_ppo.py.
+                halting_entropy_this_step = -(
+                    halting_prob * jnp.log(halting_prob)
+                    + (1.0 - halting_prob) * jnp.log(1.0 - halting_prob)
+                )
+                per_step_halting_entropy = per_step_halting_entropy.at[..., step].set(
+                    jnp.where(
+                        jnp.logical_and(still_running, not is_forced_step),
+                        halting_entropy_this_step,
+                        0.0,
+                    )
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
             still_running = still_running & (~halts_this_step)
 
         if replaying:
-            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
+            return (
+                final_state,
+                halting_log_prob,
+                states_history,
+                per_step_halting_log_prob,
+                per_step_halting_entropy,
+            )
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
@@ -414,7 +449,8 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
             `(embedding, halting_log_prob, states_history,
-            per_step_halting_log_prob)` when replaying a known trajectory
+            per_step_halting_log_prob, per_step_halting_entropy)` when
+            replaying a known trajectory
             (see class docstring for the convergence diagnostics, module
             docstring for `states_history`/`per_step_halting_log_prob`).
         """
@@ -461,6 +497,7 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         if replaying:
             states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
             per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
+            per_step_halting_entropy = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
@@ -526,6 +563,26 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
                 per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
                     step_contribution
                 )
+                # Bernoulli entropy of this step's halting decision - masked
+                # identically to `step_contribution` above (zero before
+                # min_steps, at the forced max_steps halt, and once an
+                # example has already halted), since a forced decision isn't
+                # a "choice" to encourage exploration in. Uses `halting_prob`
+                # directly (not `halting_prob_for_log`): a caller after an
+                # entropy *bonus* wants gradient into the halting head here,
+                # exactly as `actor_policy.entropy()` does for the
+                # environment action - see ff_ppo.py.
+                halting_entropy_this_step = -(
+                    halting_prob * jnp.log(halting_prob)
+                    + (1.0 - halting_prob) * jnp.log(1.0 - halting_prob)
+                )
+                per_step_halting_entropy = per_step_halting_entropy.at[..., step].set(
+                    jnp.where(
+                        jnp.logical_and(still_running, not is_forced_step),
+                        halting_entropy_this_step,
+                        0.0,
+                    )
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -534,7 +591,13 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = jnp.tanh(final_state)
 
         if replaying:
-            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
+            return (
+                final_state,
+                halting_log_prob,
+                states_history,
+                per_step_halting_log_prob,
+                per_step_halting_entropy,
+            )
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
@@ -700,7 +763,8 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
             `(embedding, halting_log_prob, states_history,
-            per_step_halting_log_prob)` when replaying a known trajectory
+            per_step_halting_log_prob, per_step_halting_entropy)` when
+            replaying a known trajectory
             (see class docstring for the convergence diagnostics, module
             docstring for `states_history`/`per_step_halting_log_prob`).
         """
@@ -752,6 +816,7 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         if replaying:
             states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
             per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
+            per_step_halting_entropy = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
@@ -817,6 +882,26 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
                 per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
                     step_contribution
                 )
+                # Bernoulli entropy of this step's halting decision - masked
+                # identically to `step_contribution` above (zero before
+                # min_steps, at the forced max_steps halt, and once an
+                # example has already halted), since a forced decision isn't
+                # a "choice" to encourage exploration in. Uses `halting_prob`
+                # directly (not `halting_prob_for_log`): a caller after an
+                # entropy *bonus* wants gradient into the halting head here,
+                # exactly as `actor_policy.entropy()` does for the
+                # environment action - see ff_ppo.py.
+                halting_entropy_this_step = -(
+                    halting_prob * jnp.log(halting_prob)
+                    + (1.0 - halting_prob) * jnp.log(1.0 - halting_prob)
+                )
+                per_step_halting_entropy = per_step_halting_entropy.at[..., step].set(
+                    jnp.where(
+                        jnp.logical_and(still_running, not is_forced_step),
+                        halting_entropy_this_step,
+                        0.0,
+                    )
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -825,7 +910,13 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = jnp.tanh(final_state)
 
         if replaying:
-            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
+            return (
+                final_state,
+                halting_log_prob,
+                states_history,
+                per_step_halting_log_prob,
+                per_step_halting_entropy,
+            )
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
 
 
@@ -909,7 +1000,8 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
             `(embedding, compute_time, first_convergence_step,
             num_close_steps)` when `target_compute_time` is None, or
             `(embedding, halting_log_prob, states_history,
-            per_step_halting_log_prob)` when replaying a known trajectory
+            per_step_halting_log_prob, per_step_halting_entropy)` when
+            replaying a known trajectory
             (see class docstring for the convergence diagnostics, module
             docstring for `states_history`/`per_step_halting_log_prob`).
         """
@@ -954,6 +1046,7 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
         if replaying:
             states_history = jnp.zeros(batch_shape + (self.max_steps, self.hidden_dim))
             per_step_halting_log_prob = jnp.zeros(batch_shape + (self.max_steps,))
+            per_step_halting_entropy = jnp.zeros(batch_shape + (self.max_steps,))
 
         for step in range(self.max_steps):
             prev_state = state
@@ -1030,6 +1123,26 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
                 per_step_halting_log_prob = per_step_halting_log_prob.at[..., step].set(
                     step_contribution
                 )
+                # Bernoulli entropy of this step's halting decision - masked
+                # identically to `step_contribution` above (zero before
+                # min_steps, at the forced max_steps halt, and once an
+                # example has already halted), since a forced decision isn't
+                # a "choice" to encourage exploration in. Uses `halting_prob`
+                # directly (not `halting_prob_for_log`): a caller after an
+                # entropy *bonus* wants gradient into the halting head here,
+                # exactly as `actor_policy.entropy()` does for the
+                # environment action - see ff_ppo.py.
+                halting_entropy_this_step = -(
+                    halting_prob * jnp.log(halting_prob)
+                    + (1.0 - halting_prob) * jnp.log(1.0 - halting_prob)
+                )
+                per_step_halting_entropy = per_step_halting_entropy.at[..., step].set(
+                    jnp.where(
+                        jnp.logical_and(still_running, not is_forced_step),
+                        halting_entropy_this_step,
+                        0.0,
+                    )
+                )
             num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
@@ -1038,5 +1151,11 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
         final_state = jnp.tanh(final_state)
 
         if replaying:
-            return final_state, halting_log_prob, states_history, per_step_halting_log_prob
+            return (
+                final_state,
+                halting_log_prob,
+                states_history,
+                per_step_halting_log_prob,
+                per_step_halting_entropy,
+            )
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
