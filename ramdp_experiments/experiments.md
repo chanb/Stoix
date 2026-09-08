@@ -504,14 +504,22 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinf
 
 # Comments on Sept 8
 - For lightsout, 64 dim is the best for all architectures. When using 128 dim, the models are already pretty good without extra compute: See https://wandb.ai/bpychan-university-of-alberta/lightsout-sep7
-- 
+- There was a bug in `cond_fac`, where the Q-function inference is `Q(s, a, c)` rather than `gamma**(c - 1) Q(s, a, 1)`
+  - IRU lightsout: `cond_fac` is somewhat noisy, the performance is fluctuating a lot as the model if decreasing its runtime
+- https://wandb.ai/bpychan-university-of-alberta/lightsout-sep8 : no cba nor recompute adv
+- https://wandb.ai/bpychan-university-of-alberta/lightsout-sep7 : cba but no recompute adv
 
 ## Maze
 ### IRU
 ```
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 3 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
 
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 3 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing --qv-critic separate
+
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor false --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing --qv-critic separate
 ```
 
 ## Sokoban

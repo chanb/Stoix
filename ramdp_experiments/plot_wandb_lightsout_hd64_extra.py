@@ -8,7 +8,11 @@ Produces, per architecture:
   1. lightsout_hd64_<arch>_pareto.pdf - final compute (ponder steps) vs.
      final performance scatter: fixed-budget points plus adaptive-budget
      points, so the compute/performance trade-off is readable in one panel
-     instead of cross-referencing separate figures.
+     instead of cross-referencing separate figures. For
+     Transformer-ExplicitCoT, which has a vocab_size axis, this is one file
+     per vocab_size instead (lightsout_hd64_transformer-explicitcot_vocab
+     <N>_pareto.pdf) - the vocab_size=1/budget=1 point is shared across all
+     of them (see expand_vocab_agnostic_budget1 in the main script).
   2. lightsout_hd64_<arch>_seed_variance.pdf - per-seed strip plot + mean/SE
      point, budget on x, instead of collapsing straight to mean +/- SEM;
      shows whether spread is genuine or one outlier seed.
@@ -105,15 +109,22 @@ def determine_primary_vocab(sub_arch: pd.DataFrame) -> int:
     return counts.idxmax()
 
 
-def plot_pareto(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -> None:
+def plot_pareto(
+    df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path, vocab_size: int | None = None
+) -> None:
     """Final compute (ponder steps) vs. final performance for one
-    architecture. Fixed-budget points are plain markers (no connecting
-    line - budget isn't an ordered path through compute/performance space,
-    so a line between them implies a trend that isn't really there);
-    adaptive-budget points (one per qac_variant) are separate markers.
-    For Transformer-ExplicitCoT only the "primary" vocab_size (the one with
-    the widest fixed-budget sweep) is shown - the dedicated vocab_size
-    breakdown lives in the main script's figures."""
+    architecture (and, for Transformer-ExplicitCoT, one vocab_size). Fixed-
+    budget points are plain markers (no connecting line - budget isn't an
+    ordered path through compute/performance space, so a line between them
+    implies a trend that isn't really there); adaptive-budget points (one
+    per qac_variant) are separate markers.
+
+    `vocab_size`, when given, restricts to that vocab_size (the caller loops
+    over every vocab_size present and makes one file each, since
+    expand_vocab_agnostic_budget1 already folded the shared vocab_size=1
+    budget=1 point into every vocab_size group upstream). When omitted
+    (non-eCoT architectures, which have no vocab_size axis), falls back to
+    the "primary" vocab_size (the sentinel, a no-op for those archs)."""
     return_metrics = METRICS[:2]
     compute_metric = METRICS[2]
     qac_markers = {"reinforce": "D", "cond_fac": "s", "cond_naive": "^"}
@@ -121,8 +132,9 @@ def plot_pareto(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -
     fixed_color = "0.25"
 
     sub_arch = df[df["arch"] == arch]
-    primary_vocab = determine_primary_vocab(sub_arch)
-    arch_sub = sub_arch[sub_arch["vocab_size"] == primary_vocab]
+    if vocab_size is None:
+        vocab_size = determine_primary_vocab(sub_arch)
+    arch_sub = sub_arch[sub_arch["vocab_size"] == vocab_size]
 
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
@@ -182,6 +194,10 @@ def plot_pareto(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -
         if col == 0:
             ax.set_ylabel("Final performance\n(mean of last 3 evals, ± SEM)", fontsize=8)
 
+    title = f"{arch}: compute vs. performance (Pareto view)"
+    if vocab_size != VOCAB_SIZE_NA:
+        title += f", vocab={vocab_size}"
+
     by_label: dict = {}
     for ax in axes:
         h, l = ax.get_legend_handles_labels()
@@ -193,7 +209,7 @@ def plot_pareto(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -
         list(by_label.keys()),
         min(len(by_label), 4),
         figsize,
-        f"{arch}: compute vs. performance (Pareto view)",
+        title,
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
@@ -527,7 +543,19 @@ def main() -> None:
         if arch not in df["arch"].unique():
             continue
         safe_name = arch.lower().replace(" ", "_")
-        plot_pareto(df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_pareto.pdf", args.output_dir)
+        sub_arch = df[df["arch"] == arch]
+        vocab_values = sorted(v for v in sub_arch["vocab_size"].unique() if v != VOCAB_SIZE_NA)
+        if vocab_values:
+            for vocab_size in vocab_values:
+                plot_pareto(
+                    df,
+                    arch,
+                    args.output_dir / f"lightsout_hd64_{safe_name}_vocab{vocab_size}_pareto.pdf",
+                    args.output_dir,
+                    vocab_size=vocab_size,
+                )
+        else:
+            plot_pareto(df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_pareto.pdf", args.output_dir)
         plot_seed_variance(
             df, arch, variant_palette, args.output_dir / f"lightsout_hd64_{safe_name}_seed_variance.pdf", args.output_dir
         )
