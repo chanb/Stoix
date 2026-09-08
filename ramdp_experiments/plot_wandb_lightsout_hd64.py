@@ -422,6 +422,12 @@ def main() -> None:
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
+    # Config identity now dedups runs (see fetch_wandb_lightsout_hd64.py), so
+    # a still-running run only shows up here when no finished run with that
+    # exact config exists yet (e.g. a newly-launched sweep) - keep only
+    # finished ones so a handful of early eval points from an in-progress
+    # run don't truncate or otherwise skew an aggregate curve.
+    df = df[df["state"] == "finished"]
     df = df[~df["sgh"]]
     # IRU-ACT has some runs launched with total_timesteps=1e8 alongside the
     # main 3e8 sweep for the same (qac_variant, budget) config; keep only

@@ -6,14 +6,23 @@ to a local parquet file for plotting (see plot_wandb_lightsout_hd64.py).
 
 The project mixes runs logged under a couple of config schema versions (e.g.
 `stop_gradient_halting_input` / `halting_ent_coef` only exist on newer runs,
-and some (arch, qac_variant, budget, seed) combos were relaunched and so have
-duplicate rows). This script:
+and some configs were relaunched and so have duplicate rows). This script:
   - normalizes `stop_gradient_halting_input` (absent == False)
-  - dedupes by (arch, qac_variant, min_steps, max_steps, sgh, vocab_size,
-    total_timesteps, seed), keeping the most-recently-created run,
-    preferring `finished` over other states (IRU-ACT has both 1e8- and
-    3e8-timestep runs for the same otherwise-matching config; without this
-    axis they'd collide in the dedup key and get silently mixed)
+  - dedupes by the run's full config (everything except the `logger`
+    subtree, which is pure logging plumbing - exp path, wandb run id, tags -
+    not experiment identity), keeping the most-recently-created run per
+    identical config, preferring `finished` over other states.
+
+    Deliberately NOT deduped by a hand-picked tuple of fields (arch,
+    qac_variant, budget, ...): earlier versions of this script did that and
+    it kept silently mixing distinct runs together every time a new
+    hyperparameter axis turned out to vary (stop_gradient_halting_input,
+    vocab_size, total_timesteps each caused this in turn) but wasn't yet in
+    the tuple. The run's naming convention (`logger.base_exp_path` /
+    `group_tag`) has the exact same blind spot - it's built from a fixed set
+    of tag components that new hyperparameters aren't automatically added
+    to. Keying off the actual config sidesteps the whole class of bug: any
+    config difference, known or not-yet-discovered, makes two runs distinct.
 
 Usage:
   python ramdp_experiments/fetch_wandb_lightsout_hd64.py --out wandb_cache_hd64.parquet
@@ -22,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -54,6 +64,19 @@ def cfg_get(c: dict, path: str, default=None):
 
 VOCAB_SIZE_NA = -1  # sentinel: architecture has no vocab_size (only Transformer-ExplicitCoT does)
 
+# Config subtrees that are logging plumbing, not experiment identity - two
+# runs with identical hyperparameters but different exp paths / wandb run
+# ids / tags are the same experiment (a relaunch), not different ones.
+IDENTITY_EXCLUDE_KEYS = {"logger"}
+
+
+def config_identity_key(c: dict) -> str:
+    """Canonical string identity for a run's config: every field except
+    `logger`. Two runs get the same key iff every hyperparameter matches -
+    this is what dedup should key on, not a hand-picked subset of fields."""
+    identity = {k: v for k, v in c.items() if k not in IDENTITY_EXCLUDE_KEYS}
+    return json.dumps(identity, sort_keys=True)
+
 
 @dataclass
 class RunMeta:
@@ -66,6 +89,7 @@ class RunMeta:
     vocab_size: int
     total_timesteps: int
     seed: int
+    config_key: str
     created_at: str
     state: str
 
@@ -107,6 +131,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
                     vocab_size=vocab_size,
                     total_timesteps=int(float(total_timesteps_raw)),
                     seed=int(seed),
+                    config_key=config_identity_key(c),
                     created_at=str(r.created_at),
                     state=r.state,
                 ),
@@ -118,29 +143,20 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
 def dedupe_latest(
     rows: List[Tuple["wandb.apis.public.Run", RunMeta]]
 ) -> List[Tuple["wandb.apis.public.Run", RunMeta]]:
-    """Keep, per (arch, qac_variant, min_steps, max_steps, sgh, seed), the
-    best run: finished beats non-finished, then most-recently-created wins."""
-    best: Dict[tuple, Tuple["wandb.apis.public.Run", RunMeta]] = {}
+    """Keep, per identical config (meta.config_key - see config_identity_key),
+    the best run: finished beats non-finished, then most-recently-created
+    wins."""
+    best: Dict[str, Tuple["wandb.apis.public.Run", RunMeta]] = {}
     for run, meta in rows:
-        key = (
-            meta.arch,
-            meta.qac_variant,
-            meta.min_steps,
-            meta.max_steps,
-            meta.sgh,
-            meta.vocab_size,
-            meta.total_timesteps,
-            meta.seed,
-        )
-        cur = best.get(key)
+        cur = best.get(meta.config_key)
         if cur is None:
-            best[key] = (run, meta)
+            best[meta.config_key] = (run, meta)
             continue
         _, cur_meta = cur
         rank = (meta.state == "finished", meta.created_at)
         cur_rank = (cur_meta.state == "finished", cur_meta.created_at)
         if rank > cur_rank:
-            best[key] = (run, meta)
+            best[meta.config_key] = (run, meta)
     return list(best.values())
 
 
@@ -154,7 +170,7 @@ def main() -> None:
     all_rows = fetch_run_metas(args.project)
     print(f"  {len(all_rows)} runs match hidden_dim=64")
     deduped = dedupe_latest(all_rows)
-    print(f"  {len(deduped)} runs after dedup by (arch, qac_variant, budget, sgh, seed)")
+    print(f"  {len(deduped)} runs after dedup by full config identity")
 
     frames = []
     for i, (run, meta) in enumerate(deduped):
@@ -173,6 +189,7 @@ def main() -> None:
         hist["total_timesteps"] = meta.total_timesteps
         hist["seed"] = meta.seed
         hist["run_id"] = meta.run_id
+        hist["state"] = meta.state
         frames.append(hist)
         print(f"  [{i+1}/{len(deduped)}] {run.id} ({meta.arch}, seed={meta.seed}): {len(hist)} rows")
 

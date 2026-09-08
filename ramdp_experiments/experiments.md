@@ -505,3 +505,19 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinf
 # Comments on Sept 8
 - For lightsout, 64 dim is the best for all architectures. When using 128 dim, the models are already pretty good without extra compute: See https://wandb.ai/bpychan-university-of-alberta/lightsout-sep7
 - 
+
+## Maze
+### IRU
+```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
+```
+
+## Sokoban
+### IRU
+```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 128 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 32 --epochs 4 --num-minibatches 8 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project sokoban-sep8 --yes --no-skip-existing
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 128 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 32 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project sokoban-sep8 --yes --no-skip-existing
+```
