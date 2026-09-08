@@ -470,6 +470,12 @@ Submitted batch job 814461
 - Knapsack has slightly nice trend, but they're all close to optimal.
 - I think for lightsout and maze (with lower returns) we can just have larger models and decreasing the budget
 - Maybe it's worthwhile to think about whether the halting mechanism learns as quickly as the policy.
+  - Stop gradient from flowing to torso from halting predictor: Seems to help in the small parameter space (maze)---but not for IRU lightsout with larger hidden dim
+  - Halt entropy?
+- For IRU lightsout, 32 hidden dim is too weak, (max - min: ~4% pt)
+  - Both 64 and 128 hidden dims have better improvement (max - min: ~7% pt and ~14% pt resp.)
+  - Train for 3e8 instead of just 1e8 (like the TF models)
+- Maze should use CNN architecture
 
 ## Knapsack
 TODO
@@ -481,14 +487,21 @@ python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforc
 
 python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
 
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input true --halting-ent-coef 0.0,0.001,0.01 --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --halting-ent-coef 0.0,0.001,0.01 --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing
 ```
 
-### iCoT
-```
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 5 --runs-per-gpu 1 --architectures transformer --hidden-dim 32 --mlp-dim 128 --num-heads 8 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
 
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures transformer --hidden-dim 32 --mlp-dim 128 --num-heads 8 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
-
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures transformer --hidden-dim 32 --mlp-dim 128 --num-heads 8 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false,true --wandb true --wandb-project maze-sep7 --yes --no-skip-existing
+## Sokoban
+### IRU
 ```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project sokoban-sep7 --yes --no-skip-existing
+
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project sokoban-sep7 --yes --no-skip-existing
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project sokoban-sep7 --yes --no-skip-existing
+```
+
+
+# Comments on Sept 8
+- For lightsout, 64 dim is the best for all architectures. When using 128 dim, the models are already pretty good without extra compute: See https://wandb.ai/bpychan-university-of-alberta/lightsout-sep7
+- 
