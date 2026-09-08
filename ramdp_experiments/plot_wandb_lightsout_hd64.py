@@ -301,7 +301,7 @@ def plot_budget_vs_performance(
         f"{arch}: fixed budget vs. final performance",
     )
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -363,7 +363,7 @@ def plot_arch(df: pd.DataFrame, arch: str, budget_colors: dict, output_path: Pat
         fig, list(by_label.values()), list(by_label.keys()), min(len(by_label), 4), figsize, arch
     )
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -410,7 +410,7 @@ def plot_headline_comparison(df: pd.DataFrame, output_path: Path, out_dir: Path)
         "Architecture comparison (adaptive budget, REINFORCE, no stop-grad halt)",
     )
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -443,16 +443,16 @@ def main() -> None:
         if arch not in df["arch"].unique():
             continue
         safe_name = arch.lower().replace(" ", "_")
-        plot_arch(df, arch, budget_colors, args.output_dir / f"lightsout_hd64_{safe_name}.png", args.output_dir)
+        plot_arch(df, arch, budget_colors, args.output_dir / f"lightsout_hd64_{safe_name}.pdf", args.output_dir)
         plot_budget_vs_performance(
             df,
             arch,
             variant_colors,
-            args.output_dir / f"lightsout_hd64_{safe_name}_budget_vs_performance.png",
+            args.output_dir / f"lightsout_hd64_{safe_name}_budget_vs_performance.pdf",
             args.output_dir,
         )
 
-    plot_headline_comparison(df, args.output_dir / "lightsout_hd64_arch_comparison.png", args.output_dir)
+    plot_headline_comparison(df, args.output_dir / "lightsout_hd64_arch_comparison.pdf", args.output_dir)
 
 
 if __name__ == "__main__":

@@ -185,19 +185,28 @@ def get_learner_fn(
         "reinforce",
     ), f"Unknown qac_variant: {qac_variant}"
     is_qac = qac_variant in ("naive", "fac", "cond_naive", "cond_fac")
-    # "cond_naive"/"cond_fac" condition the critic on compute_time as an
-    # extra input rather than via table-indexing ("naive") or scaling ("fac").
-    condition_q_on_compute_time = qac_variant in ("cond_naive", "cond_fac")
 
     def _q_output(
         critic_params: FrozenDict, obs: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
-        """Get the critic's raw `q_value` output. "cond_naive"/"cond_fac"
-        condition the network on `compute_time` as an extra input; the other
-        variants apply it afterwards instead, see `_q_at_action_and_compute_time`."""
-        if condition_q_on_compute_time:
+        """Get the critic's raw `q_value` output. "cond_naive" conditions the
+        network on the realised `compute_time` as an extra input; "cond_fac"
+        shares that same conditioned architecture/parameter count but is
+        always queried at the fixed reference `compute_time=1`, so - like
+        "fac" - its raw output is `c`-invariant and stays a genuine Q(s,·,1)
+        that the `gamma ** (c - 1)` scaling in `_q_at_action_and_compute_time`
+        is the *only* source of `c`-dependence for. The other variants apply
+        `compute_time` afterwards instead, see `_q_at_action_and_compute_time`."""
+        if qac_variant == "cond_naive":
             return critic_apply_fn(
                 critic_params, obs, method="q_value", compute_time=compute_time
+            )
+        if qac_variant == "cond_fac":
+            return critic_apply_fn(
+                critic_params,
+                obs,
+                method="q_value",
+                compute_time=jnp.ones_like(compute_time),
             )
         return critic_apply_fn(critic_params, obs, method="q_value")
 
@@ -208,8 +217,10 @@ def get_learner_fn(
         parameterised: "naive" indexes a `(num_actions, max_steps)` table by
         both `action` and `compute_time`; "fac" indexes Q(s,·,1) by `action`
         then scales by `gamma ** (compute_time - 1)`; "cond_naive" indexes
-        the already-conditioned Q(s,·,c) by `action` only; "cond_fac" does
-        the same plus the `gamma ** (compute_time - 1)` scaling."""
+        the already-conditioned Q(s,·,c) by `action` only; "cond_fac" indexes
+        Q(s,·,1) (from `_q_output`'s fixed `compute_time=1` query) by
+        `action`, then applies the same `gamma ** (compute_time - 1)` scaling
+        as "fac"."""
         if qac_variant == "naive":
             compute_time_idx = (compute_time - 1).astype(jnp.int32)
             q_at_c = jnp.take_along_axis(
@@ -799,10 +810,9 @@ def get_learner_fn(
                             critic_params, traj_batch.obs, traj_batch.compute_time
                         )
                         if qac_variant == "fac":
-                            # Regress the raw (unscaled) Q(s,·,1) prediction
-                            # against a rescaled target - keeps the critic's
-                            # gradient in the same (c=1) scale regardless of
-                            # the realised compute time.
+                            # Scale the raw Q(s,·,1) prediction up to the true
+                            # Q(s,a,c) scale by gamma ** (c - 1), then regress
+                            # against `targets` (already on that true scale).
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
                             ).squeeze(-1) * config.system.gamma ** (
@@ -810,8 +820,11 @@ def get_learner_fn(
                             )
                             q_targets = targets
                         else:  # "naive", "cond_naive", "cond_fac"
-                            # Already in the true Q(s,a,c) scale, so regress
-                            # directly against targets.
+                            # "naive"/"cond_naive" are already in the true
+                            # Q(s,a,c) scale; "cond_fac" goes through the same
+                            # gamma ** (c - 1) rescaling as "fac" above (see
+                            # `_q_at_action_and_compute_time`). Either way,
+                            # regress directly against targets.
                             q_pred = _q_at_action_and_compute_time(
                                 q_output, traj_batch.action, traj_batch.compute_time
                             )

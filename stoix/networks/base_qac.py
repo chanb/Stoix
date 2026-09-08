@@ -87,15 +87,18 @@ class ValueAndQCritic(nn.Module):
           - "fac": `compute_time=None`, output is `(num_actions,)`,
             representing Q(s,·,1) (the runtime-factorized Q(s,·,c) is
             recovered by the caller scaling this by `gamma ** (c - 1)`).
-          - "cond_naive"/"cond_fac": `compute_time` given, output is
-            `(num_actions,)`, already conditioned on the realised `c` via
-            `_q_input`'s linear feature - "cond_naive" uses it directly as
-            Q(s,·,c); "cond_fac" is still scaled by the caller (see
-            `ff_ppo.py`), to test whether that analytic prior helps *given*
-            the same c-conditioning capacity (and, since both variants share
-            this exact architecture, the same parameter count) as
-            "cond_naive", rather than conflating the prior with a
-            parameter-count difference the way plain "naive" vs "fac" do.
+          - "cond_naive": `compute_time` given as the realised `c`, output is
+            `(num_actions,)`, conditioned on `c` via `_q_input`'s linear
+            feature, and used directly as Q(s,·,c).
+          - "cond_fac": `compute_time` given, but always the fixed reference
+            value `1` (see `ff_ppo.py`'s `_q_output`) rather than the
+            realised `c` - so, like "fac", the raw output is `c`-invariant
+            and represents Q(s,·,1); the caller still scales it by
+            `gamma ** (c - 1)`. This shares "cond_naive"'s exact architecture
+            and parameter count, isolating the parameter-count confound that
+            plain "naive" vs "fac" have (a table vs a single head), while
+            keeping "fac"'s analytic scaling as the only source of
+            `c`-dependence.
         """
         return self.q_head(
             _q_input(self.compute_time_dense, self._embed(observation), compute_time)

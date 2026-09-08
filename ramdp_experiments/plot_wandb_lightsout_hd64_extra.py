@@ -4,21 +4,20 @@
 replacing it. Reads the same CSV cache (see fetch_wandb_lightsout_hd64.py)
 and reuses that module's filtering, style, and helper functions.
 
-Produces, per architecture unless noted:
-  1. lightsout_hd64_pareto.png (one figure, all archs) - final compute
-     (ponder steps) vs. final performance scatter: fixed-budget curve plus
-     adaptive-budget points, so the compute/performance trade-off across
-     architectures is readable from a single panel instead of cross-
-     referencing separate figures.
-  2. lightsout_hd64_<arch>_seed_variance.png - per-seed strip plot + mean/SE
+Produces, per architecture:
+  1. lightsout_hd64_<arch>_pareto.pdf - final compute (ponder steps) vs.
+     final performance scatter: fixed-budget points plus adaptive-budget
+     points, so the compute/performance trade-off is readable in one panel
+     instead of cross-referencing separate figures.
+  2. lightsout_hd64_<arch>_seed_variance.pdf - per-seed strip plot + mean/SE
      point, budget on x, instead of collapsing straight to mean +/- SEM;
      shows whether spread is genuine or one outlier seed.
-  3. lightsout_hd64_<arch>_heatmap.png - (variant x budget) heatmap of final
+  3. lightsout_hd64_<arch>_heatmap.pdf - (variant x budget) heatmap of final
      performance; a compact grid instead of many line/row panels.
-  4. lightsout_hd64_<arch>_steps_to_threshold.png - timesteps needed to
+  4. lightsout_hd64_<arch>_steps_to_threshold.pdf - timesteps needed to
      reach 80% of each run's own final performance, as a bar chart; isolates
      learning *speed* from final performance.
-  5. lightsout_hd64_<arch>_compute_spaghetti.png - per-seed compute-time
+  5. lightsout_hd64_<arch>_compute_spaghetti.pdf - per-seed compute-time
      trajectories (adaptive-budget configs only) as individual thin lines
      instead of a mean +/- SEM band, to see whether halting behavior is
      consistent across seeds or not.
@@ -106,16 +105,24 @@ def determine_primary_vocab(sub_arch: pd.DataFrame) -> int:
     return counts.idxmax()
 
 
-def plot_pareto(df: pd.DataFrame, arch_colors: dict, output_path: Path, out_dir: Path) -> None:
-    """Final compute (ponder steps) vs. final performance, all architectures
-    overlaid. Fixed-budget points are connected into a curve; adaptive-
-    budget points (one per qac_variant) are separate markers. For
-    Transformer-ExplicitCoT only the "primary" vocab_size (the one with the
-    widest fixed-budget sweep) is shown, to keep this headline view legible
-    - the dedicated vocab_size breakdown lives in the main script's figures."""
+def plot_pareto(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -> None:
+    """Final compute (ponder steps) vs. final performance for one
+    architecture. Fixed-budget points are plain markers (no connecting
+    line - budget isn't an ordered path through compute/performance space,
+    so a line between them implies a trend that isn't really there);
+    adaptive-budget points (one per qac_variant) are separate markers.
+    For Transformer-ExplicitCoT only the "primary" vocab_size (the one with
+    the widest fixed-budget sweep) is shown - the dedicated vocab_size
+    breakdown lives in the main script's figures."""
     return_metrics = METRICS[:2]
     compute_metric = METRICS[2]
     qac_markers = {"reinforce": "D", "cond_fac": "s", "cond_naive": "^"}
+    qac_colors = dict(zip(["reinforce", "cond_fac", "cond_naive"], sns.color_palette("colorblind", n_colors=3)))
+    fixed_color = "0.25"
+
+    sub_arch = df[df["arch"] == arch]
+    primary_vocab = determine_primary_vocab(sub_arch)
+    arch_sub = sub_arch[sub_arch["vocab_size"] == primary_vocab]
 
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
@@ -126,60 +133,52 @@ def plot_pareto(df: pd.DataFrame, arch_colors: dict, output_path: Path, out_dir:
 
     for col, metric in enumerate(return_metrics):
         ax = axes[col]
-        for arch in ARCH_ORDER:
-            sub_arch = df[df["arch"] == arch]
-            if sub_arch.empty:
-                continue
-            primary_vocab = determine_primary_vocab(sub_arch)
-            arch_sub = sub_arch[sub_arch["vocab_size"] == primary_vocab]
-            perf = compute_final_values(arch_sub, metric)
-            comp = compute_final_values(arch_sub, compute_metric)
-            merged = perf.merge(comp[["run_id", "value"]], on="run_id", suffixes=("_perf", "_compute"))
-            color = arch_colors[arch]
+        perf = compute_final_values(arch_sub, metric)
+        comp = compute_final_values(arch_sub, compute_metric)
+        merged = perf.merge(comp[["run_id", "value"]], on="run_id", suffixes=("_perf", "_compute"))
 
-            fixed = merged[merged["min_steps"] == merged["max_steps"]]
-            if not fixed.empty:
-                stats = fixed.groupby("min_steps").agg(
-                    perf_mean=("value_perf", "mean"),
-                    perf_sem=("value_perf", lambda s: s.std() / np.sqrt(len(s))),
-                    comp_mean=("value_compute", "mean"),
-                    comp_sem=("value_compute", lambda s: s.std() / np.sqrt(len(s))),
-                ).sort_index()
-                ax.errorbar(
-                    stats["comp_mean"],
-                    stats["perf_mean"],
-                    xerr=stats["comp_sem"],
-                    yerr=stats["perf_sem"],
-                    marker="o",
-                    color=color,
-                    linewidth=1.2,
-                    capsize=2,
-                    label=f"{arch} (fixed budget)",
-                )
+        fixed = merged[merged["min_steps"] == merged["max_steps"]]
+        if not fixed.empty:
+            stats = fixed.groupby("min_steps").agg(
+                perf_mean=("value_perf", "mean"),
+                perf_sem=("value_perf", lambda s: s.std() / np.sqrt(len(s))),
+                comp_mean=("value_compute", "mean"),
+                comp_sem=("value_compute", lambda s: s.std() / np.sqrt(len(s))),
+            ).sort_index()
+            ax.errorbar(
+                stats["comp_mean"],
+                stats["perf_mean"],
+                xerr=stats["comp_sem"],
+                yerr=stats["perf_sem"],
+                marker="o",
+                color=fixed_color,
+                linestyle="none",
+                capsize=2,
+                label="Fixed budget",
+            )
 
-            adaptive = merged[merged["min_steps"] != merged["max_steps"]]
-            for qac_variant, g in adaptive.groupby("qac_variant"):
-                perf_mean = g["value_perf"].mean()
-                perf_sem = g["value_perf"].std() / np.sqrt(len(g))
-                comp_mean = g["value_compute"].mean()
-                comp_sem = g["value_compute"].std() / np.sqrt(len(g))
-                marker = qac_markers.get(qac_variant, "*")
-                ax.errorbar(
-                    [comp_mean],
-                    [perf_mean],
-                    xerr=[comp_sem],
-                    yerr=[perf_sem],
-                    marker=marker,
-                    markersize=7,
-                    color=color,
-                    linestyle="none",
-                    capsize=2,
-                    label=f"{arch} ({variant_row_label(qac_variant, False)})",
-                )
+        adaptive = merged[merged["min_steps"] != merged["max_steps"]]
+        for qac_variant, g in adaptive.groupby("qac_variant"):
+            perf_mean = g["value_perf"].mean()
+            perf_sem = g["value_perf"].std() / np.sqrt(len(g))
+            comp_mean = g["value_compute"].mean()
+            comp_sem = g["value_compute"].std() / np.sqrt(len(g))
+            ax.errorbar(
+                [comp_mean],
+                [perf_mean],
+                xerr=[comp_sem],
+                yerr=[perf_sem],
+                marker=qac_markers.get(qac_variant, "*"),
+                markersize=7,
+                color=qac_colors.get(qac_variant, "0.5"),
+                linestyle="none",
+                capsize=2,
+                label=variant_row_label(qac_variant, False),
+            )
 
-        ax.set_xlabel("Final mean compute (ponder) steps")
-        ax.set_title(METRIC_LABELS[metric], fontsize=9)
         ax.grid(True, alpha=0.3)
+        ax.set_title(METRIC_LABELS[metric], fontsize=9)
+        ax.set_xlabel("Final mean compute (ponder) steps")
         if col == 0:
             ax.set_ylabel("Final performance\n(mean of last 3 evals, ± SEM)", fontsize=8)
 
@@ -192,12 +191,12 @@ def plot_pareto(df: pd.DataFrame, arch_colors: dict, output_path: Path, out_dir:
         fig,
         list(by_label.values()),
         list(by_label.keys()),
-        3,
+        min(len(by_label), 4),
         figsize,
-        "Compute vs. performance (Pareto view, primary vocab per arch)",
+        f"{arch}: compute vs. performance (Pareto view)",
     )
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -279,7 +278,7 @@ def plot_seed_variance(
     handles = [plt.Line2D([0], [0], marker="o", linestyle="none", color=variant_palette[lbl]) for lbl in hue_order]
     place_legend_and_title(fig, handles, hue_order, min(len(hue_order), 3), figsize, f"{arch}: per-seed final performance")
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -342,7 +341,7 @@ def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) 
 
     fig.suptitle(f"{arch}: final performance heatmap", y=1.04, fontsize=12)
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -443,7 +442,7 @@ def plot_steps_to_threshold(
         f"{arch}: learning speed (steps to {int(frac * 100)}% of final performance)",
     )
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -498,7 +497,7 @@ def plot_compute_spaghetti(df: pd.DataFrame, arch: str, output_path: Path, out_d
     handles = [plt.Line2D([0], [0], color=seed_colors[s], label=f"seed {s}") for s in range(5)]
     place_legend_and_title(fig, handles, [f"seed {s}" for s in range(5)], 5, figsize, arch)
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -522,28 +521,26 @@ def main() -> None:
     df = expand_vocab_agnostic_budget1(df)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    arch_colors = dict(zip(ARCH_ORDER, sns.color_palette("colorblind", n_colors=len(ARCH_ORDER))))
     variant_palette = all_variant_vocab_palette(df)
-
-    plot_pareto(df, arch_colors, args.output_dir / "lightsout_hd64_pareto.png", args.output_dir)
 
     for arch in ARCH_ORDER:
         if arch not in df["arch"].unique():
             continue
         safe_name = arch.lower().replace(" ", "_")
+        plot_pareto(df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_pareto.pdf", args.output_dir)
         plot_seed_variance(
-            df, arch, variant_palette, args.output_dir / f"lightsout_hd64_{safe_name}_seed_variance.png", args.output_dir
+            df, arch, variant_palette, args.output_dir / f"lightsout_hd64_{safe_name}_seed_variance.pdf", args.output_dir
         )
-        plot_heatmap(df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_heatmap.png", args.output_dir)
+        plot_heatmap(df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_heatmap.pdf", args.output_dir)
         plot_steps_to_threshold(
             df,
             arch,
             variant_palette,
-            args.output_dir / f"lightsout_hd64_{safe_name}_steps_to_threshold.png",
+            args.output_dir / f"lightsout_hd64_{safe_name}_steps_to_threshold.pdf",
             args.output_dir,
         )
         plot_compute_spaghetti(
-            df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_compute_spaghetti.png", args.output_dir
+            df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_compute_spaghetti.pdf", args.output_dir
         )
 
 
