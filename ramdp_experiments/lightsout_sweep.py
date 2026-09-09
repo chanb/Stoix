@@ -758,7 +758,12 @@ class Job:
             # multiple list elements (group_tag_parts, not the single
             # dash-joined group_tag string) so Neptune stores each axis as an
             # independently filterable tag instead of one long string.
-            cmd.append(f"logger.loggers.wandb.group_tag=[{','.join(self.group_tag_parts)}]")
+            # Each element is single-quoted so OmegaConf parses it as a str
+            # even when it's all-digits (e.g. a _cap_tag_length hash suffix) -
+            # unquoted, OmegaConf's list grammar infers such elements as int,
+            # which breaks WandBLogger's "_".join(group_tag).
+            quoted_parts = ",".join(f"'{part}'" for part in self.group_tag_parts)
+            cmd.append(f"logger.loggers.wandb.group_tag=[{quoted_parts}]")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         if self.arch == EXPLICIT_COT_ARCH or self.arch in NO_LAYER_NORM_ARCHES:

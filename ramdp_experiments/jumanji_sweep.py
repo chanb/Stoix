@@ -769,7 +769,12 @@ class Job:
         if self.wandb:
             cmd.append("logger.loggers.wandb.enabled=True")
             cmd.append(f"logger.loggers.wandb.project={self.wandb_project}")
-            cmd.append(f"logger.loggers.wandb.group_tag=[{','.join(self.group_tag_parts)}]")
+            # Each element is single-quoted so OmegaConf parses it as a str
+            # even when it's all-digits (e.g. a _cap_tag_length hash suffix) -
+            # unquoted, OmegaConf's list grammar infers such elements as int,
+            # which breaks WandBLogger's "_".join(group_tag).
+            quoted_parts = ",".join(f"'{part}'" for part in self.group_tag_parts)
+            cmd.append(f"logger.loggers.wandb.group_tag=[{quoted_parts}]")
         if self.delightful:
             cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         # `++` (override-or-add), not `=`: not every network yaml declares
