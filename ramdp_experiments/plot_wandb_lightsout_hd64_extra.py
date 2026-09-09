@@ -300,13 +300,20 @@ def plot_seed_variance(
 
 
 def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -> None:
-    """(variant x budget) -> final performance heatmap, one per return
-    metric - a compact grid alternative to the many row/line panels in the
-    main script's figures."""
+    """(qac_variant x budget) -> final performance heatmap, one subplot per
+    return metric (columns) and, for architectures with a vocab_size axis
+    (Transformer-ExplicitCoT), one subplot row per vocab_size too - a
+    compact grid alternative to the many row/line panels in the main
+    script's figures, without folding vocab_size into the row labels of a
+    single heatmap."""
     sub_arch = df[df["arch"] == arch]
     return_metrics = METRICS[:2]
     row_keys = variant_rows_for_arch(sub_arch)
-    row_labels = [variant_row_label(qv, False, vs) for qv, vs in row_keys]
+    vocab_values = sorted({vs for _, vs in row_keys}, key=lambda v: (v != VOCAB_SIZE_NA, v))
+    qac_by_vocab = {
+        vs: sorted({qv for qv, v2 in row_keys if v2 == vs}, key=lambda q: (q != "reinforce", q))
+        for vs in vocab_values
+    }
     budgets_all = sorted(
         sub_arch[["min_steps", "max_steps"]].drop_duplicates().itertuples(index=False, name=None),
         key=lambda mm: (mm[0] != mm[1], mm[0], mm[1]),
@@ -319,43 +326,57 @@ def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) 
     # Sized directly from the grid shape (cells ~square) rather than via
     # set_size's subplot-grid formula, which assumes stacked subplot rows
     # and badly stretches a wide-and-short annotated heatmap.
-    n_row_labels = max(len(row_labels), 1)
+    n_vocab_rows = max(len(vocab_values), 1)
+    n_cols = len(return_metrics)
+    max_qac_rows = max((len(v) for v in qac_by_vocab.values()), default=1)
     n_col_labels = max(len(col_labels), 1)
     cell_size = 0.5
     figsize = (
-        n_col_labels * cell_size * len(return_metrics) + 1.5 * len(return_metrics),
-        n_row_labels * cell_size + 1.5,
+        n_col_labels * cell_size * n_cols + 1.5 * n_cols,
+        max_qac_rows * cell_size * n_vocab_rows + 1.5 * n_vocab_rows,
     )
-    fig, axes = plt.subplots(1, len(return_metrics), figsize=figsize, squeeze=False)
-    axes = axes[0]
+    fig, axes = plt.subplots(n_vocab_rows, n_cols, figsize=figsize, squeeze=False)
 
-    for col, metric in enumerate(return_metrics):
-        ax = axes[col]
-        labeled = build_labeled_final_df(sub_arch, metric, row_keys)
-        pivot = pd.DataFrame(index=row_labels, columns=col_labels, dtype=float)
-        if not labeled.empty:
-            grouped = labeled.groupby(["variant_label", "budget_label"])["value"].mean()
-            for (rlabel, clabel), val in grouped.items():
-                if rlabel in pivot.index and clabel in pivot.columns:
-                    pivot.loc[rlabel, clabel] = val
-        sns.heatmap(
-            pivot.astype(float),
-            annot=True,
-            fmt=".2f",
-            cmap="viridis",
-            ax=ax,
-            cbar_kws={"label": METRIC_LABELS[metric]},
-            linewidths=0.5,
-            linecolor="white",
-            annot_kws={"fontsize": 7},
-        )
-        ax.set_title(METRIC_LABELS[metric], fontsize=9)
-        ax.set_xlabel("Budget")
-        ax.set_ylabel("")
-        ax.tick_params(axis="x", rotation=45, labelsize=7)
-        ax.tick_params(axis="y", rotation=0, labelsize=7)
+    for row, vocab_size in enumerate(vocab_values):
+        row_labels = [variant_row_label(qv, False) for qv in qac_by_vocab[vocab_size]]
+        row_row_keys = [(qv, vocab_size) for qv in qac_by_vocab[vocab_size]]
+        for col, metric in enumerate(return_metrics):
+            ax = axes[row, col]
+            labeled = build_labeled_final_df(sub_arch, metric, row_row_keys)
+            # Row labels here are per-qac_variant only (vocab_size is fixed
+            # for this subplot row), so re-derive them without the vocab
+            # suffix that build_labeled_final_df's variant_label carries.
+            pivot = pd.DataFrame(index=row_labels, columns=col_labels, dtype=float)
+            if not labeled.empty:
+                labeled = labeled.assign(
+                    qac_row_label=[variant_row_label(qv, False) for qv in labeled["qac_variant"]]
+                )
+                grouped = labeled.groupby(["qac_row_label", "budget_label"])["value"].mean()
+                for (rlabel, clabel), val in grouped.items():
+                    if rlabel in pivot.index and clabel in pivot.columns:
+                        pivot.loc[rlabel, clabel] = val
+            sns.heatmap(
+                pivot.astype(float),
+                annot=True,
+                fmt=".2f",
+                cmap="viridis",
+                ax=ax,
+                cbar_kws={"label": METRIC_LABELS[metric]},
+                linewidths=0.5,
+                linecolor="white",
+                annot_kws={"fontsize": 7},
+            )
+            if row == 0:
+                ax.set_title(METRIC_LABELS[metric], fontsize=9)
+            if row == n_vocab_rows - 1:
+                ax.set_xlabel("Budget")
+            else:
+                ax.set_xlabel("")
+            ax.set_ylabel(f"vocab={vocab_size}" if vocab_size != VOCAB_SIZE_NA and col == 0 else "", fontsize=8)
+            ax.tick_params(axis="x", rotation=45, labelsize=7)
+            ax.tick_params(axis="y", rotation=0, labelsize=7)
 
-    fig.suptitle(f"{arch}: final performance heatmap", y=1.04, fontsize=12)
+    fig.suptitle(f"{arch}: final performance heatmap", y=1.0 + 0.03 * n_vocab_rows, fontsize=12)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
@@ -375,7 +396,7 @@ def compute_steps_to_threshold(sub_arch: pd.DataFrame, metric: str, row_keys, fr
             continue
         for run_id, g in row_sub.groupby("run_id"):
             g = g.sort_values("eval_idx")
-            final = g[metric].tail(3).mean()
+            final = g[metric].tail(2).mean()
             if pd.isna(final) or final <= 0:
                 step = np.nan
             else:
