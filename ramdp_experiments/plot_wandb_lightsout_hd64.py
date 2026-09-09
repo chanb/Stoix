@@ -48,6 +48,13 @@ METRIC_LABELS = {
     "actor/compute_time/mean": "Mean compute (ponder) steps",
 }
 ARCH_ORDER = ["IRU-ACT", "Transformer-CoT", "Transformer-ExplicitCoT"]
+ARCH_LABELS = {"Transformer-CoT": "Transformer-iCoT", "Transformer-ExplicitCoT": "Transformer-eCoT"}
+
+
+def arch_label(arch: str) -> str:
+    """Display name for an `arch` value - distinct from the raw value since
+    that still has to match the data (df["arch"]) and derived filenames."""
+    return ARCH_LABELS.get(arch, arch)
 
 
 def set_size(width_pt, fraction=1, subplots=(1, 1), use_golden_ratio=True):
@@ -120,14 +127,14 @@ def place_legend_and_title(fig, handles, labels, ncols: int, figsize, title: str
 
 
 def budget_label(min_steps: int, max_steps: int) -> str:
-    return f"fixed={min_steps}" if min_steps == max_steps else f"adaptive[{min_steps}-{max_steps}]"
+    return f"uniform={min_steps}" if min_steps == max_steps else f"adaptive[{min_steps}-{max_steps}]"
 
 
 VOCAB_SIZE_NA = -1  # sentinel: architecture has no vocab_size (only Transformer-ExplicitCoT does)
 
 
 def variant_row_label(qac_variant: str, sgh: bool, vocab_size: int = VOCAB_SIZE_NA) -> str:
-    label = {"reinforce": "REINFORCE", "cond_fac": "Cond. factorized", "cond_naive": "Cond. naive"}.get(
+    label = {"reinforce": "PPO", "cond_fac": "Factorized", "cond_naive": "Separated"}.get(
         qac_variant, qac_variant
     )
     if sgh:
@@ -261,7 +268,7 @@ def plot_budget_vs_performance(
                 capsize=3,
                 color="0.25",
                 linewidth=1.2,
-                label="Fixed budget",
+                label="Uniform budget",
             )
 
             adaptive = final_df[final_df["min_steps"] != final_df["max_steps"]]
@@ -280,7 +287,7 @@ def plot_budget_vs_performance(
             if row == 0:
                 ax.set_title(METRIC_LABELS[metric], fontsize=9)
             if row == n_rows - 1:
-                ax.set_xlabel("Fixed compute budget")
+                ax.set_xlabel("Uniform compute budget")
             if col == 0:
                 row_label = f"vocab={vocab_size}\n\n" if has_vocab else ""
                 ax.set_ylabel(f"{row_label}Final performance\n(mean of last 3 evals, ± SEM)", fontsize=8)
@@ -298,7 +305,7 @@ def plot_budget_vs_performance(
         list(by_label.keys()),
         min(len(by_label), 3),
         figsize,
-        f"{arch}: fixed budget vs. final performance",
+        f"{arch_label(arch)}: uniform budget vs. final performance",
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
@@ -360,7 +367,7 @@ def plot_arch(df: pd.DataFrame, arch: str, budget_colors: dict, output_path: Pat
             for hh, ll in zip(h, l):
                 by_label.setdefault(ll, hh)
     place_legend_and_title(
-        fig, list(by_label.values()), list(by_label.keys()), min(len(by_label), 4), figsize, arch
+        fig, list(by_label.values()), list(by_label.keys()), min(len(by_label), 4), figsize, arch_label(arch)
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
@@ -393,7 +400,7 @@ def plot_headline_comparison(df: pd.DataFrame, output_path: Path, out_dir: Path)
             eval_idx, mean, sem = result
             steps = step_axis(arch_df).reindex(eval_idx).to_numpy()
             color = arch_colors[arch]
-            ax.plot(steps, mean, label=arch, color=color, linewidth=1.4)
+            ax.plot(steps, mean, label=arch_label(arch), color=color, linewidth=1.4)
             ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
         ax.set_title(METRIC_LABELS[metric], fontsize=9)
         ax.set_xlabel("Timesteps")
@@ -407,7 +414,7 @@ def plot_headline_comparison(df: pd.DataFrame, output_path: Path, out_dir: Path)
         labels,
         len(labels),
         figsize,
-        "Architecture comparison (adaptive budget, REINFORCE, no stop-grad halt)",
+        "Architecture comparison (adaptive budget, PPO, no stop-grad halt)",
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
