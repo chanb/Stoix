@@ -427,7 +427,7 @@ ENV_CNN_ARCH = {
         "critic_layer_sizes": (256, 256),
     },
     "maze": {
-        "channel_sizes": (32, 8),
+        "channel_sizes": (4, 4),
         "kernel_sizes": (3, 3),
         "strides": (1, 1),
         "hidden_sizes": (64,),

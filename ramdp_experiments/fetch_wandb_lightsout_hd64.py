@@ -96,7 +96,10 @@ class RunMeta:
 
 def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta]]:
     api = wandb.Api()
-    runs = api.runs(project, filters={"config.network.actor_network.pre_torso.hidden_dim": "64"})
+    runs = api.runs(project, filters={
+        "config.network.actor_network.pre_torso.hidden_dim": "64",
+        "config.system.gamma": "0.999",
+    })
     out = []
     for r in runs:
         c = r.config
