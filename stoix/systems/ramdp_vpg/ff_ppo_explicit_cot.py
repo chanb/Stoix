@@ -18,6 +18,16 @@ Everything about *how* this is trained follows `ff_ppo.py`, unmodified:
     same four Q-V variants ("fac"/"naive"/"cond_naive"/"cond_fac", all using
     `stoix.networks.base_qac.ValueAndQCritic`) plus "reinforce" (G-V, using
     `stoix.networks.base.FeedForwardCritic`).
+  - `config.system.gae_lambda` controls the critic's regression target
+    (`targets`/`g_targets`) via GAE(lambda)
+    (`stoix.utils.multistep.batch_truncated_generalized_advantage_estimation`)
+    rather than a plain to-the-end Monte-Carlo return - 1.0 (the default)
+    recovers the original return exactly, <1.0 trades bias for lower
+    variance. Orthogonal to `qac_variant`: for the four Q-V variants it only
+    changes what trains V/Q, since their advantage is Q(s,a,c) - V(s)
+    either way; for "reinforce", whose advantage is `targets - V(s)`, it
+    makes the advantage itself GAE(lambda). See `ff_ppo.py`'s module
+    docstring for the full rationale.
   - Two quantities derived from the critic can be recomputed at the end of
     every PPO epoch from that epoch's just-updated critic params, rather
     than staying frozen at their rollout-time values for the whole update -
@@ -156,7 +166,7 @@ from stoix.utils.jax_utils import (
 )
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import clipped_value_loss, ppo_clip_loss
-from stoix.utils.multistep import batch_discounted_returns
+from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
@@ -366,7 +376,10 @@ def get_learner_fn(
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
         not_done = 1.0 - traj_batch.done.astype(jnp.float32)
         d_t = (not_done * config.system.gamma**compute_time).astype(jnp.float32)
-        g_targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+        _, g_targets = batch_truncated_generalized_advantage_estimation(
+            r_t, d_t, config.system.gae_lambda, v_tm1=traj_batch.value, v_t=v_t,
+            stop_target_gradients=True,
+        )
 
         if is_qac:
             # Q - V: directly Q(s_t, a_t, c_t) - V(s_t), no n-step/Monte-Carlo
@@ -581,7 +594,10 @@ def get_learner_fn(
                 new_last_val = critic_apply_fn(critic_params, last_timestep.observation)
 
             v_t = jnp.concatenate([new_value, new_last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
-            refreshed_targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+            _, refreshed_targets = batch_truncated_generalized_advantage_estimation(
+                r_t, d_t, config.system.gae_lambda, v_tm1=new_value, v_t=v_t,
+                stop_target_gradients=True,
+            )
 
             if is_qac:
                 q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
@@ -951,7 +967,10 @@ def get_learner_fn(
                 v_t = jnp.concatenate(
                     [new_value, new_last_val[..., jnp.newaxis]], axis=-1
                 )[:, 1:]
-                targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+                _, targets = batch_truncated_generalized_advantage_estimation(
+                    r_t, d_t, config.system.gae_lambda, v_tm1=new_value, v_t=v_t,
+                    stop_target_gradients=True,
+                )
 
                 if is_qac:
                     # Refresh the advantage's Q term with this epoch's

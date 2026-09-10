@@ -33,6 +33,14 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
   # controls both the usual reward horizon and the cost of pondering longer, and
   # (for "fac") the Q(s,a,1) -> Q(s,a,c) scaling.
+gae_lambda: 1.0 # GAE(lambda) mixing parameter for the critic's regression target
+  # (`targets`/`g_targets`). 1.0 (the default) recovers the original to-the-end
+  # Monte-Carlo return exactly; <1.0 blends in earlier bootstrapped value
+  # estimates for a lower-variance, more-biased target. Applies regardless of
+  # `qac_variant`: for the four Q-V variants it only affects what trains V (and
+  # Q, for "naive"/"fac"), since their advantage is Q(s,a,c) - V(s) either way;
+  # for "reinforce", whose advantage is `targets - V(s)`, this makes the
+  # advantage itself GAE(lambda) rather than the n-step-to-end special case.
 clip_eps: 0.2 # Clipping value for the PPO actor ratio, and for the critic's value/Q loss
   # when clip_value_loss=True.
 clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"/"fac") uses

@@ -729,10 +729,13 @@ python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit
 ## Sokoban
 This run is learning:
 ```
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 7 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
 ```
 
 Try adaptive:
 ```
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 6 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 1 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
+
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 2 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95
 ```

@@ -135,6 +135,16 @@ script's behavior differs):
     ff_ppo_* systems only, see epochs. Unlike the other PPO knobs above, not
     present in minatar_fixed_budget_sweep.py/lightsout_fixed_budget_sweep.py
     (added here, mirroring lightsout_sweep.py/jumanji_sweep.py).
+  - gae_lambda:   system.gae_lambda - GAE(lambda) mixing parameter for the critic's
+    regression target (targets/g_targets). 1.0 (the yaml default) recovers the
+    original to-the-end Monte-Carlo return exactly; <1.0 blends in earlier
+    bootstrapped value estimates for a lower-variance, more-biased target.
+    Applies regardless of qac_variant: for the four Q-V variants it only affects
+    what trains V/Q, since their advantage is Q(s,a,c) - V(s) either way; for
+    "reinforce", whose advantage is targets - V(s), this makes the advantage
+    itself GAE(lambda) - see stoix/systems/ramdp_vpg/ff_ppo.py's module
+    docstring. ff_ppo_* systems only, see epochs. Like standardize_advantages
+    above, not present in minatar_fixed_budget_sweep.py.
 
 gamma defaults to 0.99 (system.gamma, applied to every job, not swept):
 every one of these envs has an episode horizon well under a few hundred
@@ -170,6 +180,8 @@ Usage:
       --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac \\
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
+      --gae-lambda 0.9,0.95,1.0                    # sweep GAE(lambda)
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs sokoban,slidingtile,maze \\
       --systems ff_ppo_explicit_fac --architectures cnn+transformer_explicit_cot  # CNN-input explicit-CoT sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py \\
@@ -491,9 +503,9 @@ ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": T
 # see QAC_SYSTEMS/Job.qv_critic) - the MLP that follows the CNN embedding.
 ENV_CNN_ARCH = {
     "sokoban": {
-        "channel_sizes": (128, 128, 128),
-        "kernel_sizes": (3, 3, 3),
-        "strides": (2, 1, 1),
+        "channel_sizes": (128, 128),
+        "kernel_sizes": (3, 3),
+        "strides": (2, 1),
         "hidden_sizes": (128,),
         "critic_hidden_sizes": (128,),
         "critic_layer_sizes": (128, 128),
@@ -662,6 +674,7 @@ class Job:
     num_minibatches: int
     clip_eps: float
     clip_value_loss: bool
+    gae_lambda: float
     latent_kl_coef: float
     standardize_advantages: bool
     recompute_advantages: bool
@@ -724,6 +737,8 @@ class Job:
 
         if self.system in PPO_SYSTEMS:
             ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
+            if self.gae_lambda != 1.0:
+                ppo += f"-gae{self.gae_lambda:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
             if self.standardize_advantages:
@@ -811,6 +826,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.gae_lambda={self.gae_lambda:g}")
             cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
@@ -923,6 +939,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.num_minibatches,
             args.clip_eps,
             args.clip_value_loss,
+            args.gae_lambda,
             args.standardize_advantages,
             args.recompute_advantages,
             args.critic_before_actor,
@@ -1042,6 +1059,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches,
                 clip_eps,
                 clip_value_loss,
+                gae_lambda,
                 standardize_advantages,
                 recompute_advantages,
                 critic_before_actor,
@@ -1077,6 +1095,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_minibatches,
                     clip_eps,
                     clip_value_loss,
+                    gae_lambda,
                     standardize_advantages,
                     recompute_advantages,
                     critic_before_actor,
@@ -1112,6 +1131,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_minibatches=num_minibatches,
                     clip_eps=clip_eps,
                     clip_value_loss=clip_value_loss,
+                    gae_lambda=gae_lambda,
                     latent_kl_coef=latent_kl_coef,
                     standardize_advantages=standardize_advantages,
                     recompute_advantages=recompute_advantages,
@@ -1286,6 +1306,16 @@ def main() -> None:
     parser.add_argument("--clip-eps", default="0.2", help="Comma-separated system.clip_eps values (PPO only).")
     parser.add_argument("--clip-value-loss", default="true", help="Comma-separated bools (PPO only).")
     parser.add_argument(
+        "--gae-lambda",
+        default="1.0",
+        help="Comma-separated system.gae_lambda values (GAE(lambda) mixing parameter for the "
+        "critic's regression target). 1.0 (default) recovers the original to-the-end "
+        "Monte-Carlo return exactly; <1.0 blends in earlier bootstrapped value estimates for "
+        "a lower-variance, more-biased target - and, for ff_ppo_reinforce, makes the "
+        "advantage itself GAE(lambda). Swept independently of --epochs/--num-minibatches/"
+        "--clip-eps/--clip-value-loss. PPO systems only.",
+    )
+    parser.add_argument(
         "--standardize-advantages",
         default="false",
         help="Comma-separated bools (true/false) - system.standardize_advantages: whether the "
@@ -1436,6 +1466,7 @@ def main() -> None:
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
     args.clip_value_loss = [x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")]
+    args.gae_lambda = [float(x) for x in args.gae_lambda.split(",")]
     args.standardize_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
     ]

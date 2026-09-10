@@ -31,8 +31,8 @@ max_steps replacing budget - see that script's docstring for the full
 system/architecture/PPO-knob/env-difficulty-knob descriptions):
   - env, <env>-specific difficulty knobs, system, architecture, hidden_dim,
     lr, critic_lr, delightful, delightful_eta, epochs, num_minibatches,
-    clip_eps, clip_value_loss, recompute_advantages, critic_before_actor, use_layer_norm,
-    use_input_layer_norm,
+    clip_eps, clip_value_loss, gae_lambda, recompute_advantages, critic_before_actor,
+    use_layer_norm, use_input_layer_norm,
     num_layers, num_heads, mlp_dim, vocab_size, use_latent_feedback, qv_critic, seed: identical
     semantics to jumanji_fixed_budget_sweep.py, including its five ff_ppo_explicit_*
     systems and its transformer_explicit_cot/cnn+transformer_explicit_cot
@@ -88,6 +88,8 @@ Usage:
       --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_fac \\
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
+  python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce \\
+      --gae-lambda 0.9,0.95,1.0                    # sweep GAE(lambda)
   python ramdp_experiments/jumanji_sweep.py --envs sokoban,slidingtile,maze \\
       --systems ff_ppo_explicit_fac --architectures cnn+transformer_explicit_cot  # CNN-input explicit-CoT sweep
   python ramdp_experiments/jumanji_sweep.py \\
@@ -595,6 +597,7 @@ class Job:
     num_minibatches: int
     clip_eps: float
     clip_value_loss: bool
+    gae_lambda: float
     latent_kl_coef: float
     halting_ent_coef: float
     standardize_advantages: bool
@@ -659,6 +662,8 @@ class Job:
 
         if self.system in PPO_SYSTEMS:
             ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
+            if self.gae_lambda != 1.0:
+                ppo += f"-gae{self.gae_lambda:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
             if self.standardize_advantages:
@@ -753,6 +758,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.gae_lambda={self.gae_lambda:g}")
             cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
@@ -883,6 +889,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.num_minibatches,
             args.clip_eps,
             args.clip_value_loss,
+            args.gae_lambda,
             args.standardize_advantages,
             args.recompute_advantages,
             args.critic_before_actor,
@@ -1030,6 +1037,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches,
                 clip_eps,
                 clip_value_loss,
+                gae_lambda,
                 standardize_advantages,
                 recompute_advantages,
                 critic_before_actor,
@@ -1067,6 +1075,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_minibatches,
                     clip_eps,
                     clip_value_loss,
+                    gae_lambda,
                     standardize_advantages,
                     recompute_advantages,
                     critic_before_actor,
@@ -1108,6 +1117,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_minibatches=num_minibatches,
                     clip_eps=clip_eps,
                     clip_value_loss=clip_value_loss,
+                    gae_lambda=gae_lambda,
                     latent_kl_coef=latent_kl_coef,
                     halting_ent_coef=halting_ent_coef,
                     standardize_advantages=standardize_advantages,
@@ -1294,6 +1304,16 @@ def main() -> None:
     parser.add_argument("--clip-eps", default="0.2", help="Comma-separated system.clip_eps values (PPO only).")
     parser.add_argument("--clip-value-loss", default="true", help="Comma-separated bools (PPO only).")
     parser.add_argument(
+        "--gae-lambda",
+        default="1.0",
+        help="Comma-separated system.gae_lambda values (GAE(lambda) mixing parameter for the "
+        "critic's regression target). 1.0 (default) recovers the original to-the-end "
+        "Monte-Carlo return exactly; <1.0 blends in earlier bootstrapped value estimates for "
+        "a lower-variance, more-biased target - and, for ff_ppo_reinforce, makes the "
+        "advantage itself GAE(lambda). Swept independently of --epochs/--num-minibatches/"
+        "--clip-eps/--clip-value-loss. PPO systems only.",
+    )
+    parser.add_argument(
         "--standardize-advantages",
         default="false",
         help="Comma-separated bools (true/false) - system.standardize_advantages: whether the "
@@ -1472,6 +1492,7 @@ def main() -> None:
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
     args.clip_value_loss = [x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")]
+    args.gae_lambda = [float(x) for x in args.gae_lambda.split(",")]
     args.standardize_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
     ]

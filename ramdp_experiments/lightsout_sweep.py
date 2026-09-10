@@ -100,6 +100,16 @@ Grid axes:
                  or plain L2 regression instead (False, as in ff_reinforce.py/
                  ff_qac.py) - see stoix/systems/ramdp_vpg/ff_ppo.py's module
                  docstring. ff_ppo_* systems only, see epochs.
+  - gae_lambda:  system.gae_lambda - GAE(lambda) mixing parameter for the critic's
+                 regression target (targets/g_targets). 1.0 (the yaml default)
+                 recovers the original to-the-end Monte-Carlo return exactly; <1.0
+                 blends in earlier bootstrapped value estimates for a lower-variance,
+                 more-biased target. Applies regardless of qac_variant: for the four
+                 Q-V variants it only affects what trains V/Q, since their advantage
+                 is Q(s,a,c) - V(s) either way; for "reinforce", whose advantage is
+                 targets - V(s), this makes the advantage itself GAE(lambda) - see
+                 stoix/systems/ramdp_vpg/ff_ppo.py's module docstring. ff_ppo_*
+                 systems only, see epochs.
   - standardize_advantages: system.standardize_advantages - whether the advantage
                  (Q - V or G - V, depending on qac_variant) is standardized
                  (zero mean, unit variance) across the rollout before being used
@@ -240,6 +250,8 @@ Usage:
       --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac \\
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
+  python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce \\
+      --gae-lambda 0.9,0.95,1.0                    # sweep GAE(lambda)
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_cond_naive,ff_ppo_cond_fac \\
       --architectures mlp                          # compare conditioned Q-V variants, same capacity
   python ramdp_experiments/lightsout_sweep.py \\
@@ -542,6 +554,7 @@ class Job:
     num_minibatches: int
     clip_eps: float
     clip_value_loss: bool
+    gae_lambda: float
     latent_kl_coef: float
     halting_ent_coef: float
     standardize_advantages: bool
@@ -619,6 +632,8 @@ class Job:
         # rollout, no clipped ratio) - see PPO_SYSTEMS/Job.command().
         if self.system in PPO_SYSTEMS:
             ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
+            if self.gae_lambda != 1.0:
+                ppo += f"-gae{self.gae_lambda:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
             if self.standardize_advantages:
@@ -716,6 +731,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.gae_lambda={self.gae_lambda:g}")
             cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
@@ -844,18 +860,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
 
-    # (epochs, num_minibatches, clip_eps, clip_value_loss, standardize_advantages,
-    # recompute_advantages, critic_before_actor) combos: only meaningful for
-    # PPO_SYSTEMS (ff_ppo.py) - forced to the first requested value for every
-    # other system in the main product loop below, then deduplicated by
-    # run_name, mirroring how delightful_combos/num_heads_options collapse
-    # axes that don't apply.
+    # (epochs, num_minibatches, clip_eps, clip_value_loss, gae_lambda,
+    # standardize_advantages, recompute_advantages, critic_before_actor) combos:
+    # only meaningful for PPO_SYSTEMS (ff_ppo.py) - forced to the first requested
+    # value for every other system in the main product loop below, then
+    # deduplicated by run_name, mirroring how delightful_combos/num_heads_options
+    # collapse axes that don't apply.
     ppo_combos = list(
         itertools.product(
             args.epochs,
             args.num_minibatches,
             args.clip_eps,
             args.clip_value_loss,
+            args.gae_lambda,
             args.standardize_advantages,
             args.recompute_advantages,
             args.critic_before_actor,
@@ -1014,6 +1031,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             num_minibatches,
             clip_eps,
             clip_value_loss,
+            gae_lambda,
             standardize_advantages,
             recompute_advantages,
             critic_before_actor,
@@ -1049,6 +1067,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches,
                 clip_eps,
                 clip_value_loss,
+                gae_lambda,
                 standardize_advantages,
                 recompute_advantages,
                 critic_before_actor,
@@ -1087,6 +1106,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches=num_minibatches,
                 clip_eps=clip_eps,
                 clip_value_loss=clip_value_loss,
+                gae_lambda=gae_lambda,
                 latent_kl_coef=latent_kl_coef,
                 halting_ent_coef=halting_ent_coef,
                 standardize_advantages=standardize_advantages,
@@ -1334,6 +1354,16 @@ def main() -> None:
         "independently of --epochs/--num-minibatches/--clip-eps. PPO systems only, see --epochs.",
     )
     parser.add_argument(
+        "--gae-lambda",
+        default="1.0",
+        help="Comma-separated system.gae_lambda values (GAE(lambda) mixing parameter for the "
+        "critic's regression target). 1.0 (default) recovers the original to-the-end "
+        "Monte-Carlo return exactly; <1.0 blends in earlier bootstrapped value estimates for "
+        "a lower-variance, more-biased target - and, for ff_ppo_reinforce, makes the "
+        "advantage itself GAE(lambda). Swept independently of --epochs/--num-minibatches/"
+        "--clip-eps/--clip-value-loss. PPO systems only, see --epochs.",
+    )
+    parser.add_argument(
         "--standardize-advantages",
         default="false",
         help="Comma-separated bools (true/false) - system.standardize_advantages: whether the "
@@ -1579,6 +1609,7 @@ def main() -> None:
     args.clip_value_loss = [
         x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")
     ]
+    args.gae_lambda = [float(x) for x in args.gae_lambda.split(",")]
     args.standardize_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
     ]
@@ -1638,6 +1669,8 @@ def main() -> None:
         assert m >= 1, f"num_minibatches must be >= 1, got {m}"
     for c in args.clip_eps:
         assert c > 0, f"clip_eps must be > 0, got {c}"
+    for g in args.gae_lambda:
+        assert 0.0 <= g <= 1.0, f"gae_lambda must be in [0, 1], got {g}"
 
     if args.gpus == "auto":
         try:
@@ -1691,7 +1724,8 @@ def main() -> None:
     print(f"  delightful={args.delightful} delightful_eta={args.delightful_eta} (not PPO_SYSTEMS)")
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
-        f"clip_value_loss={args.clip_value_loss} standardize_advantages={args.standardize_advantages} "
+        f"clip_value_loss={args.clip_value_loss} gae_lambda={args.gae_lambda} "
+        f"standardize_advantages={args.standardize_advantages} "
         f"recompute_advantages={args.recompute_advantages} "
         f"critic_before_actor={args.critic_before_actor} (PPO systems only: {PPO_SYSTEMS})"
     )

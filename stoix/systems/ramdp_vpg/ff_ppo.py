@@ -34,12 +34,27 @@ values:
 The four Q-V variants all use `stoix.networks.base_qac.ValueAndQCritic` (a
 shared torso with a V head and a Q head).
 
+`targets` - the critic's own regression target, `g_targets` below, which also
+feeds the "reinforce" advantage (see next paragraph) - is computed with
+`config.system.gae_lambda` via
+`stoix.utils.multistep.batch_truncated_generalized_advantage_estimation`
+rather than a plain to-the-end Monte-Carlo return. `gae_lambda=1.0` (the
+default) makes this mathematically identical to the to-the-end return the
+four Q-V variants' description above assumes (`batch_discounted_returns`,
+which this replaced); `gae_lambda<1.0` instead blends in earlier
+bootstrapped estimates for a lower-variance, more-biased target - standard
+GAE(lambda), Schulman et al. This is orthogonal to `qac_variant`: for the
+four Q-V variants it only changes what trains V (and Q, for "naive"/"fac"),
+since their advantage is `Q(s,a,c) - V(s)` either way; for "reinforce",
+whose advantage is `targets - V(s)`, it changes the advantage too, making
+this exactly GAE(lambda) rather than the n-step-to-end special case.
+
 Two quantities derived from the critic can be recomputed at the end of every
 PPO epoch from that epoch's just-updated critic params, rather than staying
 frozen at their rollout-time values for the whole update - both gated by the
 single flag `config.system.recompute_advantages` (default `False`):
 
-  - `targets`, the n-step return (`g_targets`) that trains the critic
+  - `targets`, the GAE(lambda) target (`g_targets`) that trains the critic
     itself, bootstraps off a per-step value estimate at the tail of each
     n-step window (`v_t`). When `recompute_advantages=True`, that bootstrap
     is rebuilt each epoch from the updated critic (`new_value`/`new_last_val`
@@ -221,7 +236,7 @@ from stoix.utils.jax_utils import (
 )
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import clipped_value_loss, ppo_clip_loss
-from stoix.utils.multistep import batch_discounted_returns
+from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
@@ -436,7 +451,10 @@ def get_learner_fn(
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
         not_done = 1.0 - traj_batch.done.astype(jnp.float32)
         d_t = (not_done * config.system.gamma**compute_time).astype(jnp.float32)
-        g_targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+        _, g_targets = batch_truncated_generalized_advantage_estimation(
+            r_t, d_t, config.system.gae_lambda, v_tm1=traj_batch.value, v_t=v_t,
+            stop_target_gradients=True,
+        )
 
         if is_qac:
             # Q - V directly, no n-step/Monte-Carlo return in the advantage
@@ -664,7 +682,10 @@ def get_learner_fn(
                 new_last_val = critic_apply_fn(critic_params, last_timestep.observation)
 
             v_t = jnp.concatenate([new_value, new_last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
-            refreshed_targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+            _, refreshed_targets = batch_truncated_generalized_advantage_estimation(
+                r_t, d_t, config.system.gae_lambda, v_tm1=new_value, v_t=v_t,
+                stop_target_gradients=True,
+            )
 
             if is_qac:
                 q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
@@ -1066,7 +1087,10 @@ def get_learner_fn(
                 v_t = jnp.concatenate(
                     [new_value, new_last_val[..., jnp.newaxis]], axis=-1
                 )[:, 1:]
-                targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
+                _, targets = batch_truncated_generalized_advantage_estimation(
+                    r_t, d_t, config.system.gae_lambda, v_tm1=new_value, v_t=v_t,
+                    stop_target_gradients=True,
+                )
 
                 if is_qac:
                     # Refresh the advantage's Q term with this epoch's
