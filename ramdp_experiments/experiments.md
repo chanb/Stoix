@@ -528,6 +528,10 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinf
 python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 1e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.01,0.001 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor false --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing --qv-critic shared
 
 python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor false --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing --qv-critic shared
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.0001 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor false --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing --qv-critic shared
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 5 --seeds 3 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 32 --num-layers 4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5,6,7 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor false --stop-gradient-halting-input false --wandb true --wandb-project maze-sep7-v2 --yes --no-skip-existing --qv-critic separate
 ```
 
 ## Sokoban
@@ -536,4 +540,184 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinf
 python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,3,4,5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 128 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 32 --epochs 4 --num-minibatches 8 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --wandb true --wandb-project sokoban-sep8 --yes --no-skip-existing
 
 python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_reinforce,ff_ppo_cond_naive --max-steps 5 --seeds 5 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 128 --num-layers 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0,1,2,3,4,5,6,7 --rollout-length 32 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --stop-gradient-halting-input false --wandb true --wandb-project sokoban-sep8 --yes --no-skip-existing
+```
+
+
+# Comments on Sept 9
+tmux attach -t0
+```
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 16,32,64 --num-layers 2,4 --total-timesteps 3e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4,1e-3 --envs maze --maze-size 10 --gpus 0,1,2,3,4,5 --rollout-length 10 --epochs 2 --num-minibatches 4 --ent-coef 0.001 --gamma 0.999 --actor-weight-decay 0.0 --critic-before-actor false --stop-gradient-halting-input false --wandb true --wandb-project maze-sep9 --yes --no-skip-existing --qv-critic separate,shared --critic-weight-decay 0.0
+```
+- Bad runs
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd32-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl2-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.001-ec0.001-mgn0.5-nl2-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd32-lr0.0003-clr0.001-ec0.001-mgn0.5-nl2-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd64-lr0.0003-clr0.001-ec0.001-mgn0.5-nl2-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.001-ec0.001-mgn0.5-nl4-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd64-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl2-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+- Bad but better than above: <0.5 return
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd32-lr0.0003-clr0.001-ec0.001-mgn0.5-nl2-sepqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.001-ec0.001-mgn0.5-nl2-sepqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.001-ec0.001-mgn0.5-nl4-sepqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd64-lr0.0003-clr0.001-ec0.001-mgn0.5-nl2-sepqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl2-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+- Similar: ~0.5 return
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd32-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl4-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd32-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl4-sepqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl4-sharedqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd32-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl2-sepqv', 'ep2-mb4-clip0.2-l2c']`
+  - `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd16-lr0.0003-clr0.0003-ec0.001-mgn0.5-nl2-sepqv', 'ep2-mb4-clip0.2-l2c']`
+
+
+Based on above, use separate q-v, try standardized advantage
+```
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 1,2,4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4,1e-3 --envs maze --total-num-envs 128 --maze-size 10 --gpus 0,1,2,3,4,5 --rollout-length 10 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.0 --critic-before-actor false,true --wandb true --wandb-project maze-sep9 --yes --no-skip-existing --qv-critic separate --critic-weight-decay 0.0,0.001 --use-input-layer-norm false,true --standardize-advantages false,true
+```
+
+
+
+tmux attach -t1, -t2
+```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 256 --num-layers 4 --total-timesteps 1e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 7 --rollout-length 128 --total-num-envs 256 --epochs 2 --num-minibatches 16 --ent-coef 0.01 --gamma 0.995 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing
+```
+- Maybe need standardized advantage
+
+```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 7 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
+```
+
+
+# Comments on Sept 10
+### Maze
+Search:
+```
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 1,2,4 --total-timesteps 1e8 --clip-value-lo
+ss false --lr 3e-4 --critic-lr 3e-4,1e-3 --envs maze --total-num-envs 128 --maze-size 10 --gpus 0,1,2,3,4,5 --rollout-length 10 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.0 --critic-before-actor false,true --wandb true --wandb
+-project maze-sep9 --yes --no-skip-existing --qv-critic separate --critic-weight-decay 0.0,0.001 --use-input-layer-norm false,true --standardize-advantages false,true
+```
+
+- Seems to be reasonably good `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd64-lr0.0003-clr0.0003-ec0.01-mgn0.5-nl1-sepqv', '145f8f33']`---takes <2hrs on salient4:
+```
+/home/bryanpu1/projects/iclr_2027/Stoix/stoix/systems/ramdp_vpg/ff_ppo.py
+    env=jumanji/maze_grid
+    network=cnn_iru_compute_qac_separate_qv
+    system.gamma=0.99
+    arch.total_timesteps=1e+08
+    arch.total_num_envs=128
+    arch.seed=0
+    arch.num_evaluation=50
+    arch.num_eval_episodes=10
+    network.actor_network.pre_torso.hidden_dim=64
+    ++network.actor_network.pre_torso.num_layers=1
+    network.actor_network.pre_torso.max_steps=5
+    network.actor_network.pre_torso.min_steps=1
+    system.actor_lr=0.0003
+    system.critic_lr=0.0003
+    system.actor_weight_decay=0
+    system.critic_weight_decay=0.001
+    system.ent_coef=0.01
+    system.max_grad_norm=0.5
+    system.rollout_length=10
+    logger.base_exp_path=/home/bryanpu1/projects/iclr_2027/Stoix/results_jumanji_sweep/maze-sz10-ppo_cond_fac-cnn+iru-mn1-mx5-hd64-lr0.0003-clr0.0003-ec0.01-mgn0.5-nl1-sepqv-145f8f33-seed_0
+    env.kwargs.generator.num_rows=10
+    env.kwargs.generator.num_cols=10
+    system.epochs=2
+    system.num_minibatches=2
+    system.clip_eps=0.2
+    system.clip_value_loss=False
+    system.standardize_advantages=False
+    system.recompute_advantages=False
+    system.critic_before_actor=True
+    system.latent_kl_coef=0
+    system.halting_ent_coef=0
+    logger.loggers.wandb.enabled=True
+    logger.loggers.wandb.project=maze-sep9
+    logger.loggers.wandb.group_tag=['maze-sz10','ppo_cond_fac-cnn+iru','mn1-mx5','hd64-lr0.0003-clr0.0003-ec0.01-mgn0.5-nl1-sepqv','145f8f33']
+    ++network.actor_network.pre_torso.use_input_layer_norm=False
+    ++network.actor_network.pre_torso.stop_gradient_halting_input=False
+    system.qac_variant=cond_fac
+    network.actor_network.input_layer.channel_sizes=[16,16]
+    network.actor_network.input_layer.kernel_sizes=[3,3]
+    network.actor_network.input_layer.strides=[2,1]
+    network.actor_network.input_layer.hidden_sizes=[64]
+    network.critic_network.value_input_layer.channel_sizes=[16,16]
+    network.critic_network.value_input_layer.kernel_sizes=[3,3]
+    network.critic_network.value_input_layer.strides=[2,1]
+    network.critic_network.value_input_layer.hidden_sizes=[128]
+    network.critic_network.value_pre_torso.layer_sizes=[128,128]
+    network.critic_network.q_input_layer.channel_sizes=[16,16]
+    network.critic_network.q_input_layer.kernel_sizes=[3,3]
+    network.critic_network.q_input_layer.strides=[2,1]
+    network.critic_network.q_input_layer.hidden_sizes=[128]
+    network.critic_network.q_pre_torso.layer_sizes=[128,128]
+```
+- Generally, it seems like critic_lr=1e-3 is too high, standardize-advantages=True gives flat line in some cases
+- critic_before_actor and critic_weight_decay don't seem to matter too much (yet), when num_layers=1 and hidden_dim=64 and input_layer_norm=False
+  - Here, standardize-advantage=True seems to actually give lower episode return but higher discounted return (it takes less steps)
+    e.g.
+```
+/home/bryanpu1/projects/iclr_2027/Stoix/stoix/systems/ramdp_vpg/ff_ppo.py
+    env=jumanji/maze_grid
+    network=cnn_iru_compute_qac_separate_qv
+    system.gamma=0.99
+    arch.total_timesteps=1e+08
+    arch.total_num_envs=128
+    arch.seed=0
+    arch.num_evaluation=50
+    arch.num_eval_episodes=10
+    network.actor_network.pre_torso.hidden_dim=64
+    ++network.actor_network.pre_torso.num_layers=2
+    network.actor_network.pre_torso.max_steps=5
+    network.actor_network.pre_torso.min_steps=1
+    system.actor_lr=0.0003
+    system.critic_lr=0.0003
+    system.actor_weight_decay=0
+    system.critic_weight_decay=0.001
+    system.ent_coef=0.01
+    system.max_grad_norm=0.5
+    system.rollout_length=10
+    logger.base_exp_path=/home/bryanpu1/projects/iclr_2027/Stoix/results_jumanji_sweep/maze-sz10-ppo_cond_fac-cnn+iru-mn1-mx5-hd64-lr0.0003-clr0.0003-ec0.01-mgn0.5-nl2-sepqv-2eb84e8f-seed_0
+    env.kwargs.generator.num_rows=10
+    env.kwargs.generator.num_cols=10
+    system.epochs=2
+    system.num_minibatches=2
+    system.clip_eps=0.2
+    system.clip_value_loss=False
+    system.standardize_advantages=True
+    system.recompute_advantages=False
+    system.critic_before_actor=False
+    system.latent_kl_coef=0
+    system.halting_ent_coef=0
+    logger.loggers.wandb.enabled=True
+    logger.loggers.wandb.project=maze-sep9
+    logger.loggers.wandb.group_tag=['maze-sz10','ppo_cond_fac-cnn+iru','mn1-mx5','hd64-lr0.0003-clr0.0003-ec0.01-mgn0.5-nl2-sepqv','2eb84e8f']
+    ++network.actor_network.pre_torso.use_input_layer_norm=False
+    ++network.actor_network.pre_torso.stop_gradient_halting_input=False
+    system.qac_variant=cond_fac
+    network.actor_network.input_layer.channel_sizes=[16,16]
+    network.actor_network.input_layer.kernel_sizes=[3,3]
+    network.actor_network.input_layer.strides=[2,1]
+    network.actor_network.input_layer.hidden_sizes=[64]
+    network.critic_network.value_input_layer.channel_sizes=[16,16]
+    network.critic_network.value_input_layer.kernel_sizes=[3,3]
+    network.critic_network.value_input_layer.strides=[2,1]
+    network.critic_network.value_input_layer.hidden_sizes=[128]
+    network.critic_network.value_pre_torso.layer_sizes=[128,128]
+    network.critic_network.q_input_layer.channel_sizes=[16,16]
+    network.critic_network.q_input_layer.kernel_sizes=[3,3]
+    network.critic_network.q_input_layer.strides=[2,1]
+    network.critic_network.q_input_layer.hidden_sizes=[128]
+    network.critic_network.q_pre_torso.layer_sizes=[128,128]
+```
+
+
+### Sokoban
+This run is learning:
+```
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 7 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
+```
+
+Try adaptive:
+```
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 6 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
 ```

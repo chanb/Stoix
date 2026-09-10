@@ -40,6 +40,13 @@ system/architecture/PPO-knob/env-difficulty-knob descriptions):
     (--qv-critic, default sweeps both "shared"/"separate") only applies to
     systems with a genuine Q-V critic (QAC_SYSTEMS) - see
     QV_CRITIC_CHOICES/Job.command()'s `_qv_network_name`.
+  - standardize_advantages: system.standardize_advantages - whether the advantage
+                 (Q - V or G - V, depending on qac_variant) is standardized
+                 (zero mean, unit variance) across the rollout before being used
+                 in the PPO clipped surrogate. ff_ppo_* systems only, see epochs.
+                 Unlike the other PPO knobs above, not present in
+                 jumanji_fixed_budget_sweep.py (added here, mirroring
+                 lightsout_sweep.py).
   - min_steps:   forbids halting (voluntarily, in replay, or greedily) before
                  this many pondering steps - see the compute torsos'
                  min_steps mechanism, stoix/networks/torso_compute*.py.
@@ -77,6 +84,8 @@ Usage:
       --envs sokoban,slidingtile,maze  # CNN-input sweep (sokoban/slidingtile/maze, via jumanji/*_grid)
   python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
+  python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_fac \\
+      --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_fac \\
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
   python ramdp_experiments/jumanji_sweep.py --envs sokoban,slidingtile,maze \\
@@ -411,12 +420,12 @@ ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": T
 # see QAC_SYSTEMS/Job.qv_critic) - the MLP that follows the CNN embedding.
 ENV_CNN_ARCH = {
     "sokoban": {
-        "channel_sizes": (32, 32),
-        "kernel_sizes": (8, 4),
-        "strides": (4, 2),
-        "hidden_sizes": (64,),
-        "critic_hidden_sizes": (256,),
-        "critic_layer_sizes": (256, 256),
+        "channel_sizes": (128, 128, 128),
+        "kernel_sizes": (3, 3, 3),
+        "strides": (2, 1, 1),
+        "hidden_sizes": (128,),
+        "critic_hidden_sizes": (128,),
+        "critic_layer_sizes": (128, 128),
     },
     "slidingtile": {
         "channel_sizes": (32,),
@@ -427,9 +436,9 @@ ENV_CNN_ARCH = {
         "critic_layer_sizes": (256, 256),
     },
     "maze": {
-        "channel_sizes": (4, 4),
+        "channel_sizes": (16, 16),
         "kernel_sizes": (3, 3),
-        "strides": (1, 1),
+        "strides": (2, 1),
         "hidden_sizes": (64,),
         "critic_hidden_sizes": (128,),
         "critic_layer_sizes": (128, 128),
@@ -588,6 +597,7 @@ class Job:
     clip_value_loss: bool
     latent_kl_coef: float
     halting_ent_coef: float
+    standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
     use_layer_norm: bool
@@ -651,6 +661,8 @@ class Job:
             ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
+            if self.standardize_advantages:
+                ppo += "-stdadv"
             if self.recompute_advantages:
                 ppo += "-radv"
             if self.critic_before_actor:
@@ -741,6 +753,7 @@ class Job:
             cmd.append(f"system.num_minibatches={self.num_minibatches}")
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+            cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
             if self.system in LATENT_KL_PPO_SYSTEMS:
@@ -870,6 +883,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.num_minibatches,
             args.clip_eps,
             args.clip_value_loss,
+            args.standardize_advantages,
             args.recompute_advantages,
             args.critic_before_actor,
         )
@@ -1016,6 +1030,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_minibatches,
                 clip_eps,
                 clip_value_loss,
+                standardize_advantages,
                 recompute_advantages,
                 critic_before_actor,
             ),
@@ -1052,6 +1067,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_minibatches,
                     clip_eps,
                     clip_value_loss,
+                    standardize_advantages,
                     recompute_advantages,
                     critic_before_actor,
                 ) = ppo_combos[0]
@@ -1094,6 +1110,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     clip_value_loss=clip_value_loss,
                     latent_kl_coef=latent_kl_coef,
                     halting_ent_coef=halting_ent_coef,
+                    standardize_advantages=standardize_advantages,
                     recompute_advantages=recompute_advantages,
                     critic_before_actor=critic_before_actor,
                     use_layer_norm=use_layer_norm,
@@ -1277,6 +1294,14 @@ def main() -> None:
     parser.add_argument("--clip-eps", default="0.2", help="Comma-separated system.clip_eps values (PPO only).")
     parser.add_argument("--clip-value-loss", default="true", help="Comma-separated bools (PPO only).")
     parser.add_argument(
+        "--standardize-advantages",
+        default="false",
+        help="Comma-separated bools (true/false) - system.standardize_advantages: whether the "
+        "advantage is standardized (zero mean, unit variance) across the rollout before being "
+        "used in the PPO clipped surrogate. Swept independently of --epochs/--num-minibatches/"
+        "--clip-eps/--clip-value-loss. PPO systems only.",
+    )
+    parser.add_argument(
         "--recompute-advantages",
         default="false",
         help="Comma-separated bools (true/false) - system.recompute_advantages: whether the "
@@ -1447,6 +1472,9 @@ def main() -> None:
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
     args.clip_value_loss = [x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")]
+    args.standardize_advantages = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
+    ]
     args.recompute_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.recompute_advantages.split(",")
     ]
