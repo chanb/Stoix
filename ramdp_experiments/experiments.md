@@ -588,12 +588,16 @@ python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforc
 
 
 # Comments on Sept 10
-### Maze
+## Maze
+### IRU
 Search:
 ```
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 1,2,4 --total-timesteps 1e8 --clip-value-lo
-ss false --lr 3e-4 --critic-lr 3e-4,1e-3 --envs maze --total-num-envs 128 --maze-size 10 --gpus 0,1,2,3,4,5 --rollout-length 10 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.0 --critic-before-actor false,true --wandb true --wandb
--project maze-sep9 --yes --no-skip-existing --qv-critic separate --critic-weight-decay 0.0,0.001 --use-input-layer-norm false,true --standardize-advantages false,true
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 1,2,4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4,1e-3 --envs maze --total-num-envs 128 --maze-size 10 --gpus 0,1,2,3,4,5 --rollout-length 10 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.0 --critic-before-actor false,true --wandb true --wandb-project maze-sep9 --yes --no-skip-existing --qv-critic separate --critic-weight-decay 0.0,0.001 --use-input-layer-norm false,true --standardize-advantages false,true
+```
+
+New run:
+```
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --total-num-envs 128 --maze-size 10 --gpus 0,1,2,3 --rollout-length 10 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --critic-before-actor false,true --wandb true --wandb-project maze-sep9 --yes --no-skip-existing --qv-critic separate --use-input-layer-norm true --standardize-advantages false,true
 ```
 
 - Seems to be reasonably good `['maze-sz10', 'ppo_cond_fac-cnn+iru', 'mn1-mx5', 'hd64-lr0.0003-clr0.0003-ec0.01-mgn0.5-nl1-sepqv', '145f8f33']`---takes <2hrs on salient4:
@@ -711,7 +715,18 @@ ss false --lr 3e-4 --critic-lr 3e-4,1e-3 --envs maze --total-num-envs 128 --maze
 ```
 
 
-### Sokoban
+### eCoT
+```
+# tmux attach -t6, gpus 4,5
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_explicit_cond_fac --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+transformer_explicit_cot --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --vocab-size 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 4,5 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --critic-before-actor false,true --qv-critic separate --standardize-advantages false,true --wandb true --wandb-project maze-sep10-ecot_sweep --yes --no-skip-existing
+
+
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+transformer_explicit_cot --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --vocab-size 1 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --critic-before-actor false,true --qv-critic separate --standardize-advantages false,true --wandb true --wandb-project maze-sep10-ecot_sweep --yes --no-skip-existing
+```
+
+
+
+## Sokoban
 This run is learning:
 ```
 python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 7 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true
