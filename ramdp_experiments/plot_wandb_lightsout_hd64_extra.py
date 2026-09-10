@@ -25,6 +25,21 @@ Produces, per architecture:
      trajectories (adaptive-budget configs only) as individual thin lines
      instead of a mean +/- SEM band, to see whether halting behavior is
      consistent across seeds or not.
+  6. lightsout_hd64_pareto_{actor,evaluator}_{episode,discounted}_return.pdf
+     - four combined 1x5 figures (paper-sized fonts), one per actor/evaluator
+     x episode/discounted-return metric, each with one column per the same
+     (architecture, vocab_size) grouping as the per-file pareto plots above
+     (IRU-ACT, Transformer-CoT, Transformer-ExplicitCoT x vocab={2,4,8}).
+     The actor figures share a fixed y-axis of [0.5, 1.0] so performance is
+     directly comparable across architectures; all four share fixed x-ticks
+     at [1, 2, 3, 4, 5].
+  7. lightsout_hd64_learning_curve_{actor,evaluator}_{episode,discounted}
+     _return.pdf - four more combined 1x5 figures, same 5-column (arch,
+     vocab_size) grouping, but plotting the full training curve (metric vs.
+     timesteps) instead of a single final-performance point: every fixed
+     budget (grayscale) and every adaptive-budget qac_variant (colored) is
+     overlaid in the same panel, so one figure shows the whole compute/
+     algorithm sweep's training dynamics per architecture.
 
 Usage:
   python ramdp_experiments/plot_wandb_lightsout_hd64_extra.py \\
@@ -37,8 +52,11 @@ import argparse
 import os
 from pathlib import Path
 
+from matplotlib.ticker import FormatStrFormatter
+
 import plot_wandb_lightsout_hd64 as base
 
+last_k_eval = 1
 plt = base.plt
 sns = base.sns
 pd = base.pd
@@ -50,10 +68,13 @@ place_legend_and_title = base.place_legend_and_title
 budget_label = base.budget_label
 variant_row_label = base.variant_row_label
 compute_final_values = base.compute_final_values
+mean_sem_curve = base.mean_sem_curve
+step_axis = base.step_axis
 expand_vocab_agnostic_budget1 = base.expand_vocab_agnostic_budget1
 METRICS = base.METRICS
 METRIC_LABELS = base.METRIC_LABELS
 ARCH_ORDER = base.ARCH_ORDER
+arch_label = base.arch_label
 VOCAB_SIZE_NA = base.VOCAB_SIZE_NA
 doc_width_pt = base.doc_width_pt
 
@@ -139,7 +160,7 @@ def plot_pareto(
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
 
-    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=False)
+    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=True)
     fig, axes = plt.subplots(1, len(return_metrics), figsize=figsize, squeeze=False)
     axes = axes[0]
 
@@ -166,7 +187,7 @@ def plot_pareto(
                 color=fixed_color,
                 linestyle="none",
                 capsize=2,
-                label="Fixed budget",
+                label="Uniform budget",
             )
 
         adaptive = merged[merged["min_steps"] != merged["max_steps"]]
@@ -189,12 +210,13 @@ def plot_pareto(
             )
 
         ax.grid(True, alpha=0.3)
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
         ax.set_title(METRIC_LABELS[metric], fontsize=9)
-        ax.set_xlabel("Final mean compute (ponder) steps")
         if col == 0:
-            ax.set_ylabel("Final performance\n(mean of last 3 evals, ± SEM)", fontsize=8)
+            ax.set_ylabel("Final performance\n(mean of last {} evals, ± SEM)".format(last_k_eval), fontsize=8)
 
-    title = f"{arch}: compute vs. performance (Pareto view)"
+    fig.supxlabel("Final mean compute steps $c$")
+    title = f"{arch_label(arch)}: Compute vs. Performance"
     if vocab_size != VOCAB_SIZE_NA:
         title += f", vocab={vocab_size}"
 
@@ -213,6 +235,284 @@ def plot_pareto(
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
+    print(f"Saved {output_path}")
+    plt.close(fig)
+
+
+PARETO_ROWS = [
+    dict(prefix="actor", metric="actor/episode_return/mean", label="Episode return",
+         ylim=(0.5, 1.0), fname="actor_episode_return"),
+    dict(prefix="actor", metric="actor/episode_discounted_return/mean", label="Discounted return",
+         ylim=(0.5, 1.0), fname="actor_discounted_return"),
+    dict(prefix="evaluator", metric="evaluator/episode_return/mean", label="Episode return",
+         ylim=None, fname="evaluator_episode_return"),
+    dict(prefix="evaluator", metric="evaluator/episode_discounted_return/mean", label="Discounted return",
+         ylim=None, fname="evaluator_discounted_return"),
+]
+
+PARETO_GRID_XTICKS = [1, 2, 3, 4, 5]
+PARETO_GRID_FONTSIZES = dict(title=20, col_title=18, row_label=16, tick=12, xlabel=16, legend=14)
+
+
+def pareto_columns(df: pd.DataFrame):
+    """Ordered (arch, vocab_size, column_title) triples: one column per
+    architecture, expanded into one column per vocab_size for architectures
+    with a vocab_size axis (Transformer-ExplicitCoT) - the same grouping
+    plot_pareto uses to produce one file per (arch, vocab_size)."""
+    columns = []
+    for arch in ARCH_ORDER:
+        if arch not in df["arch"].unique():
+            continue
+        sub_arch = df[df["arch"] == arch]
+        vocab_values = sorted(v for v in sub_arch["vocab_size"].unique() if v != VOCAB_SIZE_NA)
+        if vocab_values:
+            for vocab_size in vocab_values:
+                columns.append(
+                    (arch, vocab_size, f"{arch_label(arch)}\n$\\vert \\mathcal{{V}} \\vert = {vocab_size}$")
+                )
+        else:
+            columns.append((arch, VOCAB_SIZE_NA, arch_label(arch)))
+    return columns
+
+
+def plot_pareto_row(
+    df: pd.DataFrame,
+    metric: str,
+    compute_metric: str,
+    row_label: str,
+    output_path: Path,
+    out_dir: Path,
+    title: str,
+    ylim: "tuple[float, float] | None" = None,
+) -> None:
+    """Single combined figure, one row: one column per (architecture,
+    vocab_size) - the same grouping as the per-file plot_pareto figures -
+    for one actor/evaluator return metric, so that metric's compute/
+    performance trade-off is visible across every architecture at a glance.
+    `ylim`, when given, is applied to every panel so performance is directly
+    comparable architecture-to-architecture; x-ticks are fixed at
+    PARETO_GRID_XTICKS regardless of each panel's data range, for a
+    consistent budget axis across panels."""
+    columns = pareto_columns(df)
+    n_cols = len(columns)
+    qac_markers = {"reinforce": "D", "cond_fac": "s", "cond_naive": "^"}
+    qac_colors = dict(zip(["reinforce", "cond_fac", "cond_naive"], sns.color_palette("colorblind", n_colors=3)))
+    fixed_color = "0.25"
+    fs = PARETO_GRID_FONTSIZES
+
+    if os.path.abspath(out_dir).startswith("/Users"):
+        plt.rcParams.update(pgf_with_latex)
+
+    figsize = set_size(doc_width_pt, fraction=2.6, subplots=(1, n_cols), use_golden_ratio=False)
+    fig, axes = plt.subplots(1, n_cols, figsize=figsize, squeeze=False)
+    axes = axes[0]
+
+    for col, (arch, vocab_size, col_title) in enumerate(columns):
+        ax = axes[col]
+        arch_sub = df[(df["arch"] == arch) & (df["vocab_size"] == vocab_size)]
+        perf = compute_final_values(arch_sub, metric)
+        comp = compute_final_values(arch_sub, compute_metric)
+        merged = perf.merge(comp[["run_id", "value"]], on="run_id", suffixes=("_perf", "_compute"))
+
+        fixed = merged[merged["min_steps"] == merged["max_steps"]]
+        if not fixed.empty:
+            stats = fixed.groupby("min_steps").agg(
+                perf_mean=("value_perf", "mean"),
+                perf_sem=("value_perf", lambda s: s.std() / np.sqrt(len(s))),
+                comp_mean=("value_compute", "mean"),
+                comp_sem=("value_compute", lambda s: s.std() / np.sqrt(len(s))),
+            ).sort_index()
+            ax.errorbar(
+                stats["comp_mean"],
+                stats["perf_mean"],
+                xerr=stats["comp_sem"],
+                yerr=stats["perf_sem"],
+                marker="o",
+                markersize=6,
+                color=fixed_color,
+                linestyle="none",
+                capsize=3,
+                label="Uniform budget",
+            )
+
+        adaptive = merged[merged["min_steps"] != merged["max_steps"]]
+        for qac_variant, g in adaptive.groupby("qac_variant"):
+            perf_mean = g["value_perf"].mean()
+            perf_sem = g["value_perf"].std() / np.sqrt(len(g))
+            comp_mean = g["value_compute"].mean()
+            comp_sem = g["value_compute"].std() / np.sqrt(len(g))
+            ax.errorbar(
+                [comp_mean],
+                [perf_mean],
+                xerr=[comp_sem],
+                yerr=[perf_sem],
+                marker=qac_markers.get(qac_variant, "*"),
+                markersize=9,
+                color=qac_colors.get(qac_variant, "0.5"),
+                linestyle="none",
+                capsize=3,
+                label=variant_row_label(qac_variant, False),
+            )
+
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(PARETO_GRID_XTICKS)
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+        ax.tick_params(labelsize=fs["tick"])
+        # if ylim is not None:
+        #     ax.set_ylim(*ylim)
+        ax.set_title(col_title, fontsize=fs["col_title"])
+        if col == 0:
+            ax.set_ylabel(row_label, fontsize=fs["row_label"])
+        # if col > 0:
+        #     ax.set_yticks([])
+
+    fig.subplots_adjust(bottom=0.55 / figsize[1])
+    max_title_lines = max(col_title.count("\n") + 1 for _, _, col_title in columns)
+    fig.subplots_adjust(top=1 - (0.05 + 0.25 * max_title_lines) / figsize[1])
+    fig.supxlabel("Compute steps $c$", fontsize=fs["xlabel"])
+    by_label: dict = {}
+    for ax in axes:
+        h, l = ax.get_legend_handles_labels()
+        for hh, ll in zip(h, l):
+            by_label.setdefault(ll, hh)
+
+    ncols = min(len(by_label), 4)
+    legend_rows = -(-len(by_label) // ncols)
+    legend_top_frac = 1.0 + (0.05 + 0.30 * legend_rows) / figsize[1]
+    title_y = legend_top_frac + 0.30 / figsize[1]
+    fig.suptitle(title, y=title_y, fontsize=fs["title"])
+    fig.legend(
+        list(by_label.values()),
+        list(by_label.keys()),
+        bbox_to_anchor=(0.0, 1.0, 1.0, 0.0),
+        loc="lower center",
+        ncols=ncols,
+        borderaxespad=0.0,
+        frameon=True,
+        fontsize=fs["legend"],
+    )
+    fig.savefig(output_path, format="pdf", bbox_inches="tight", dpi=600)
+    print(f"Saved {output_path}")
+    plt.close(fig)
+
+
+QAC_VARIANT_ORDER = ["reinforce", "cond_fac", "cond_naive"]
+
+LEARNING_CURVE_ROWS = [
+    dict(prefix="actor", metric="actor/episode_return/mean", label="Episode return", fname="actor_episode_return"),
+    dict(prefix="actor", metric="actor/episode_discounted_return/mean", label="Discounted return",
+         fname="actor_discounted_return"),
+    dict(prefix="evaluator", metric="evaluator/episode_return/mean", label="Episode return",
+         fname="evaluator_episode_return"),
+    dict(prefix="evaluator", metric="evaluator/episode_discounted_return/mean", label="Discounted return",
+         fname="evaluator_discounted_return"),
+]
+
+
+def learning_curve_palette(df: pd.DataFrame):
+    """Grayscale (light->dark, more compute = darker) per fixed budget, plus
+    the same 3 colorblind colors used for qac_variant everywhere else in
+    this file - so fixed- and adaptive-budget curves read as two distinct
+    families instead of competing for hues in one panel."""
+    fixed_budgets = sorted(df.loc[df["min_steps"] == df["max_steps"], "min_steps"].unique())
+    grays = plt.cm.Greys(np.linspace(0.35, 0.85, len(fixed_budgets))) if fixed_budgets else []
+    fixed_colors = dict(zip(fixed_budgets, grays))
+    qac_colors = dict(zip(QAC_VARIANT_ORDER, sns.color_palette("colorblind", n_colors=len(QAC_VARIANT_ORDER))))
+    return fixed_colors, qac_colors
+
+
+def plot_learning_curves(
+    df: pd.DataFrame,
+    metric: str,
+    row_label: str,
+    output_path: Path,
+    out_dir: Path,
+    title: str,
+) -> None:
+    """Single combined figure, one row: one subplot per (architecture,
+    vocab_size) - the same 5-column grouping as plot_pareto_row - with every
+    fixed-budget curve (grayscale) and every adaptive-budget qac_variant
+    curve (PPO/Factorized/Separated, each its own colorblind color)
+    overlaid in the same panel, mean +/- SEM across seeds. Unlike the main
+    script's plot_arch (one row per qac_variant), this puts the full
+    compute/algorithm sweep for one architecture in a single panel."""
+    columns = pareto_columns(df)
+    n_cols = len(columns)
+    fixed_colors, qac_colors = learning_curve_palette(df)
+    fs = PARETO_GRID_FONTSIZES
+
+    if os.path.abspath(out_dir).startswith("/Users"):
+        plt.rcParams.update(pgf_with_latex)
+
+    figsize = set_size(doc_width_pt, fraction=2.6, subplots=(1, n_cols), use_golden_ratio=False)
+    fig, axes = plt.subplots(1, n_cols, figsize=figsize, squeeze=False)
+    axes = axes[0]
+
+    for col, (arch, vocab_size, col_title) in enumerate(columns):
+        ax = axes[col]
+        col_df = df[(df["arch"] == arch) & (df["vocab_size"] == vocab_size)]
+
+        fixed_budgets = sorted(col_df.loc[col_df["min_steps"] == col_df["max_steps"], "min_steps"].unique())
+        for mn in fixed_budgets:
+            b_df = col_df[(col_df["min_steps"] == mn) & (col_df["max_steps"] == mn)]
+            result = mean_sem_curve(b_df, metric)
+            if result is None:
+                continue
+            eval_idx, mean, sem = result
+            steps = step_axis(b_df).reindex(eval_idx).to_numpy()
+            color = fixed_colors[mn]
+            ax.plot(steps, mean, color=color, linewidth=1.3, label=f"Fixed budget={mn}")
+            ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
+
+        adaptive_df = col_df[col_df["min_steps"] != col_df["max_steps"]]
+        for qac_variant in QAC_VARIANT_ORDER:
+            v_df = adaptive_df[adaptive_df["qac_variant"] == qac_variant]
+            result = mean_sem_curve(v_df, metric)
+            if result is None:
+                continue
+            eval_idx, mean, sem = result
+            steps = step_axis(v_df).reindex(eval_idx).to_numpy()
+            color = qac_colors[qac_variant]
+            ax.plot(
+                steps, mean, color=color, linewidth=1.8,
+                label=f"Adaptive {variant_row_label(qac_variant, False)}",
+            )
+            ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
+
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=fs["tick"])
+        ax.set_title(col_title, fontsize=fs["col_title"])
+        ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+        if col == 0:
+            ax.set_ylabel(row_label, fontsize=fs["row_label"])
+
+    fig.subplots_adjust(bottom=0.55 / figsize[1])
+    max_title_lines = max(col_title.count("\n") + 1 for _, _, col_title in columns)
+    fig.subplots_adjust(top=1 - (0.05 + 0.25 * max_title_lines) / figsize[1])
+    fig.supxlabel("Timesteps", fontsize=fs["xlabel"])
+
+    by_label: dict = {}
+    for ax in axes:
+        h, l = ax.get_legend_handles_labels()
+        for hh, ll in zip(h, l):
+            by_label.setdefault(ll, hh)
+
+    ncols = min(len(by_label), 4)
+    legend_rows = -(-len(by_label) // ncols)
+    legend_top_frac = 1.0 + (0.05 + 0.30 * legend_rows) / figsize[1]
+    title_y = legend_top_frac + 0.30 / figsize[1]
+    fig.suptitle(title, y=title_y, fontsize=fs["title"])
+    fig.legend(
+        list(by_label.values()),
+        list(by_label.keys()),
+        bbox_to_anchor=(0.0, 1.0, 1.0, 0.0),
+        loc="lower center",
+        ncols=ncols,
+        borderaxespad=0.0,
+        frameon=True,
+        fontsize=fs["legend"],
+    )
+    fig.savefig(output_path, format="pdf", bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
     plt.close(fig)
 
@@ -237,7 +537,7 @@ def plot_seed_variance(
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
 
-    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=False)
+    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=True)
     fig, axes = plt.subplots(1, len(return_metrics), figsize=figsize, squeeze=False)
     axes = axes[0]
 
@@ -292,7 +592,9 @@ def plot_seed_variance(
             ax.set_ylabel("")
 
     handles = [plt.Line2D([0], [0], marker="o", linestyle="none", color=variant_palette[lbl]) for lbl in hue_order]
-    place_legend_and_title(fig, handles, hue_order, min(len(hue_order), 3), figsize, f"{arch}: per-seed final performance")
+    place_legend_and_title(
+        fig, handles, hue_order, min(len(hue_order), 3), figsize, f"{arch_label(arch)}: per-seed final performance"
+    )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
@@ -376,7 +678,7 @@ def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) 
             ax.tick_params(axis="x", rotation=45, labelsize=7)
             ax.tick_params(axis="y", rotation=0, labelsize=7)
 
-    fig.suptitle(f"{arch}: final performance heatmap", y=1.0 + 0.03 * n_vocab_rows, fontsize=12)
+    fig.suptitle(f"{arch_label(arch)}: final performance heatmap", y=1.0 + 0.03 * n_vocab_rows, fontsize=12)
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
@@ -396,7 +698,7 @@ def compute_steps_to_threshold(sub_arch: pd.DataFrame, metric: str, row_keys, fr
             continue
         for run_id, g in row_sub.groupby("run_id"):
             g = g.sort_values("eval_idx")
-            final = g[metric].tail(2).mean()
+            final = g[metric].tail(last_k_eval).mean()
             if pd.isna(final) or final <= 0:
                 step = np.nan
             else:
@@ -434,7 +736,7 @@ def plot_steps_to_threshold(
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
 
-    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=False)
+    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=True)
     fig, axes = plt.subplots(1, len(return_metrics), figsize=figsize, squeeze=False)
     axes = axes[0]
 
@@ -476,7 +778,7 @@ def plot_steps_to_threshold(
         hue_order,
         min(len(hue_order), 3),
         figsize,
-        f"{arch}: learning speed (steps to {int(frac * 100)}% of final performance)",
+        f"{arch_label(arch)}: learning speed (steps to {int(frac * 100)}% of final performance)",
     )
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
@@ -504,7 +806,7 @@ def plot_compute_spaghetti(df: pd.DataFrame, arch: str, output_path: Path, out_d
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
 
-    figsize = set_size(doc_width_pt, fraction=1.1, subplots=(n_rows, 1), use_golden_ratio=False)
+    figsize = set_size(doc_width_pt, fraction=1.1, subplots=(n_rows, 1), use_golden_ratio=True)
     fig, axes = plt.subplots(n_rows, 1, figsize=figsize, squeeze=False)
 
     seed_colors = sns.color_palette("colorblind", n_colors=5)
@@ -527,12 +829,11 @@ def plot_compute_spaghetti(df: pd.DataFrame, arch: str, output_path: Path, out_d
         ax.grid(True, alpha=0.3)
         if row == 0:
             ax.set_title(f"Per-seed compute-time trajectories (adaptive[{mn}-{mx}])", fontsize=9)
-        if row == n_rows - 1:
-            ax.set_xlabel("Timesteps")
         ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
 
+    fig.supxlabel("Timesteps")
     handles = [plt.Line2D([0], [0], color=seed_colors[s], label=f"seed {s}") for s in range(5)]
-    place_legend_and_title(fig, handles, [f"seed {s}" for s in range(5)], 5, figsize, arch)
+    place_legend_and_title(fig, handles, [f"seed {s}" for s in range(5)], 5, figsize, arch_label(arch))
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight", dpi=600)
     print(f"Saved {output_path}")
@@ -590,6 +891,29 @@ def main() -> None:
         )
         plot_compute_spaghetti(
             df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_compute_spaghetti.pdf", args.output_dir
+        )
+
+    for spec in PARETO_ROWS:
+        compute_metric = f"{spec['prefix']}/compute_time/mean"
+        plot_pareto_row(
+            df,
+            spec["metric"],
+            compute_metric,
+            spec["label"],
+            args.output_dir / f"lightsout_hd64_pareto_{spec['fname']}.pdf",
+            args.output_dir,
+            title=f"{spec['label']} vs. compute (all architectures)",
+            ylim=spec["ylim"],
+        )
+
+    for spec in LEARNING_CURVE_ROWS:
+        plot_learning_curves(
+            df,
+            spec["metric"],
+            spec["label"],
+            args.output_dir / f"lightsout_hd64_learning_curve_{spec['fname']}.pdf",
+            args.output_dir,
+            title=f"{spec['label']} vs. timesteps (all budgets and variants, all architectures)",
         )
 
 

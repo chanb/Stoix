@@ -10,11 +10,20 @@ Transformer-CoT, Transformer-ExplicitCoT never appear in the same figure) -
 one IQM and one probability-of-improvement figure per (dataset, architecture,
 metric).
 
-Run separately for two scores (`--metric` choices, or both by default):
+Run separately for four scores (`--metric` choices, or all by default):
   - discounted_return: actor/episode_discounted_return/mean, final value
-    (mean of the run's last 3 evals - see compute_final_values).
+    (mean of the run's last 3 evals - see compute_final_values). Actor
+    metrics come from the training-time rollout (the batch of episodes the
+    policy update itself is computed from).
   - budget: actor/compute_time/mean, final value - how many ponder steps an
     adaptive-budget run actually used, not the nominal budget cap.
+  - eval_discounted_return / eval_budget: same two quantities, but from
+    evaluator/episode_discounted_return/mean and evaluator/compute_time/mean
+    - a held-out evaluator rollout logged at the same eval_step as the actor
+    metrics above (see fetch_wandb_lightsout_hd64.py), not the training
+    batch. Use these to check whether an IQM/POI conclusion drawn from
+    actor-side numbers also holds on held-out evaluation, or is a training-
+    batch artifact.
 
 "Algorithms" (rliable's unit of comparison) are every (qac_variant,
 vocab_size) combo present AT THE ADAPTIVE BUDGET (min_steps=1, max_steps=5)
@@ -67,6 +76,14 @@ ARCH_ORDER = base.ARCH_ORDER
 METRIC_SPECS = {
     "discounted_return": ("actor/episode_discounted_return/mean", "IQM: discounted return"),
     "budget": ("actor/compute_time/mean", "IQM: compute (ponder) steps used"),
+    "eval_discounted_return": (
+        "evaluator/episode_discounted_return/mean",
+        "IQM: discounted return (evaluator)",
+    ),
+    "eval_budget": (
+        "evaluator/compute_time/mean",
+        "IQM: compute (ponder) steps used (evaluator)",
+    ),
 }
 
 AlgoSpec = Tuple[str, str, int]  # (arch, qac_variant, vocab_size)
@@ -120,6 +137,35 @@ def algorithm_scores(df: pd.DataFrame, arch: str, qac_variant: str, vocab_size: 
 
 def build_score_dict(df: pd.DataFrame, algorithms: Dict[str, AlgoSpec], metric: str) -> Dict[str, np.ndarray]:
     return {label: algorithm_scores(df, *spec, metric) for label, spec in algorithms.items()}
+
+
+def print_compute_time_spread(df: pd.DataFrame, algorithms: Dict[str, AlgoSpec], arch: str, prefix: str) -> None:
+    """Print, per algorithm, the final (mean of last-3-eval) compute_time
+    mean/min/max averaged across seeds, plus max-min spread - a quick check
+    of whether an adaptive-budget agent's per-episode compute usage
+    actually varies or is effectively constant. `prefix` is "actor" or
+    "evaluator"."""
+    min_col, max_col = f"{prefix}/compute_time/min", f"{prefix}/compute_time/max"
+    if min_col not in df.columns or max_col not in df.columns:
+        print(
+            f"  [{arch}] {prefix}/compute_time spread: skipped - {min_col}/{max_col} not in this CSV "
+            "(re-run fetch_wandb_lightsout_hd64.py, which now scrapes them from the console log - "
+            "see fetch_compute_time_extrema)"
+        )
+        return
+    print(f"  [{arch}] {prefix}/compute_time spread (final value, mean across seeds):")
+    for label, spec in algorithms.items():
+        mean_scores = algorithm_scores(df, *spec, f"{prefix}/compute_time/mean").ravel()
+        if mean_scores.size == 0:
+            continue
+        min_scores = algorithm_scores(df, *spec, min_col).ravel()
+        max_scores = algorithm_scores(df, *spec, max_col).ravel()
+        mean_of_min = min_scores.mean() if min_scores.size else float("nan")
+        mean_of_max = max_scores.mean() if max_scores.size else float("nan")
+        print(
+            f"    {label:35s} mean={mean_scores.mean():6.2f}  min={mean_of_min:6.2f}  "
+            f"max={mean_of_max:6.2f}  spread={mean_of_max - mean_of_min:6.2f}  (n={mean_scores.size} seeds)"
+        )
 
 
 def build_poi_pairs(labels: List[str]) -> List[Tuple[str, str]]:
@@ -198,7 +244,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csvs", type=Path, nargs="+", help="wandb_cache_hd64-*.csv files, one per dataset")
     parser.add_argument(
-        "--metric", choices=list(METRIC_SPECS.keys()), action="append", help="Restrict to one metric (repeatable). Default: both."
+        "--metric", choices=list(METRIC_SPECS.keys()), action="append", help="Restrict to one metric (repeatable). Default: all."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("ramdp_experiments/rliable_plots"))
     args = parser.parse_args()
@@ -221,6 +267,9 @@ def main() -> None:
                 continue
             safe_name = arch.lower().replace(" ", "-").replace(".", "")
             print(f"  [{arch}] variants: {list(algorithms.keys())}")
+
+            for prefix in ("actor", "evaluator"):
+                print_compute_time_spread(df, algorithms, arch, prefix)
 
             for metric_key in metric_keys:
                 metric_col, iqm_label = METRIC_SPECS[metric_key]

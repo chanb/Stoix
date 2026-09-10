@@ -1,8 +1,30 @@
 #!/usr/bin/env python
 """Fetch actor/{episode_return,episode_discounted_return,compute_time} training
-curves from the wandb project `bpychan-university-of-alberta/lightsout-sep7`,
-restricted to `network.actor_network.pre_torso.hidden_dim == 64`, and cache them
-to a local parquet file for plotting (see plot_wandb_lightsout_hd64.py).
+curves, and the same three quantities from held-out evaluator rollouts
+(evaluator/{episode_return,episode_discounted_return,compute_time}), from the
+wandb project `bpychan-university-of-alberta/lightsout-sep7`, restricted to
+`network.actor_network.pre_torso.hidden_dim == 64`, and cache them to a local
+parquet file for plotting (see plot_wandb_lightsout_hd64.py) and rliable
+analysis (see rliable_analysis.py).
+
+Also fetches compute_time/{min,max} for both actor and evaluator, so
+downstream analysis can check how much an adaptive-budget agent's
+per-episode compute usage actually varies rather than only seeing the mean.
+These two are NOT in `wandb.log`'s structured history - `WandBLogger.log_stat`
+(stoix/utils/logger.py) drops every non-mean stat unless a run's config sets
+`logger.loggers.wandb.detailed_logging: true` (default False, see
+stoix/configs/logger/logger.yaml), and none of these runs did. But
+`ConsoleLogger.log_stat` has no such gate, so mean/std/min/max for every
+metric were all printed to stdout regardless - e.g. "EVALUATOR - ... |
+Compute time mean: 3.480 | Compute time std: 0.596 | Compute time min: 2.200
+| Compute time max: 4.500 | ..." - and wandb captures stdout as the run's
+console log (the "Logs" tab) independently of what got `wandb.log`'d. So
+`fetch_compute_time_extrema` reads back the tail of that console log via
+`run.console_logs(last=...)` and regex-parses out the last few ACTOR/
+EVALUATOR blocks' min/max, averaged the same way `compute_final_values`
+(plot_wandb_lightsout_hd64.py) averages the last 3 eval points - it's a
+single scalar per run, broadcast onto every row of that run's history so
+the existing per-eval-point machinery doesn't need to change.
 
 The project mixes runs logged under a couple of config schema versions (e.g.
 `stop_gradient_halting_input` / `halting_ent_coef` only exist on newer runs,
@@ -32,9 +54,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import wandb
 
@@ -44,7 +68,31 @@ METRICS = [
     "actor/episode_return/mean",
     "actor/episode_discounted_return/mean",
     "actor/compute_time/mean",
+    # Evaluator metrics: same quantities but from held-out eval rollouts
+    # (deterministic-ish, not the training batch) rather than the actor's
+    # own training-time episodes - logged at the same eval_step/wandb step
+    # as the actor/* metrics above (see ff_reinforce.py's eval loop), so
+    # they line up 1:1 with the actor rows already fetched here.
+    "evaluator/episode_return/mean",
+    "evaluator/episode_discounted_return/mean",
+    "evaluator/compute_time/mean",
+    # compute_time/{min,max} are deliberately NOT here - Run.history(keys=...)
+    # requires every requested key to be present on a row, and these were
+    # never sent via wandb.log (see module docstring), so including them
+    # would make every run's history query return empty. Fetched separately
+    # from the console log instead - see fetch_compute_time_extrema.
 ]
+
+# How many of the most recent console log lines to pull per run when looking
+# for the tail few eval checkpoints' compute_time min/max (see
+# fetch_compute_time_extrema). Each eval_step contributes only a handful of
+# lines (MISC/TRAINER/ACTOR/EVALUATOR, occasionally ABSOLUTE), so this is
+# generous headroom for N_TAIL_EVALS worth of them in one request.
+CONSOLE_TAIL_LINES = 500
+N_TAIL_EVALS = 3  # matches compute_final_values' n_tail default
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_CONSOLE_EVENT_PREFIX = {"ACTOR": "actor", "EVALUATOR": "evaluator"}
 
 ARCH_SHORT = {
     "stoix.networks.torso_compute.IRUAdaptiveComputationTimeTorso": "IRU-ACT",
@@ -163,6 +211,66 @@ def dedupe_latest(
     return list(best.values())
 
 
+def parse_console_log_line(content: str) -> Optional[Tuple[str, Dict[str, float]]]:
+    """Parse one ConsoleLogger-formatted line (see stoix/utils/logger.py's
+    `ConsoleLogger.log_dict`), e.g. "EVALUATOR - Compute time mean: 3.480 |
+    Compute time min: 2.200 | ..." into (event_label, {stat_key: value}),
+    e.g. ("EVALUATOR", {"compute_time_mean": 3.48, "compute_time_min": 2.2,
+    ...}). Returns None for lines that don't match this format (config
+    dumps, non-Stoix log lines, etc.)."""
+    content = _ANSI_RE.sub("", content).strip()
+    if " - " not in content:
+        return None
+    label, _, rest = content.partition(" - ")
+    stats: Dict[str, float] = {}
+    for frag in rest.split(" | "):
+        key, sep, value = frag.partition(": ")
+        if not sep:
+            continue
+        try:
+            stats[key.strip().lower().replace(" ", "_")] = float(value)
+        except ValueError:
+            continue
+    return label.strip(), stats
+
+
+def fetch_compute_time_extrema(
+    run: "wandb.apis.public.Run", n_tail: int = N_TAIL_EVALS, tail_lines: int = CONSOLE_TAIL_LINES
+) -> Dict[str, float]:
+    """{"actor/compute_time/min": ..., "evaluator/compute_time/max": ...,
+    ...} - the mean of the last `n_tail` ACTOR/EVALUATOR eval checkpoints'
+    compute_time min and max, read back from the run's console log (see
+    module docstring for why min/max aren't in wandb's structured history).
+    Missing keys mean nothing was found (e.g. the run has no console log,
+    or ACTOR never logged compute_time in the fetched tail)."""
+    mins: Dict[str, List[float]] = {"actor": [], "evaluator": []}
+    maxs: Dict[str, List[float]] = {"actor": [], "evaluator": []}
+    try:
+        lines = list(run.console_logs(last=tail_lines))
+    except Exception as e:
+        print(f"    (console log fetch failed for {run.id}: {e})")
+        lines = []
+    for line in lines:
+        parsed = parse_console_log_line(line.content)
+        if parsed is None:
+            continue
+        label, stats = parsed
+        prefix = _CONSOLE_EVENT_PREFIX.get(label)
+        if prefix is None:
+            continue
+        if "compute_time_min" in stats:
+            mins[prefix].append(stats["compute_time_min"])
+        if "compute_time_max" in stats:
+            maxs[prefix].append(stats["compute_time_max"])
+    result: Dict[str, float] = {}
+    for prefix in ("actor", "evaluator"):
+        if mins[prefix]:
+            result[f"{prefix}/compute_time/min"] = float(np.mean(mins[prefix][-n_tail:]))
+        if maxs[prefix]:
+            result[f"{prefix}/compute_time/max"] = float(np.mean(maxs[prefix][-n_tail:]))
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default=PROJECT)
@@ -183,6 +291,8 @@ def main() -> None:
             continue
         hist = hist.reset_index(drop=True)
         hist["eval_idx"] = hist.index
+        for col, value in fetch_compute_time_extrema(run).items():
+            hist[col] = value
         hist["arch"] = meta.arch
         hist["qac_variant"] = meta.qac_variant
         hist["min_steps"] = meta.min_steps
