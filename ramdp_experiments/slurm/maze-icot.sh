@@ -10,6 +10,10 @@
 module load StdEnv/2023
 module load cuda/12.2
 
+mkdir -p $SLURM_TMPDIR/tmp
+export CUDA_MPS_LOG_DIRECTORY=$SLURM_TMPDIR/tmp
+nvidia-cuda-mps-control -d
+
 cd /home/chanb/research/iclr_2027/Stoix
 
 echo "hostname: $(hostname)"
