@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=aip-schuurma
-#SBATCH --time=11:59:00
+#SBATCH --time=02:59:00
 #SBATCH --mem=32GB
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:2
@@ -16,11 +16,9 @@ echo "hostname: $(hostname)"
 echo "starting at: $(date)"
 
 
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 5 --runs-per-gpu 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --latent-kl-coef=5e-5,1e-4,1e-3 --wandb true --wandb-project maze-tf-sep6 --yes --server vulcan --no-skip-existing
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 2 --architectures cnn+transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --critic-before-actor false,true --qv-critic separate --standardize-advantages false,true --wandb true --wandb-project maze-sep10-ecot_sweep --yes --no-skip-existing --server vulcan
 
-python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,4,8,16 --seeds 5 --runs-per-gpu 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --latent-kl-coef=5e-5,1e-4,1e-3 --wandb true --wandb-project maze-tf-sep6 --yes --server vulcan --no-skip-existing
-
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac,ff_ppo_cond_naive,ff_ppo_reinforce --max-steps 16 --seeds 5 --runs-per-gpu 3 --architectures transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.005 --critic-before-actor true --latent-kl-coef=5e-5,1e-4,1e-3 --wandb true --wandb-project maze-tf-sep6 --yes --server vulcan --no-skip-existing
+# python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 2,3,4,5 --seeds 1 --runs-per-gpu 2 --architectures cnn+transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs maze --maze-size 10 --gpus 0,1 --rollout-length 10 --total-num-envs 128 --epochs 2 --num-minibatches 2 --ent-coef 0.01 --gamma 0.99 --critic-before-actor false,true --qv-critic separate --standardize-advantages false,true --wandb true --wandb-project maze-sep10-ecot_sweep --yes --no-skip-existing --server vulcan
 
 wait
 
