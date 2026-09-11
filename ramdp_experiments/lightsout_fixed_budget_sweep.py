@@ -91,6 +91,10 @@ Grid axes:
                  targets - V(s), this makes the advantage itself GAE(lambda) - see
                  stoix/systems/ramdp_vpg/ff_ppo.py's module docstring. ff_ppo_*
                  systems only, see epochs.
+  - standardize_advantages: system.standardize_advantages - whether the advantage
+                 (Q - V or G - V, depending on qac_variant) is standardized
+                 (zero mean, unit variance) across the rollout before being used
+                 in the PPO clipped surrogate. ff_ppo_* systems only, see epochs.
   - recompute_advantages: system.recompute_advantages - whether the advantage's
                  "what changed" term (Q(s,a,c) for the four Q-V variants, V(s) for
                  "reinforce") and the critic's own regression target are recomputed
@@ -185,6 +189,8 @@ Usage:
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
       --clip-value-loss true,false                       # PPO clipped vs. L2 critic loss
+  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
+      --standardize-advantages true,false                 # sweep PPO advantage standardization
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac \\
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
@@ -456,6 +462,7 @@ class Job:
     clip_value_loss: bool
     gae_lambda: float
     latent_kl_coef: float
+    standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
     use_layer_norm: bool
@@ -529,6 +536,8 @@ class Job:
                 ppo += f"-gae{self.gae_lambda:g}"
             if not self.clip_value_loss:
                 ppo += "-l2c"
+            if self.standardize_advantages:
+                ppo += "-stdadv"
             if self.recompute_advantages:
                 ppo += "-radv"
             if self.critic_before_actor:
@@ -616,6 +625,7 @@ class Job:
             cmd.append(f"system.clip_eps={self.clip_eps:g}")
             cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
             cmd.append(f"system.gae_lambda={self.gae_lambda:g}")
+            cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
             if self.system in LATENT_KL_PPO_SYSTEMS:
@@ -717,6 +727,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.clip_eps,
             args.clip_value_loss,
             args.gae_lambda,
+            args.standardize_advantages,
             args.recompute_advantages,
             args.critic_before_actor,
         )
@@ -841,6 +852,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             clip_eps,
             clip_value_loss,
             gae_lambda,
+            standardize_advantages,
             recompute_advantages,
             critic_before_actor,
         ),
@@ -874,6 +886,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 clip_eps,
                 clip_value_loss,
                 gae_lambda,
+                standardize_advantages,
                 recompute_advantages,
                 critic_before_actor,
             ) = ppo_combos[0]
@@ -906,6 +919,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 clip_value_loss=clip_value_loss,
                 gae_lambda=gae_lambda,
                 latent_kl_coef=latent_kl_coef,
+                standardize_advantages=standardize_advantages,
                 recompute_advantages=recompute_advantages,
                 critic_before_actor=critic_before_actor,
                 use_layer_norm=use_layer_norm,
@@ -1149,6 +1163,14 @@ def main() -> None:
         "--clip-eps/--clip-value-loss. PPO systems only, see --epochs.",
     )
     parser.add_argument(
+        "--standardize-advantages",
+        default="false",
+        help="Comma-separated bools (true/false) - system.standardize_advantages: whether the "
+        "advantage is standardized (zero mean, unit variance) across the rollout before being "
+        "used in the PPO clipped surrogate. Swept independently of --epochs/--num-minibatches/"
+        "--clip-eps/--clip-value-loss. PPO systems only, see --epochs.",
+    )
+    parser.add_argument(
         "--recompute-advantages",
         default="false",
         help="Comma-separated bools (true/false) - system.recompute_advantages: whether the "
@@ -1156,7 +1178,7 @@ def main() -> None:
         "at the end of every PPO epoch from that epoch's just-updated critic params, rather than "
         "staying pinned at their rollout-time values for the whole update (vanilla-PPO style, "
         "the default). Swept independently of --epochs/--num-minibatches/--clip-eps/"
-        "--clip-value-loss. PPO systems only, see --epochs.",
+        "--clip-value-loss/--standardize-advantages. PPO systems only, see --epochs.",
     )
     parser.add_argument(
         "--critic-before-actor",
@@ -1165,7 +1187,8 @@ def main() -> None:
         "joint per-minibatch actor+critic update with two fully sequential phases, `epochs` "
         "epochs of critic-only updates followed by `epochs` epochs of actor-only updates - see "
         "ff_ppo.py's module docstring. Swept independently of --epochs/--num-minibatches/"
-        "--clip-eps/--clip-value-loss/--recompute-advantages. PPO systems only, see --epochs.",
+        "--clip-eps/--clip-value-loss/--standardize-advantages/--recompute-advantages. PPO "
+        "systems only, see --epochs.",
     )
     parser.add_argument(
         "--latent-kl-coef",
@@ -1351,6 +1374,9 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.clip_value_loss.split(",")
     ]
     args.gae_lambda = [float(x) for x in args.gae_lambda.split(",")]
+    args.standardize_advantages = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.standardize_advantages.split(",")
+    ]
     args.recompute_advantages = [
         x.strip().lower() in ("1", "true", "yes") for x in args.recompute_advantages.split(",")
     ]
@@ -1453,6 +1479,7 @@ def main() -> None:
     print(
         f"  epochs={args.epochs} num_minibatches={args.num_minibatches} clip_eps={args.clip_eps} "
         f"clip_value_loss={args.clip_value_loss} gae_lambda={args.gae_lambda} "
+        f"standardize_advantages={args.standardize_advantages} "
         f"recompute_advantages={args.recompute_advantages} "
         f"critic_before_actor={args.critic_before_actor} (PPO systems only: {PPO_SYSTEMS})"
     )
