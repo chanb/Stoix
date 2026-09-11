@@ -519,9 +519,9 @@ ENV_CNN_ARCH = {
         "critic_layer_sizes": (256, 256),
     },
     "maze": {
-        "channel_sizes": (16, 16),
-        "kernel_sizes": (3, 3),
-        "strides": (2, 1),
+        "channel_sizes": (8,),
+        "kernel_sizes": (3,),
+        "strides": (1,),
         "hidden_sizes": (64,),
         "critic_hidden_sizes": (128,),
         "critic_layer_sizes": (128, 128),
@@ -882,9 +882,15 @@ class Job:
 
         if is_cnn:
             cnn_arch = ENV_CNN_ARCH[self.env]
-            channel_sizes = ",".join(str(c) for c in cnn_arch["channel_sizes"])
-            kernel_sizes = ",".join(str(k) for k in cnn_arch["kernel_sizes"])
-            strides = ",".join(str(s) for s in cnn_arch["strides"])
+            critic_channel_sizes = channel_sizes = ",".join(str(c) for c in cnn_arch["channel_sizes"])
+            critic_kernel_sizes = kernel_sizes = ",".join(str(k) for k in cnn_arch["kernel_sizes"])
+            critic_strides = strides = ",".join(str(s) for s in cnn_arch["strides"])
+            if "critic_channel_sizes" in cnn_arch:
+                critic_channel_sizes = cnn_arch["critic_channel_sizes"]
+            if "critic_kernel_sizes" in cnn_arch:
+                critic_kernel_sizes = cnn_arch["critic_kernel_sizes"]
+            if "critic_strides" in cnn_arch:
+                critic_strides = cnn_arch["critic_strides"]
             hidden_sizes = ",".join(str(h) for h in cnn_arch["hidden_sizes"])
             critic_hidden_sizes = ",".join(str(h) for h in cnn_arch["critic_hidden_sizes"])
             critic_layer_sizes = ",".join(str(h) for h in cnn_arch["critic_layer_sizes"])
@@ -896,9 +902,9 @@ class Job:
                 # Separate-torso Q-V critic (value_input_layer/q_input_layer +
                 # value_pre_torso/q_pre_torso), not a single input_layer/pre_torso.
                 for head in ("value", "q"):
-                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[{channel_sizes}]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[{kernel_sizes}]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[{strides}]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[{critic_channel_sizes}]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[{critic_kernel_sizes}]")
+                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[{critic_strides}]")
                     cmd.append(
                         f"network.critic_network.{head}_input_layer.hidden_sizes=[{critic_hidden_sizes}]"
                     )
@@ -906,9 +912,9 @@ class Job:
                         f"network.critic_network.{head}_pre_torso.layer_sizes=[{critic_layer_sizes}]"
                     )
             else:
-                cmd.append(f"network.critic_network.input_layer.channel_sizes=[{channel_sizes}]")
-                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[{kernel_sizes}]")
-                cmd.append(f"network.critic_network.input_layer.strides=[{strides}]")
+                cmd.append(f"network.critic_network.input_layer.channel_sizes=[{critic_channel_sizes}]")
+                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[{critic_kernel_sizes}]")
+                cmd.append(f"network.critic_network.input_layer.strides=[{critic_strides}]")
                 cmd.append(f"network.critic_network.input_layer.hidden_sizes=[{critic_hidden_sizes}]")
                 cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{critic_layer_sizes}]")
         elif not ENV_HAS_BUILTIN_WRAPPER[self.env]:
