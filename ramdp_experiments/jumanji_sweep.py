@@ -421,10 +421,18 @@ ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": T
 # value_pre_torso/q_pre_torso.layer_sizes for the separate-torso Q-V critic,
 # see QAC_SYSTEMS/Job.qv_critic) - the MLP that follows the CNN embedding.
 ENV_CNN_ARCH = {
+    # "sokoban": {
+    #     "channel_sizes": (128, 128, 128),
+    #     "kernel_sizes": (3, 3, 3),
+    #     "strides": (2, 1, 1),
+    #     "hidden_sizes": (128,),
+    #     "critic_hidden_sizes": (128,),
+    #     "critic_layer_sizes": (128, 128),
+    # },
     "sokoban": {
-        "channel_sizes": (128, 128, 128),
-        "kernel_sizes": (3, 3, 3),
-        "strides": (2, 1, 1),
+        "channel_sizes": (128, 128),
+        "kernel_sizes": (3, 3),
+        "strides": (2, 1),
         "hidden_sizes": (128,),
         "critic_hidden_sizes": (128,),
         "critic_layer_sizes": (128, 128),
