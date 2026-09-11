@@ -41,7 +41,7 @@ O(max_steps) total compute rather than O(max_steps^2) for a design that
 recomputed the whole scratchpad from scratch every step.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import chex
 import jax
@@ -163,6 +163,56 @@ class TransformerBlock(nn.Module):
 
         token = token + self.out_proj(attn_out)
         return self._mlp(token), cached_keys, cached_values
+
+    def step_joint(
+        self,
+        token: chex.Array,
+        keys: Sequence[chex.Array],
+        values: Sequence[chex.Array],
+        masks: Sequence[chex.Array],
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+        """Generalises `step` to attend, in a single joint softmax, over the
+        concatenation of several independently-masked caches at once -
+        e.g. `torso_compute_sps.py`'s two-stream design, where one query
+        must see both an unboundedly-growing persistent cache and a
+        sliding-window ephemeral one in the same attention operation (not
+        as two separate attentions summed afterwards), per Equation 5 of
+        "The State-Prediction Separation Hypothesis" (arXiv:2607.01218).
+        `step(token, cached_keys, cached_values, step_idx, max_steps)` is
+        the special case `step_joint(token, [cached_keys], [cached_values],
+        [jnp.arange(max_steps + 1) <= step_idx])`, except that call also
+        writes `token`'s own key/value into the (single) cache - this
+        method does not, since with several caches it's the caller's job
+        to know which one `token` belongs to (see below).
+
+        token: `(*batch, hidden_dim)`.
+        keys, values: same-length sequences of `(*batch, cache_len_i,
+            num_heads, head_dim)` arrays (`cache_len_i` may differ per
+            cache).
+        masks: same-length sequence of `(cache_len_i,)` boolean arrays -
+            which positions of the matching cache may be attended to.
+
+        Returns `(new_token, key, value)`: `key`/`value`
+            (`(*batch, num_heads, head_dim)`) are `token`'s own projected
+            key/value, not yet written into any cache - callers write them
+            into whichever cache `token` belongs to.
+        """
+        y = self.attn_norm(token)
+        q, k, v = self.query_proj(y), self.key_proj(y), self.value_proj(y)
+
+        all_keys = jnp.concatenate(list(keys), axis=-3)
+        all_values = jnp.concatenate(list(values), axis=-3)
+        all_mask = jnp.concatenate(list(masks), axis=-1)
+
+        head_dim = q.shape[-1]
+        scale = 1.0 / jnp.sqrt(jnp.array(head_dim, dtype=q.dtype))
+        scores = jnp.einsum("...hd,...khd->...hk", q, all_keys) * scale
+        scores = jnp.where(all_mask, scores, _NEG_INF)
+        weights = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum("...hk,...khd->...hd", weights, all_values)
+
+        token = token + self.out_proj(attn_out)
+        return self._mlp(token), k, v
 
 
 class _CoTStep(nn.Module):

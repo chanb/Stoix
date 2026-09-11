@@ -59,7 +59,16 @@ Grid axes:
                  transformer_explicit_cot (TransformerExplicitCoTTorso, explicit
                  token CoT - only implemented for system=ff_reinforce, via
                  stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py; requested
-                 (system, architecture) combos outside that are skipped)
+                 (system, architecture) combos outside that are skipped) |
+                 sps (SPSChainOfThoughtTorso, stoix/networks/torso_compute_sps.py -
+                 interleaves every pondering step's persistent "state" token with a
+                 dedicated "prediction" token that reads the state, plus a sliding
+                 --window-size of recent predictions, but never itself persists
+                 beyond that window - so the halting decision is read off a
+                 representation architecturally prevented from also carrying state
+                 forward. State-Prediction Separation Hypothesis, Monea et al.,
+                 arXiv:2607.01218, adapted with Coconut-style latent feedback -
+                 see the module docstring)
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
   - lr:          system.actor_lr - has its own value list, independent of critic_lr's
@@ -115,25 +124,26 @@ Grid axes:
                  discrete-token "thoughts" have no such continuous-state knob.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp only (transformer,
-                 gru, iru, and transformer_explicit_cot have no such param,
+                 gru, iru, sps, and transformer_explicit_cot have no such param,
                  so this is forced off for them regardless of what's requested).
   - use_input_layer_norm: LayerNorm on the encoded observation before the
                  initial token/state/recurrent-input projection; supported by
-                 mlp/transformer/gru/iru/transformer_explicit_cot.
+                 mlp/transformer/gru/iru/sps/transformer_explicit_cot.
   - num_layers:  how many sub-layers are stacked inside each shared pondering
                  step (network.actor_network.pre_torso.num_layers) - Dense
                  layers for mlp, GRU cells for gru, IRU cells for iru,
-                 transformer layers for transformer (see
+                 transformer layers for transformer or sps (see
                  stoix/networks/torso_compute*.py), or explicit-CoT
                  transformer layers for transformer_explicit_cot
                  (TransformerExplicitCoTTorso's yaml default is 2). Default 1.
   - num_heads:   attention head count (network.actor_network.pre_torso.num_heads);
-                 only applies to transformer (TransformerChainOfThoughtTorso)
-                 and transformer_explicit_cot (TransformerExplicitCoTTorso) -
-                 every other architecture has no such param, so this is forced
-                 to a single value for them. Default 4.
+                 only applies to transformer (TransformerChainOfThoughtTorso),
+                 sps (SPSChainOfThoughtTorso), and transformer_explicit_cot
+                 (TransformerExplicitCoTTorso) - every other architecture has
+                 no such param, so this is forced to a single value for them.
+                 Default 4.
   - mlp_dim:     transformer feedforward width (network.actor_network.pre_torso.mlp_dim);
-                 same applicability as num_heads (transformer/
+                 same applicability as num_heads (transformer/sps/
                  transformer_explicit_cot only). Default 256.
   - vocab_size:  thought-token vocabulary size (network.actor_network.pre_torso.vocab_size),
                  i.e. how many discrete "thought" classes TransformerExplicitCoTTorso can
@@ -141,6 +151,13 @@ Grid axes:
                  stoix/networks/torso_compute_explicit_cot.py. transformer_explicit_cot
                  only (every other architecture has no such param, so this is forced to a
                  single value for them). Default 32 (the network yaml default).
+  - window_size: how many recent prediction-stream ("rho") steps a query may attend to,
+                 besides the always-visible persistent ("x") stream
+                 (network.actor_network.pre_torso.window_size) - see
+                 stoix/networks/torso_compute_sps.py's module docstring for the attention
+                 pattern this bounds. sps only (WINDOW_SIZE_ARCHES) - every other
+                 architecture, including plain transformer, has no such param, so this is
+                 forced to a single value for them. Default 64.
   - use_latent_feedback: latent feedback decoding
                  (network.actor_network.pre_torso.use_latent_feedback) - fuses the
                  previous step's top-layer hidden state into the next scratchpad entry
@@ -180,6 +197,8 @@ Usage:
       --architectures transformer_explicit_cot                       # explicit-CoT sweep
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures gru,iru  # recurrent-block sweep
+  python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures sps \\
+      --window-size 16,64  # State-Prediction-Separation sweep (sliding rho-attention window)
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --difficulty-threshold 0.3  # easier training goals
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
@@ -304,6 +323,7 @@ ARCH_TO_NETWORK = {
         "transformer": "transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
+        "sps": "sps_compute",
     },
     # Every Q-V system uses SeparateValueAndQCritic (the "_separate_qv" network
     # variant): V and Q each get their own torso, independently initialised,
@@ -315,6 +335,7 @@ ARCH_TO_NETWORK = {
         "transformer": "transformer_compute_qac_separate_qv",
         "gru": "gru_compute_qac_separate_qv",
         "iru": "iru_compute_qac_separate_qv",
+        "sps": "sps_compute_qac_separate_qv",
     },
     "ff_qac_naive": {
         "mlp": "mlp_compute_qac_separate_qv",
@@ -322,6 +343,7 @@ ARCH_TO_NETWORK = {
         "transformer": "transformer_compute_qac_separate_qv",
         "gru": "gru_compute_qac_separate_qv",
         "iru": "iru_compute_qac_separate_qv",
+        "sps": "sps_compute_qac_separate_qv",
     },
 }
 # ff_ppo_fac/ff_ppo_naive use the same separate-torso Q-V critic
@@ -339,20 +361,30 @@ ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
 # both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso,
-# IRUAdaptiveComputationTimeTorso, and UnsharedIRUAdaptiveComputationTimeTorso.
-# Used to pick the right LayerNorm overrides in Job.command().
+# IRUAdaptiveComputationTimeTorso, UnsharedIRUAdaptiveComputationTimeTorso, and
+# SPSChainOfThoughtTorso. Used to pick the right LayerNorm overrides in
+# Job.command().
 NO_LAYER_NORM_ARCHES = (
     "transformer",
     "gru",
     "iru",
     "iru_unshared",
+    "sps",
 )
 # Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention
-# heads / transformer feedforward width) - TransformerChainOfThoughtTorso and
-# TransformerExplicitCoTTorso; every other torso has no such concept. Used to
-# pick whether --num-heads/--mlp-dim are swept for a given architecture in
+# heads / transformer feedforward width) - TransformerChainOfThoughtTorso,
+# TransformerExplicitCoTTorso, and SPSChainOfThoughtTorso (stoix/networks/
+# torso_compute_sps.py); every other torso has no such concept. Used to pick
+# whether --num-heads/--mlp-dim are swept for a given architecture in
 # build_grid() and applied in Job.command().
-TRANSFORMER_ARCHES = ("transformer",)
+TRANSFORMER_ARCHES = ("transformer", "sps")
+# Architectures whose pre_torso has a `window_size` param - only
+# SPSChainOfThoughtTorso (stoix/networks/torso_compute_sps.py) - how many
+# recent prediction-stream steps a query may attend to, besides the
+# always-visible persistent stream; every other torso has no such concept.
+# Used to pick whether --window-size is swept for a given architecture in
+# build_grid() and applied in Job.command().
+WINDOW_SIZE_ARCHES = ("sps",)
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
@@ -390,10 +422,12 @@ EXPLICIT_COT_NETWORK_BY_SYSTEM = {
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 # Short forms for group_tag/run_name (wandb group names get long fast):
 # "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
-# -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru/iru_unshared are already short.
+# -> explicit-CoT transformer ("TF-eCoT"), "sps" -> the State-Prediction-
+# Separation torso; mlp/gru/iru/iru_unshared are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
     EXPLICIT_COT_ARCH: "TF-eCoT",
+    "sps": "SPS",
 }
 
 # W&B's "group" field (and, in practice, run IDs) are capped at 128
@@ -465,6 +499,7 @@ class Job:
     mlp_dim: int
     vocab_size: int
     use_latent_feedback: bool
+    window_size: int
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -518,6 +553,10 @@ class Job:
         # on any other architecture, see EXPLICIT_COT_ARCH/build_grid.
         if self.arch == EXPLICIT_COT_ARCH:
             net += f"-vs{self.vocab_size}"
+        # Only shown for sps - window_size doesn't exist on any other
+        # architecture, see WINDOW_SIZE_ARCHES/build_grid.
+        if self.arch in WINDOW_SIZE_ARCHES:
+            net += f"-ws{self.window_size}"
         parts.append(net)
 
         # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
@@ -625,8 +664,9 @@ class Job:
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
-            # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
-            # TransformerExplicitCoTTorso only (see TRANSFORMER_ARCHES).
+            # Attention head count / feedforward width - every torso in
+            # TRANSFORMER_ARCHES (TransformerChainOfThoughtTorso,
+            # SPSChainOfThoughtTorso) plus TransformerExplicitCoTTorso.
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
         if self.arch == EXPLICIT_COT_ARCH:
@@ -638,6 +678,10 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
+        if self.arch in WINDOW_SIZE_ARCHES:
+            # Sliding prediction-stream attention window - SPSChainOfThoughtTorso
+            # only (stoix/networks/torso_compute_sps.py), see WINDOW_SIZE_ARCHES.
+            cmd.append(f"++network.actor_network.pre_torso.window_size={self.window_size}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -753,6 +797,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #  - use_latent_feedback (latent feedback decoding) likewise only exists on
     #    transformer_explicit_cot - swept only for that architecture, everything
     #    else forced to a single value.
+    #  - window_size (sliding prediction-stream attention window, see
+    #    stoix.networks.torso_compute_sps.SPSChainOfThoughtTorso) only exists on
+    #    sps (WINDOW_SIZE_ARCHES) - swept only for that architecture, everything
+    #    else forced to a single value.
     # Unsupported axes are forced to a single default value rather than
     # needlessly duplicated per requested setting.
     system_arch_ln_combos = []
@@ -770,6 +818,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 args.use_latent_feedback
                 if arch == EXPLICIT_COT_ARCH
                 else [args.use_latent_feedback[0]]
+            )
+            window_size_options = (
+                args.window_size if arch in WINDOW_SIZE_ARCHES else [args.window_size[0]]
             )
             if arch == EXPLICIT_COT_ARCH:
                 if system not in EXPLICIT_COT_SYSTEMS:
@@ -789,8 +840,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size, use_latent_feedback in itertools.product(
-                                vocab_size_options, use_latent_feedback_options
+                            for vocab_size, use_latent_feedback, window_size in itertools.product(
+                                vocab_size_options, use_latent_feedback_options, window_size_options
                             ):
                                 system_arch_ln_combos.append(
                                     (
@@ -803,6 +854,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         mlp_dim,
                                         vocab_size,
                                         use_latent_feedback,
+                                        window_size,
                                     )
                                 )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -825,6 +877,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             mlp_dim,
             vocab_size,
             use_latent_feedback,
+            window_size,
         ),
         budget,
         hidden_dim,
@@ -915,6 +968,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 mlp_dim=mlp_dim,
                 vocab_size=vocab_size,
                 use_latent_feedback=use_latent_feedback,
+                window_size=window_size,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 total_num_envs=args.total_num_envs,
@@ -1047,11 +1101,17 @@ def main() -> None:
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
-        help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, "
+        help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, sps, "
         "transformer_explicit_cot}. iru_unshared "
         "(UnsharedIRUAdaptiveComputationTimeTorso) is like iru but with no weight sharing across "
         "pondering steps - each step is its own independently-parameterized IRU layer. "
-        "transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
+        "sps (SPSChainOfThoughtTorso, stoix/networks/torso_compute_sps.py) interleaves "
+        "every pondering step's persistent 'state' token with a dedicated 'prediction' token "
+        "that reads the state (and a sliding --window-size of recent predictions) but never "
+        "persists beyond that window, so the halting decision is read off a representation "
+        "architecturally prevented from also carrying state forward (State-Prediction "
+        "Separation Hypothesis, Monea et al., arXiv:2607.01218, with Coconut-style latent "
+        "feedback). transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
         f"implemented for system in {EXPLICIT_COT_SYSTEMS} - other (system, architecture) combos "
         "requesting it are skipped, not errored.",
     )
@@ -1193,7 +1253,7 @@ def main() -> None:
         help="Comma-separated bools (true/false) - LayerNorm on the encoded observation before the "
         "initial token/state/recurrent-input projection "
         "(network.actor_network.pre_torso.use_input_layer_norm). Supported by architecture in "
-        "{mlp, transformer, gru, iru, transformer_explicit_cot}.",
+        "{mlp, transformer, gru, iru, sps, transformer_explicit_cot}.",
     )
     parser.add_argument(
         "--num-layers",
@@ -1202,7 +1262,7 @@ def main() -> None:
         "step (network.actor_network.pre_torso.num_layers): Dense layers for mlp "
         "(AdaptiveComputationTimeTorso), GRU cells for gru (GRUAdaptiveComputationTimeTorso), "
         "IRU cells for iru (IRUAdaptiveComputationTimeTorso), or transformer layers for "
-        "transformer (TransformerChainOfThoughtTorso) - see "
+        "transformer (TransformerChainOfThoughtTorso) or sps (SPSChainOfThoughtTorso) - see "
         "stoix/networks/torso_compute*.py. Default 1 sub-layer per step. Also swept for "
         "transformer_explicit_cot (TransformerExplicitCoTTorso's yaml default is 2).",
     )
@@ -1211,16 +1271,16 @@ def main() -> None:
         default="4",
         help="Comma-separated ints - attention head count "
         "(network.actor_network.pre_torso.num_heads). Only applies to architecture in "
-        "{transformer, transformer_explicit_cot} (TransformerChainOfThoughtTorso/"
-        "TransformerExplicitCoTTorso); ignored (forced to the first value) for every other "
-        "architecture, since those torsos have no such param. Default 4.",
+        "{transformer, sps, transformer_explicit_cot} (TransformerChainOfThoughtTorso/"
+        "SPSChainOfThoughtTorso/TransformerExplicitCoTTorso); ignored (forced to the first "
+        "value) for every other architecture, since those torsos have no such param. Default 4.",
     )
     parser.add_argument(
         "--mlp-dim",
         default="256",
         help="Comma-separated ints - transformer feedforward width "
         "(network.actor_network.pre_torso.mlp_dim). Same applicability as --num-heads: only "
-        "architecture in {transformer, transformer_explicit_cot}; ignored "
+        "architecture in {transformer, sps, transformer_explicit_cot}; ignored "
         "(forced to the first value) for every other architecture. Default 256.",
     )
     parser.add_argument(
@@ -1231,8 +1291,20 @@ def main() -> None:
         "TransformerExplicitCoTTorso can emit before the extra 'act now' class - see "
         "stoix/networks/torso_compute_explicit_cot.py. Only applies to architecture "
         "transformer_explicit_cot (unlike --num-heads/--mlp-dim, NOT swept for plain "
-        "transformer, which has no such param); ignored (forced to the first value) for "
+        "transformer/sps, which have no such param); ignored (forced to the first value) for "
         "every other architecture. Default 32 (the network yaml default).",
+    )
+    parser.add_argument(
+        "--window-size",
+        default="64",
+        help="Comma-separated ints - how many recent prediction-stream ('rho') steps a query may "
+        "attend to, besides the always-visible persistent ('x') stream "
+        "(network.actor_network.pre_torso.window_size) - see "
+        "stoix.networks.torso_compute_sps.SPSChainOfThoughtTorso's module docstring for the "
+        "attention pattern this bounds. Only applies to architecture sps (WINDOW_SIZE_ARCHES); "
+        "ignored (forced to the first value) for every other architecture, since no other torso "
+        "has this param. window_size >= max_steps - 1 makes the window non-binding. Default 64, "
+        "matching the network yaml default.",
     )
     parser.add_argument(
         "--use-latent-feedback",
@@ -1369,6 +1441,7 @@ def main() -> None:
     args.use_latent_feedback = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_latent_feedback.split(",")
     ]
+    args.window_size = [int(x) for x in args.window_size.split(",")]
 
     for g in args.grid_sizes:
         assert GRID_SIZE_RE.match(g), f"invalid grid size {g!r}, expected 'MxN' (e.g. '3x3')"
@@ -1380,6 +1453,7 @@ def main() -> None:
         "transformer",
         "gru",
         "iru",
+        "sps",
         EXPLICIT_COT_ARCH,
     )
     for a in args.architectures:
@@ -1394,6 +1468,8 @@ def main() -> None:
         assert d >= 1, f"mlp_dim must be >= 1, got {d}"
     for v in args.vocab_size:
         assert v >= 1, f"vocab_size must be >= 1, got {v}"
+    for w in args.window_size:
+        assert w >= 0, f"window_size must be >= 0, got {w}"
     for e in args.epochs:
         assert e >= 1, f"epochs must be >= 1, got {e}"
     for m in args.num_minibatches:

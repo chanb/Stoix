@@ -1,0 +1,35 @@
+# ---State-Prediction-Separation (SPS) Compute-Time-Aware REINFORCE Networks---
+# The actor's pre_torso interleaves every pondering step's persistent "state"
+# token with a dedicated "prediction" token that reads the state (and a
+# sliding window of recent predictions) but never persists beyond that
+# window, so the halting decision is read off a representation that is
+# architecturally prevented from also carrying state forward - see
+# stoix.networks.torso_compute_sps.SPSChainOfThoughtTorso (State-Prediction
+# Separation Hypothesis, Monea et al., arXiv:2607.01218, with Coconut-style
+# latent feedback). The actual (sampled) number of pondering steps taken is
+# reported as `compute_time`.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute_sps.SPSChainOfThoughtTorso
+    hidden_dim: 128
+    num_heads: 4
+    num_layers: 2
+    mlp_dim: 256
+    max_steps: 5
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    window_size: 2 # How many recent prediction-stream steps a query may attend to,
+      # besides the always-visible persistent stream - see the torso's docstring.
+    activation: gelu
+    use_input_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead

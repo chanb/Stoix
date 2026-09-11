@@ -68,11 +68,21 @@ Grid axes:
                  token CoT - only implemented for system=ff_reinforce, via
                  stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py; requested
                  (system, architecture) combos outside that are skipped) |
+                 sps (SPSChainOfThoughtTorso, stoix/networks/torso_compute_sps.py -
+                 interleaves every pondering step's persistent "state" token with a
+                 dedicated "prediction" token that reads the state, plus a sliding
+                 --window-size of recent predictions, but never itself persists
+                 beyond that window - so the halting decision is read off a
+                 representation architecturally prevented from also carrying state
+                 forward. State-Prediction Separation Hypothesis, Monea et al.,
+                 arXiv:2607.01218, adapted with Coconut-style latent feedback -
+                 see the module docstring) |
                  cnn+mlp (CNNTorso input_layer feeding AdaptiveComputationTimeTorso) |
                  cnn+transformer (CNNTorso input_layer feeding
                  TransformerChainOfThoughtTorso) |
                  cnn+gru (CNNTorso input_layer feeding GRUAdaptiveComputationTimeTorso) |
-                 cnn+iru (CNNTorso input_layer feeding IRUAdaptiveComputationTimeTorso)
+                 cnn+iru (CNNTorso input_layer feeding IRUAdaptiveComputationTimeTorso) |
+                 cnn+sps (CNNTorso input_layer feeding SPSChainOfThoughtTorso)
   - min_steps:   forbids halting (voluntarily, in replay, or greedily) before
                  this many pondering steps - see the compute torsos'
                  min_steps mechanism, stoix/networks/torso_compute*.py.
@@ -149,52 +159,63 @@ Grid axes:
                  and ff_ppo_explicit_*) - ff_reinforce/ff_qac_* have no such config knob.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
-                 cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
+                 cnn+transformer, gru, iru, cnn+gru, cnn+iru, sps, cnn+sps, and
                  transformer_explicit_cot have no such param, so this is forced
                  off for them regardless of what's requested).
   - use_input_layer_norm: LayerNorm on the encoded observation before the
                  initial token/state/recurrent-input projection; supported by
                  mlp/cnn+mlp/transformer/cnn+transformer/gru/iru/cnn+gru/cnn+iru/
-                 transformer_explicit_cot.
+                 sps/cnn+sps/transformer_explicit_cot.
   - num_layers:  how many sub-layers are stacked inside each shared pondering
                  step (network.actor_network.pre_torso.num_layers) - Dense
                  layers for mlp/cnn+mlp, GRU cells for gru/cnn+gru, IRU cells
                  for iru/cnn+iru, transformer layers for
-                 transformer/cnn+transformer (see
+                 transformer/cnn+transformer or sps/cnn+sps (see
                  stoix/networks/torso_compute*.py), or explicit-CoT
                  transformer layers for transformer_explicit_cot
                  (TransformerExplicitCoTTorso's yaml default is 2). Default 1.
   - num_heads:   attention head count (network.actor_network.pre_torso.num_heads);
                  only applies to transformer/cnn+transformer
-                 (TransformerChainOfThoughtTorso) and transformer_explicit_cot
+                 (TransformerChainOfThoughtTorso), sps/cnn+sps
+                 (SPSChainOfThoughtTorso), and transformer_explicit_cot
                  (TransformerExplicitCoTTorso) - every other architecture has
                  no such param, so this is forced to a single value for them.
                  Default 4.
   - mlp_dim:     transformer feedforward width (network.actor_network.pre_torso.mlp_dim);
                  same applicability as num_heads (transformer/cnn+transformer/
-                 transformer_explicit_cot only). Default 256.
+                 sps/cnn+sps/transformer_explicit_cot only). Default 256.
   - vocab_size:  thought-token vocabulary size (network.actor_network.pre_torso.vocab_size),
                  i.e. how many discrete "thought" classes TransformerExplicitCoTTorso can
                  emit before the extra "act now" class - see
                  stoix/networks/torso_compute_explicit_cot.py. transformer_explicit_cot
-                 only (every other architecture, including transformer/cnn+transformer,
-                 has no such param, so this is forced to a single value for them). Default
-                 32 (the network yaml default).
-  - stop_gradient_halting_input: whether IRUStep's halting head reads a
-                 detached (stop-gradient) copy of the step's state instead of
-                 the live one - see stoix/networks/torso_compute.py's
-                 IRUStep docstring. Severs the channel through which the
-                 halting REINFORCE loss's gradient would otherwise backprop
-                 into the shared IRUCell weights that also produce the
-                 action head's representation, isolating whether that
+                 only (every other architecture, including transformer/cnn+transformer and
+                 sps/cnn+sps, has no such param, so this is forced to a single value for
+                 them). Default 32 (the network yaml default).
+  - window_size: how many recent prediction-stream ("rho") steps a query may attend to,
+                 besides the always-visible persistent ("x") stream
+                 (network.actor_network.pre_torso.window_size) - see
+                 stoix/networks/torso_compute_sps.py's module docstring for the attention
+                 pattern this bounds. sps/cnn+sps only (WINDOW_SIZE_ARCHES) - every other
+                 architecture, including transformer/cnn+transformer, has no such param, so
+                 this is forced to a single value for them. Default 64.
+  - stop_gradient_halting_input: whether IRUStep's/_CoTStep's/_SPSStep's
+                 halting head reads a detached (stop-gradient) copy of the
+                 step's state instead of the live one - see
+                 stoix/networks/torso_compute.py's IRUStep,
+                 stoix/networks/torso_compute_transformer.py's _CoTStep, and
+                 stoix/networks/torso_compute_sps.py's _SPSStep docstrings.
+                 Severs the channel through which the halting REINFORCE
+                 loss's gradient would otherwise backprop into the shared
+                 recurrent/transformer weights that also produce the action
+                 head's representation, isolating whether that
                  gradient-sharing is what makes adaptive-budget (min_steps <
                  max_steps) runs underperform a matched-capacity fixed-budget
                  (min_steps == max_steps) run - for the latter this flag is a
                  no-op, since every step is already forced (no halting-loss
                  gradient reaches the torso at all regardless of this flag).
-                 iru/cnn+iru/iru_unshared/transformer/cnn+transformer only
-                 (STOP_GRADIENT_HALTING_ARCHES) - forced off for every other
-                 architecture, which has no such param.
+                 iru/cnn+iru/iru_unshared/transformer/cnn+transformer/sps/cnn+sps
+                 only (STOP_GRADIENT_HALTING_ARCHES) - forced off for every
+                 other architecture, which has no such param.
   - use_latent_feedback: latent feedback decoding
                  (network.actor_network.pre_torso.use_latent_feedback) - fuses the
                  previous step's top-layer hidden state into the next scratchpad entry
@@ -241,6 +262,8 @@ Usage:
   python ramdp_experiments/lightsout_sweep.py --architectures gru,iru,cnn+gru,cnn+iru  # recurrent-block sweep
   python ramdp_experiments/lightsout_sweep.py --architectures iru --min-steps 1 --max-steps 5 \\
       --stop-gradient-halting-input true,false  # isolate halting-head/torso gradient sharing
+  python ramdp_experiments/lightsout_sweep.py --architectures sps,cnn+sps \\
+      --window-size 16,64  # State-Prediction-Separation sweep (sliding rho-attention window)
   python ramdp_experiments/lightsout_sweep.py --difficulty-threshold 0.3  # easier training goals
   python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
@@ -374,10 +397,12 @@ ARCH_TO_NETWORK = {
         "transformer": "transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
+        "sps": "sps_compute",
         "cnn+mlp": "cnn_mlp_compute",
         "cnn+transformer": "cnn_transformer_compute",
         "cnn+gru": "cnn_gru_compute",
         "cnn+iru": "cnn_iru_compute",
+        "cnn+sps": "cnn_sps_compute",
     },
     # Every Q-V system uses SeparateValueAndQCritic (the "_separate_qv" network
     # variant): V and Q each get their own torso, independently initialised,
@@ -389,10 +414,12 @@ ARCH_TO_NETWORK = {
         "transformer": "transformer_compute_qac_separate_qv",
         "gru": "gru_compute_qac_separate_qv",
         "iru": "iru_compute_qac_separate_qv",
+        "sps": "sps_compute_qac_separate_qv",
         "cnn+mlp": "cnn_mlp_compute_qac_separate_qv",
         "cnn+transformer": "cnn_transformer_compute_qac_separate_qv",
         "cnn+gru": "cnn_gru_compute_qac_separate_qv",
         "cnn+iru": "cnn_iru_compute_qac_separate_qv",
+        "cnn+sps": "cnn_sps_compute_qac_separate_qv",
     },
     "ff_qac_naive": {
         "mlp": "mlp_compute_qac_separate_qv",
@@ -400,10 +427,12 @@ ARCH_TO_NETWORK = {
         "transformer": "transformer_compute_qac_separate_qv",
         "gru": "gru_compute_qac_separate_qv",
         "iru": "iru_compute_qac_separate_qv",
+        "sps": "sps_compute_qac_separate_qv",
         "cnn+mlp": "cnn_mlp_compute_qac_separate_qv",
         "cnn+transformer": "cnn_transformer_compute_qac_separate_qv",
         "cnn+gru": "cnn_gru_compute_qac_separate_qv",
         "cnn+iru": "cnn_iru_compute_qac_separate_qv",
+        "cnn+sps": "cnn_sps_compute_qac_separate_qv",
     },
 }
 # ff_ppo_fac/ff_ppo_naive use the same separate-torso Q-V critic
@@ -422,8 +451,9 @@ ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 # Architectures whose pre_torso has no `use_layer_norm` param - only
 # `use_input_layer_norm` - unlike AdaptiveComputationTimeTorso (which has
 # both): TransformerChainOfThoughtTorso, GRUAdaptiveComputationTimeTorso,
-# IRUAdaptiveComputationTimeTorso, and UnsharedIRUAdaptiveComputationTimeTorso.
-# Used to pick the right LayerNorm overrides in Job.command().
+# IRUAdaptiveComputationTimeTorso, UnsharedIRUAdaptiveComputationTimeTorso,
+# and SPSChainOfThoughtTorso. Used to pick the right LayerNorm overrides in
+# Job.command().
 NO_LAYER_NORM_ARCHES = (
     "transformer",
     "cnn+transformer",
@@ -432,26 +462,38 @@ NO_LAYER_NORM_ARCHES = (
     "iru",
     "cnn+iru",
     "iru_unshared",
+    "sps",
+    "cnn+sps",
 )
 # Architectures whose input_layer is a CNNTorso (need the CNN-specific
 # overrides below instead of the flatten-observation wrapper).
-CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
+CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru", "cnn+sps")
 # Architectures whose pre_torso is IRUStep-based (IRUAdaptiveComputationTimeTorso
 # or UnsharedIRUAdaptiveComputationTimeTorso, see stoix/networks/torso_compute.py).
 IRU_ARCHES = ("iru", "cnn+iru", "iru_unshared")
 # Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention
-# heads / transformer feedforward width) - TransformerChainOfThoughtTorso and
-# TransformerExplicitCoTTorso; every other torso has no such concept. Used to
-# pick whether --num-heads/--mlp-dim are swept for a given architecture in
+# heads / transformer feedforward width) - TransformerChainOfThoughtTorso,
+# TransformerExplicitCoTTorso, and SPSChainOfThoughtTorso (stoix/networks/
+# torso_compute_sps.py); every other torso has no such concept. Used to pick
+# whether --num-heads/--mlp-dim are swept for a given architecture in
 # build_grid() and applied in Job.command().
-TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
+TRANSFORMER_ARCHES = ("transformer", "cnn+transformer", "sps", "cnn+sps")
+# Architectures whose pre_torso has a `window_size` param - only
+# SPSChainOfThoughtTorso (stoix/networks/torso_compute_sps.py) - how many
+# recent prediction-stream steps a query may attend to, besides the
+# always-visible persistent stream; every other torso has no such concept.
+# Used to pick whether --window-size is swept for a given architecture in
+# build_grid() and applied in Job.command().
+WINDOW_SIZE_ARCHES = ("sps", "cnn+sps")
 # Architectures whose pre_torso has a stop_gradient_halting_input param -
-# IRUStep-based torsos (IRU_ARCHES) and TransformerChainOfThoughtTorso
-# (TRANSFORMER_ARCHES; *not* TransformerExplicitCoTTorso/EXPLICIT_COT_ARCH,
-# which has no such param) - see stoix/networks/torso_compute.py's IRUStep
-# and stoix/networks/torso_compute_transformer.py's _CoTStep docstrings.
-# Used to pick whether --stop-gradient-halting-input is swept for a given
-# architecture in build_grid() and applied in Job.command().
+# IRUStep-based torsos (IRU_ARCHES) and every torso in TRANSFORMER_ARCHES
+# (TransformerChainOfThoughtTorso and SPSChainOfThoughtTorso; *not*
+# TransformerExplicitCoTTorso/EXPLICIT_COT_ARCH, which has no such param) -
+# see stoix/networks/torso_compute.py's IRUStep, stoix/networks/
+# torso_compute_transformer.py's _CoTStep, and stoix/networks/
+# torso_compute_sps.py's _SPSStep docstrings. Used to pick whether
+# --stop-gradient-halting-input is swept for a given architecture in
+# build_grid() and applied in Job.command().
 STOP_GRADIENT_HALTING_ARCHES = IRU_ARCHES + TRANSFORMER_ARCHES
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
@@ -490,11 +532,14 @@ EXPLICIT_COT_NETWORK_BY_SYSTEM = {
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 # Short forms for group_tag/run_name (wandb group names get long fast):
 # "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
-# -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru/iru_unshared are already short.
+# -> explicit-CoT transformer ("TF-eCoT"), "sps" -> the State-Prediction-
+# Separation torso; mlp/gru/iru/iru_unshared are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
     "cnn+transformer": "cnn+TF-iCoT",
     EXPLICIT_COT_ARCH: "TF-eCoT",
+    "sps": "SPS",
+    "cnn+sps": "cnn+SPS",
 }
 
 # W&B's "group" field (and, in practice, run IDs) are capped at 128
@@ -568,6 +613,7 @@ class Job:
     mlp_dim: int
     vocab_size: int
     use_latent_feedback: bool
+    window_size: int
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -625,6 +671,10 @@ class Job:
         # on any other architecture, see EXPLICIT_COT_ARCH/build_grid.
         if self.arch == EXPLICIT_COT_ARCH:
             net += f"-vs{self.vocab_size}"
+        # Only shown for sps/cnn+sps - window_size doesn't exist on any other
+        # architecture, see WINDOW_SIZE_ARCHES/build_grid.
+        if self.arch in WINDOW_SIZE_ARCHES:
+            net += f"-ws{self.window_size}"
         parts.append(net)
 
         # Only shown for PPO systems - epochs/num_minibatches/clip_eps don't
@@ -747,8 +797,9 @@ class Job:
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
-            # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
-            # TransformerExplicitCoTTorso only (see TRANSFORMER_ARCHES).
+            # Attention head count / feedforward width - every torso in
+            # TRANSFORMER_ARCHES (TransformerChainOfThoughtTorso,
+            # SPSChainOfThoughtTorso) plus TransformerExplicitCoTTorso.
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
         if self.arch == EXPLICIT_COT_ARCH:
@@ -760,6 +811,10 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
+        if self.arch in WINDOW_SIZE_ARCHES:
+            # Sliding prediction-stream attention window - SPSChainOfThoughtTorso
+            # only (stoix/networks/torso_compute_sps.py), see WINDOW_SIZE_ARCHES.
+            cmd.append(f"++network.actor_network.pre_torso.window_size={self.window_size}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -910,6 +965,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #  - use_latent_feedback (latent feedback decoding) likewise only exists on
     #    transformer_explicit_cot - swept only for that architecture, everything
     #    else forced to a single value.
+    #  - window_size (sliding prediction-stream attention window, see
+    #    stoix.networks.torso_compute_sps.SPSChainOfThoughtTorso) only exists on
+    #    sps/cnn+sps (WINDOW_SIZE_ARCHES) - swept only for those, everything
+    #    else forced to a single value.
     #  - stop_gradient_halting_input (detaches the state fed into the halting
     #    head, see stoix.networks.torso_compute.IRUStep's and
     #    stoix.networks.torso_compute_transformer._CoTStep's docstrings) only
@@ -934,6 +993,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 if arch == EXPLICIT_COT_ARCH
                 else [args.use_latent_feedback[0]]
             )
+            window_size_options = (
+                args.window_size if arch in WINDOW_SIZE_ARCHES else [args.window_size[0]]
+            )
             stop_gradient_halting_input_options = (
                 args.stop_gradient_halting_input
                 if arch in STOP_GRADIENT_HALTING_ARCHES
@@ -957,12 +1019,16 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size, use_latent_feedback, stop_gradient_halting_input in (
-                                itertools.product(
-                                    vocab_size_options,
-                                    use_latent_feedback_options,
-                                    stop_gradient_halting_input_options,
-                                )
+                            for (
+                                vocab_size,
+                                use_latent_feedback,
+                                window_size,
+                                stop_gradient_halting_input,
+                            ) in itertools.product(
+                                vocab_size_options,
+                                use_latent_feedback_options,
+                                window_size_options,
+                                stop_gradient_halting_input_options,
                             ):
                                 system_arch_ln_combos.append(
                                     (
@@ -975,6 +1041,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         mlp_dim,
                                         vocab_size,
                                         use_latent_feedback,
+                                        window_size,
                                         stop_gradient_halting_input,
                                     )
                                 )
@@ -1015,6 +1082,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             mlp_dim,
             vocab_size,
             use_latent_feedback,
+            window_size,
             stop_gradient_halting_input,
         ),
         (min_steps, max_steps),
@@ -1120,6 +1188,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 mlp_dim=mlp_dim,
                 vocab_size=vocab_size,
                 use_latent_feedback=use_latent_feedback,
+                window_size=window_size,
                 seed=seed,
                 total_timesteps=args.total_timesteps,
                 total_num_envs=args.total_num_envs,
@@ -1252,11 +1321,17 @@ def main() -> None:
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
-        help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, "
-        "transformer_explicit_cot, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru}. iru_unshared "
-        "(UnsharedIRUAdaptiveComputationTimeTorso) is like iru but with no weight sharing across "
-        "pondering steps - each step is its own independently-parameterized IRU layer. "
-        "transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
+        help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, sps, "
+        "transformer_explicit_cot, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru, cnn+sps}. "
+        "iru_unshared (UnsharedIRUAdaptiveComputationTimeTorso) is like iru but with no weight "
+        "sharing across pondering steps - each step is its own independently-parameterized IRU "
+        "layer. sps (SPSChainOfThoughtTorso, stoix/networks/torso_compute_sps.py) interleaves "
+        "every pondering step's persistent 'state' token with a dedicated 'prediction' token "
+        "that reads the state (and a sliding --window-size of recent predictions) but never "
+        "persists beyond that window, so the halting decision is read off a representation "
+        "architecturally prevented from also carrying state forward (State-Prediction "
+        "Separation Hypothesis, Monea et al., arXiv:2607.01218, with Coconut-style latent "
+        "feedback). transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
         f"implemented for system in {EXPLICIT_COT_SYSTEMS} - other (system, architecture) combos "
         "requesting it are skipped, not errored.",
     )
@@ -1433,7 +1508,7 @@ def main() -> None:
         help="Comma-separated bools (true/false) - LayerNorm on the encoded observation before the "
         "initial token/state/recurrent-input projection "
         "(network.actor_network.pre_torso.use_input_layer_norm). Supported by architecture in "
-        "{mlp, transformer, gru, iru, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru, "
+        "{mlp, transformer, gru, iru, sps, cnn+mlp, cnn+transformer, cnn+gru, cnn+iru, cnn+sps, "
         "transformer_explicit_cot}.",
     )
     parser.add_argument(
@@ -1441,12 +1516,12 @@ def main() -> None:
         default="false",
         help="Comma-separated bools (true/false) - "
         "network.actor_network.pre_torso.stop_gradient_halting_input: detaches the state fed "
-        "into the halting head (IRUStep's or _CoTStep's Dense(1)) before it's read, so the "
-        "halting REINFORCE loss can no longer backprop into the shared recurrent/transformer "
-        "weights that also produce the action head's representation - see "
-        "stoix.networks.torso_compute.IRUStep's and "
-        "stoix.networks.torso_compute_transformer._CoTStep's docstrings. Only applies to "
-        "architecture in {iru, cnn+iru, iru_unshared, transformer, cnn+transformer} "
+        "into the halting head (IRUStep's, _CoTStep's, or _SPSStep's Dense(1)) before it's read, "
+        "so the halting REINFORCE loss can no longer backprop into the shared recurrent/"
+        "transformer weights that also produce the action head's representation - see "
+        "stoix.networks.torso_compute.IRUStep's, stoix.networks.torso_compute_transformer."
+        "_CoTStep's, and stoix.networks.torso_compute_sps._SPSStep's docstrings. Only applies to "
+        "architecture in {iru, cnn+iru, iru_unshared, transformer, cnn+transformer, sps, cnn+sps} "
         "(STOP_GRADIENT_HALTING_ARCHES); ignored (forced to the first value) for every other "
         "architecture (including transformer_explicit_cot, whose TransformerExplicitCoTTorso "
         "has no such param), since no other torso has this param. A no-op when min_steps == "
@@ -1460,26 +1535,28 @@ def main() -> None:
         "step (network.actor_network.pre_torso.num_layers): Dense layers for mlp/cnn+mlp "
         "(AdaptiveComputationTimeTorso), GRU cells for gru/cnn+gru (GRUAdaptiveComputationTimeTorso), "
         "IRU cells for iru/cnn+iru (IRUAdaptiveComputationTimeTorso), or transformer layers for "
-        "transformer/cnn+transformer (TransformerChainOfThoughtTorso) - see "
-        "stoix/networks/torso_compute*.py. Default 1 sub-layer per step. Also swept for "
-        "transformer_explicit_cot (TransformerExplicitCoTTorso's yaml default is 2).",
+        "transformer/cnn+transformer (TransformerChainOfThoughtTorso) or sps/cnn+sps "
+        "(SPSChainOfThoughtTorso) - see stoix/networks/torso_compute*.py. Default 1 sub-layer per "
+        "step. Also swept for transformer_explicit_cot (TransformerExplicitCoTTorso's yaml "
+        "default is 2).",
     )
     parser.add_argument(
         "--num-heads",
         default="4",
         help="Comma-separated ints - attention head count "
         "(network.actor_network.pre_torso.num_heads). Only applies to architecture in "
-        "{transformer, cnn+transformer, transformer_explicit_cot} (TransformerChainOfThoughtTorso/"
-        "TransformerExplicitCoTTorso); ignored (forced to the first value) for every other "
-        "architecture, since those torsos have no such param. Default 4.",
+        "{transformer, cnn+transformer, sps, cnn+sps, transformer_explicit_cot} "
+        "(TransformerChainOfThoughtTorso/SPSChainOfThoughtTorso/TransformerExplicitCoTTorso); "
+        "ignored (forced to the first value) for every other architecture, since those torsos "
+        "have no such param. Default 4.",
     )
     parser.add_argument(
         "--mlp-dim",
         default="256",
         help="Comma-separated ints - transformer feedforward width "
         "(network.actor_network.pre_torso.mlp_dim). Same applicability as --num-heads: only "
-        "architecture in {transformer, cnn+transformer, transformer_explicit_cot}; ignored "
-        "(forced to the first value) for every other architecture. Default 256.",
+        "architecture in {transformer, cnn+transformer, sps, cnn+sps, transformer_explicit_cot}; "
+        "ignored (forced to the first value) for every other architecture. Default 256.",
     )
     parser.add_argument(
         "--vocab-size",
@@ -1489,8 +1566,21 @@ def main() -> None:
         "TransformerExplicitCoTTorso can emit before the extra 'act now' class - see "
         "stoix/networks/torso_compute_explicit_cot.py. Only applies to architecture "
         "transformer_explicit_cot (unlike --num-heads/--mlp-dim, NOT swept for "
-        "transformer/cnn+transformer, which have no such param); ignored (forced to the "
-        "first value) for every other architecture. Default 32 (the network yaml default).",
+        "transformer/cnn+transformer/sps/cnn+sps, which have no such param); ignored (forced to "
+        "the first value) for every other architecture. Default 32 (the network yaml default).",
+    )
+    parser.add_argument(
+        "--window-size",
+        default="64",
+        help="Comma-separated ints - how many recent prediction-stream ('rho') steps a query may "
+        "attend to, besides the always-visible persistent ('x') stream "
+        "(network.actor_network.pre_torso.window_size) - see "
+        "stoix.networks.torso_compute_sps.SPSChainOfThoughtTorso's module docstring for the "
+        "attention pattern this bounds. Only applies to architecture in {sps, cnn+sps} "
+        "(WINDOW_SIZE_ARCHES); ignored (forced to the first value) for every other architecture, "
+        "since no other torso has this param. window_size >= max_steps - 1 makes the window "
+        "non-binding (every prediction step stays visible for the whole trajectory). Default 64, "
+        "matching the network yaml default and the SPS paper's own default.",
     )
     parser.add_argument(
         "--use-latent-feedback",
@@ -1636,6 +1726,7 @@ def main() -> None:
     args.use_latent_feedback = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_latent_feedback.split(",")
     ]
+    args.window_size = [int(x) for x in args.window_size.split(",")]
 
     for g in args.grid_sizes:
         assert GRID_SIZE_RE.match(g), f"invalid grid size {g!r}, expected 'MxN' (e.g. '3x3')"
@@ -1647,6 +1738,7 @@ def main() -> None:
         "transformer",
         "gru",
         "iru",
+        "sps",
         EXPLICIT_COT_ARCH,
     ) + CNN_ARCHES
     for a in args.architectures:
@@ -1663,6 +1755,8 @@ def main() -> None:
         assert d >= 1, f"mlp_dim must be >= 1, got {d}"
     for v in args.vocab_size:
         assert v >= 1, f"vocab_size must be >= 1, got {v}"
+    for w in args.window_size:
+        assert w >= 0, f"window_size must be >= 0, got {w}"
     for e in args.epochs:
         assert e >= 1, f"epochs must be >= 1, got {e}"
     for m in args.num_minibatches:

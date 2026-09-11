@@ -739,3 +739,12 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 
 
 python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 2 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95
 ```
+
+
+```
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,5 --seeds 3 --architectures sps --hidden-dim 64 --mlp-dim 128 --num-layers 2,4 --num-heads 8 --total-timesteps 3e8 --grid-sizes 5x4 --episode-length 10 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --ent-coef 0.01 --clip-eps 0.2,0.3 --gamma 0.99 --actor-weight-decay 0.0 --gae-lambda 0.95 --standardize-advantages true --wandb true --wandb-project lightsout-icot-${project_name}-sps --output-dir /home/bryanpu1/scratch/logs/ramdp/lightsout-icot-${project_name}-sps --runs-per-gpu 1 --gpus 0,1,4,5 --no-skip-existing --yes &
+
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 3 --architectures sps --hidden-dim 64 --mlp-dim 128 --num-layers 2,4 --num-heads 8 --total-timesteps 3e8 --grid-sizes 5x4 --episode-length 10 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --ent-coef 0.01 --clip-eps 0.2,0.3 --gamma 0.99 --actor-weight-decay 0.0 --gae-lambda 0.95 --standardize-advantages true --halting-ent-coef 0.0,0.01,0.001 --wandb true --wandb-project lightsout-icot-${project_name}-sps --output-dir /home/bryanpu1/scratch/logs/ramdp/lightsout-icot-${project_name}-sps --runs-per-gpu 1 --gpus 6,7 --no-skip-existing --yes &
+
+wait
+```
