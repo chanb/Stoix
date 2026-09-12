@@ -461,7 +461,7 @@ def plot_learning_curves(
             eval_idx, mean, sem = result
             steps = step_axis(b_df).reindex(eval_idx).to_numpy()
             color = fixed_colors[mn]
-            ax.plot(steps, mean, color=color, linewidth=1.3, label=f"Fixed budget={mn}")
+            ax.plot(steps, mean, color=color, linewidth=1.3, label=f"Uniform budget={mn}")
             ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
 
         adaptive_df = col_df[col_df["min_steps"] != col_df["max_steps"]]
