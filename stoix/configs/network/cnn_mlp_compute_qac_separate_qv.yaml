@@ -23,6 +23,7 @@ actor_network:
     hidden_dim: 128
     max_steps: 10
     min_steps: 1
+    halting_temperature: 1.0 # <1.0 sharpens the halting probability towards 0/1, >1.0 softens it towards 0.5.
     activation: relu
     use_input_layer_norm: False
     use_layer_norm: False

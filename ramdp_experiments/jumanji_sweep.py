@@ -268,6 +268,14 @@ IRU_ARCHES = ("iru", "cnn+iru")
 # Used to pick whether --stop-gradient-halting-input is swept for a given
 # architecture in build_grid() and applied in Job.command().
 STOP_GRADIENT_HALTING_ARCHES = IRU_ARCHES + TRANSFORMER_ARCHES
+# Architectures whose pre_torso has a halting_temperature param - every
+# ACTStep/RecurrentACTStep/IRUStep-based torso (mlp/gru/iru and their
+# cnn+ variants), see stoix/networks/torso_compute.py. *Not*
+# TransformerChainOfThoughtTorso/TransformerExplicitCoTTorso
+# (TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES), which have no such param yet.
+# Used to pick whether --halting-temperature is swept for a given
+# architecture in build_grid() and applied in Job.command().
+HALTING_TEMPERATURE_ARCHES = ("mlp", "gru", "iru", "cnn+mlp", "cnn+gru", "cnn+iru")
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
 
@@ -608,6 +616,7 @@ class Job:
     gae_lambda: float
     latent_kl_coef: float
     halting_ent_coef: float
+    halting_temperature: float
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
@@ -689,6 +698,8 @@ class Job:
             extra.append(f"lkl{self.latent_kl_coef:g}")
         if self.halting_ent_coef:
             extra.append(f"hec{self.halting_ent_coef:g}")
+        if self.halting_temperature != 1.0:
+            extra.append(f"ht{self.halting_temperature:g}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}")
         if self.critic_weight_decay:
@@ -835,6 +846,13 @@ class Job:
                 "++network.actor_network.pre_torso.stop_gradient_halting_input="
                 f"{self.stop_gradient_halting_input}"
             )
+        if self.arch in HALTING_TEMPERATURE_ARCHES:
+            # Divides the halting head's logit before the sigmoid - see
+            # stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep
+            # docstrings. Every network yaml for these architectures already
+            # declares halting_temperature (plain `=`, not `++`); no such
+            # param on TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES yet.
+            cmd.append(f"network.actor_network.pre_torso.halting_temperature={self.halting_temperature:g}")
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
 
@@ -1058,6 +1076,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ),
             latent_kl_coef,
             halting_ent_coef,
+            halting_temperature,
             qv_critic,
             seed,
         ) in itertools.product(
@@ -1075,6 +1094,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ppo_combos,
             args.latent_kl_coef,
             args.halting_ent_coef,
+            args.halting_temperature,
             args.qv_critic,
             range(args.seeds),
         ):
@@ -1104,6 +1124,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for ff_reinforce/ff_qac_*, which have no such config knob.
             if system not in PPO_SYSTEMS:
                 halting_ent_coef = args.halting_ent_coef[0]
+            # halting_temperature only exists on HALTING_TEMPERATURE_ARCHES -
+            # forced to the first requested value (default 1.0, a no-op) for
+            # every other architecture.
+            if arch not in HALTING_TEMPERATURE_ARCHES:
+                halting_temperature = args.halting_temperature[0]
             # qv_critic (shared vs separate-torso Q-V critic) only exists on
             # systems with a genuine Q-V critic (QAC_SYSTEMS) - forced to the
             # first requested value for "reinforce" systems (V-only critic,
@@ -1134,6 +1159,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     gae_lambda=gae_lambda,
                     latent_kl_coef=latent_kl_coef,
                     halting_ent_coef=halting_ent_coef,
+                    halting_temperature=halting_temperature,
                     standardize_advantages=standardize_advantages,
                     recompute_advantages=recompute_advantages,
                     critic_before_actor=critic_before_actor,
@@ -1375,6 +1401,18 @@ def main() -> None:
         "have no such config knob.",
     )
     parser.add_argument(
+        "--halting-temperature",
+        default="1.0",
+        help="Comma-separated network.actor_network.pre_torso.halting_temperature values - "
+        "divides the halting head's logit before the sigmoid (see "
+        "stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep docstrings): below 1.0 "
+        "sharpens the halting probability towards 0/1, above 1.0 softens it towards 0.5, 1.0 is "
+        "a no-op. Only applies to architecture in {mlp, gru, iru, cnn+mlp, cnn+gru, cnn+iru} "
+        "(HALTING_TEMPERATURE_ARCHES); ignored (forced to the first value) for every other "
+        "architecture. A no-op whenever min_steps == max_steps (halting is always forced, so "
+        "the halting head is never actually queried for a decision).",
+    )
+    parser.add_argument(
         "--qv-critic",
         default="shared",
         help=f"Comma-separated subset of {{{','.join(QV_CRITIC_CHOICES)}}} - whether the critic's "
@@ -1518,6 +1556,7 @@ def main() -> None:
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.halting_ent_coef = [float(x) for x in args.halting_ent_coef.split(",")]
+    args.halting_temperature = [float(x) for x in args.halting_temperature.split(",")]
     args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
@@ -1608,6 +1647,10 @@ def main() -> None:
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
     )
     print(f"  halting_ent_coef={args.halting_ent_coef} (PPO systems only: {PPO_SYSTEMS})")
+    print(
+        f"  halting_temperature={args.halting_temperature} "
+        f"(HALTING_TEMPERATURE_ARCHES only: {HALTING_TEMPERATURE_ARCHES})"
+    )
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
