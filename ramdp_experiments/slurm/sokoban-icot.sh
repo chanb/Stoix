@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=aip-schuurma
-#SBATCH --time=23:59:00
+#SBATCH --time=11:59:00
 #SBATCH --mem=16GB
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
@@ -29,9 +29,9 @@ project_name=sep11
 
 ### SINGLE RUN
 project_name=sep12
-# python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+transformer --hidden-dim 128 --mlp-dim 512 --num-layers 4 --num-heads 8 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.1 --critic-before-actor false --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95 --wandb true --wandb-project sokoban-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/sokoban-icot-${project_name} --yes --no-skip-existing --server vulcan &
+# python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1 --seeds 1 --runs-per-gpu 1 --architectures cnn+transformer --hidden-dim 128 --mlp-dim 512 --num-layers 2 --num-heads 8 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.02 --critic-before-actor false --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95 --wandb true --wandb-project sokoban-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/sokoban-icot-${project_name} --yes --no-skip-existing --server vulcan &
 
-python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+transformer --hidden-dim 128 --mlp-dim 512 --num-layers 4 --num-heads 8 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.1 --critic-before-actor false --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95 --halting-ent-coef 0.01 --wandb true --wandb-project sokoban-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/sokoban-icot-${project_name} --yes --no-skip-existing --server vulcan &
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+transformer --hidden-dim 128 --mlp-dim 512 --num-layers 2 --num-heads 8 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 0 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.02 --critic-before-actor false --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95 --halting-ent-coef 0.01 --halting-temperature 5.0 --wandb true --wandb-project sokoban-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/sokoban-icot-${project_name} --yes --no-skip-existing --server vulcan &
 
 
 wait
