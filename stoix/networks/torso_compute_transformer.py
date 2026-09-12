@@ -195,6 +195,7 @@ class _CoTStep(nn.Module):
     replaying: bool
     deterministic: bool
     stop_gradient_halting_input: bool = False
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -251,7 +252,8 @@ class _CoTStep(nn.Module):
         halting_input = state
         if self.stop_gradient_halting_input:
             halting_input = jax.lax.stop_gradient(halting_input)
-        halting_prob = nn.sigmoid(halting_head(halting_input))
+        halting_logit = halting_head(halting_input)
+        halting_prob = nn.sigmoid(halting_logit / self.halting_temperature)
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
 
         step_count = step_idx + 1
@@ -416,6 +418,13 @@ class TransformerChainOfThoughtTorso(nn.Module):
     that gradient-sharing channel between the two objectives. A no-op when
     `min_steps == max_steps` (every step is already forced, so no
     halting-loss gradient reaches the torso regardless).
+
+    `halting_temperature` (default `1.0`) divides the halting head's logit
+    before the sigmoid - below `1.0` sharpens the halting probability towards
+    0/1 (lower-entropy, more decisive halting decisions), above `1.0` softens
+    it towards 0.5 (higher-entropy, more exploratory halting decisions);
+    `1.0` is the standard sigmoid with no rescaling. Forwarded to the shared
+    `_CoTStep`'s halting head - see that class.
     """
 
     hidden_dim: int
@@ -429,6 +438,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
     stop_gradient_halting_input: bool = False
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -526,6 +536,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             replaying,
             deterministic,
             self.stop_gradient_halting_input,
+            self.halting_temperature,
         )
 
         initial_carry = (

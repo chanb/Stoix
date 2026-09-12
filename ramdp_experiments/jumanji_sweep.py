@@ -270,12 +270,20 @@ IRU_ARCHES = ("iru", "cnn+iru")
 STOP_GRADIENT_HALTING_ARCHES = IRU_ARCHES + TRANSFORMER_ARCHES
 # Architectures whose pre_torso has a halting_temperature param - every
 # ACTStep/RecurrentACTStep/IRUStep-based torso (mlp/gru/iru and their
-# cnn+ variants), see stoix/networks/torso_compute.py. *Not*
-# TransformerChainOfThoughtTorso/TransformerExplicitCoTTorso
-# (TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES), which have no such param yet.
-# Used to pick whether --halting-temperature is swept for a given
+# cnn+ variants), see stoix/networks/torso_compute.py, plus
+# TransformerChainOfThoughtTorso (TRANSFORMER_ARCHES), see
+# stoix/networks/torso_compute_transformer.py. *Not*
+# TransformerExplicitCoTTorso (EXPLICIT_COT_ARCHES), which has no such param
+# yet. Used to pick whether --halting-temperature is swept for a given
 # architecture in build_grid() and applied in Job.command().
-HALTING_TEMPERATURE_ARCHES = ("mlp", "gru", "iru", "cnn+mlp", "cnn+gru", "cnn+iru")
+HALTING_TEMPERATURE_ARCHES = (
+    "mlp",
+    "gru",
+    "iru",
+    "cnn+mlp",
+    "cnn+gru",
+    "cnn+iru",
+) + TRANSFORMER_ARCHES
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
 
@@ -857,9 +865,10 @@ class Job:
         if self.arch in HALTING_TEMPERATURE_ARCHES:
             # Divides the halting head's logit before the sigmoid - see
             # stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep
-            # docstrings. Every network yaml for these architectures already
-            # declares halting_temperature (plain `=`, not `++`); no such
-            # param on TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES yet.
+            # and stoix.networks.torso_compute_transformer's
+            # TransformerChainOfThoughtTorso docstrings. Every network yaml
+            # for these architectures already declares halting_temperature
+            # (plain `=`, not `++`); no such param on EXPLICIT_COT_ARCHES yet.
             cmd.append(f"network.actor_network.pre_torso.halting_temperature={self.halting_temperature:g}")
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
@@ -1413,9 +1422,12 @@ def main() -> None:
         default="1.0",
         help="Comma-separated network.actor_network.pre_torso.halting_temperature values - "
         "divides the halting head's logit before the sigmoid (see "
-        "stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep docstrings): below 1.0 "
+        "stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep and "
+        "stoix.networks.torso_compute_transformer's TransformerChainOfThoughtTorso "
+        "docstrings): below 1.0 "
         "sharpens the halting probability towards 0/1, above 1.0 softens it towards 0.5, 1.0 is "
-        "a no-op. Only applies to architecture in {mlp, gru, iru, cnn+mlp, cnn+gru, cnn+iru} "
+        "a no-op. Only applies to architecture in {mlp, gru, iru, cnn+mlp, cnn+gru, cnn+iru, "
+        "transformer, cnn+transformer} "
         "(HALTING_TEMPERATURE_ARCHES); ignored (forced to the first value) for every other "
         "architecture. A no-op whenever min_steps == max_steps (halting is always forced, so "
         "the halting head is never actually queried for a decision).",
