@@ -429,8 +429,16 @@ ENV_CNN_ARCH = {
     #     "critic_hidden_sizes": (128,),
     #     "critic_layer_sizes": (128, 128),
     # },
-    "sokoban": {
-        "channel_sizes": (128, 128),
+    # "sokoban": { # sep11
+    #     "channel_sizes": (128, 128),
+    #     "kernel_sizes": (3, 3),
+    #     "strides": (2, 1),
+    #     "hidden_sizes": (128,),
+    #     "critic_hidden_sizes": (128,),
+    #     "critic_layer_sizes": (128, 128),
+    # },
+    "sokoban": { # sep12
+        "channel_sizes": (64, 64),
         "kernel_sizes": (3, 3),
         "strides": (2, 1),
         "hidden_sizes": (128,),

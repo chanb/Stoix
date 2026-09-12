@@ -1146,7 +1146,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--clip-value-loss",
-        default="true",
+        default="false",
         help="Comma-separated bools (true/false) - system.clip_value_loss: whether the critic's "
         "value/Q loss uses PPO-style clipping (True, default) against the old value/Q estimate, "
         "or plain L2 regression instead (False, as in ff_reinforce.py/ff_qac.py). Swept "
