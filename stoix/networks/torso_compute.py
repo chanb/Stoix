@@ -83,13 +83,20 @@ class ACTStep(nn.Module):
     step (each with its own weights - not shared across the stack, unlike the
     step itself, which is shared/reused across every pondering step). The
     optional pre-LN (`use_layer_norm`) is applied once, before the stack, not
-    between its layers."""
+    between its layers.
+
+    `halting_temperature` (default `1.0`) divides the halting head's logit
+    before the sigmoid - below `1.0` sharpens the halting probability towards
+    0/1 (lower-entropy, more decisive halting decisions), above `1.0` softens
+    it towards 0.5 (higher-entropy, more exploratory halting decisions);
+    `1.0` is the standard sigmoid with no rescaling."""
 
     hidden_dim: int
     num_layers: int = 1
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_layer_norm: bool = False
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(self, state: chex.Array) -> Tuple[chex.Array, chex.Array]:
@@ -100,7 +107,8 @@ class ACTStep(nn.Module):
                 state
             )
             state = parse_activation_fn(self.activation)(state)
-        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(state))
+        halting_logit = nn.Dense(1, kernel_init=self.kernel_init)(state)
+        halting_prob = nn.sigmoid(halting_logit / self.halting_temperature)
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
         return state, halting_prob
 
@@ -146,6 +154,9 @@ class AdaptiveComputationTimeTorso(nn.Module):
         it never does within the steps actually taken.
       - `num_close_steps`: how many steps (not necessarily consecutive) had
         a distance below `convergence_threshold`.
+
+    `halting_temperature` is forwarded to the shared `ACTStep`'s halting head
+    - see that class's docstring.
     """
 
     hidden_dim: int
@@ -157,6 +168,7 @@ class AdaptiveComputationTimeTorso(nn.Module):
     use_input_layer_norm: bool = False
     use_layer_norm: bool = False
     convergence_threshold: float = 0.1
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -219,6 +231,7 @@ class AdaptiveComputationTimeTorso(nn.Module):
             self.activation,
             self.kernel_init,
             use_layer_norm=self.use_layer_norm,
+            halting_temperature=self.halting_temperature,
         )
 
         still_running = jnp.ones(batch_shape, dtype=bool)
@@ -348,11 +361,17 @@ class RecurrentACTStep(nn.Module):
     The halting probability is predicted from the top (last) layer's new
     carry, which is also what gets used as this step's "public" state (e.g.
     for the latent-convergence diagnostics and the final returned
-    embedding) - see `GRUAdaptiveComputationTimeTorso`."""
+    embedding) - see `GRUAdaptiveComputationTimeTorso`.
+
+    `halting_temperature` (default `1.0`) divides the halting head's logit
+    before the sigmoid - below `1.0` sharpens the halting probability towards
+    0/1, above `1.0` softens it towards 0.5; `1.0` is the standard sigmoid
+    with no rescaling."""
 
     hidden_dim: int
     num_layers: int = 1
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -366,7 +385,8 @@ class RecurrentACTStep(nn.Module):
             )(carry[i], x)
             new_carries.append(layer_carry)
         new_carry = jnp.stack(new_carries, axis=0)
-        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(new_carries[-1]))
+        halting_logit = nn.Dense(1, kernel_init=self.kernel_init)(new_carries[-1])
+        halting_prob = nn.sigmoid(halting_logit / self.halting_temperature)
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
         return new_carry, halting_prob
 
@@ -410,6 +430,9 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
     carry across pondering steps; the diagnostics/final embedding below use
     only the top layer's carry, matching what `RecurrentACTStep` returns as
     its halting-probability input.
+
+    `halting_temperature` is forwarded to the shared `RecurrentACTStep`'s
+    halting head - see that class's docstring.
     """
 
     hidden_dim: int
@@ -419,6 +442,7 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -474,7 +498,12 @@ class GRUAdaptiveComputationTimeTorso(nn.Module):
         input_embedding = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
             input_embedding = nn.LayerNorm()(input_embedding)
-        step_fn = RecurrentACTStep(self.hidden_dim, self.num_layers, self.kernel_init)
+        step_fn = RecurrentACTStep(
+            self.hidden_dim,
+            self.num_layers,
+            self.kernel_init,
+            halting_temperature=self.halting_temperature,
+        )
 
         # `carry` holds every stacked layer's own recurrent state
         # (`(num_layers, *batch_shape, hidden_dim)`), threaded between
@@ -654,12 +683,18 @@ class IRUStep(nn.Module):
     `Dense(1)` layer's weights but can no longer backprop into the shared
     `IRUCell` weights that also produce the state the action head reads -
     severing that gradient-sharing channel between the two objectives while
-    leaving the halting head free to read (not shape) the state."""
+    leaving the halting head free to read (not shape) the state.
+
+    `halting_temperature` (default `1.0`) divides the halting head's logit
+    before the sigmoid - below `1.0` sharpens the halting probability towards
+    0/1, above `1.0` softens it towards 0.5; `1.0` is the standard sigmoid
+    with no rescaling."""
 
     hidden_dim: int
     num_layers: int = 1
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     stop_gradient_halting_input: bool = False
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -678,7 +713,8 @@ class IRUStep(nn.Module):
         halting_input = new_carries[-1]
         if self.stop_gradient_halting_input:
             halting_input = jax.lax.stop_gradient(halting_input)
-        halting_prob = nn.sigmoid(nn.Dense(1, kernel_init=self.kernel_init)(halting_input))
+        halting_logit = nn.Dense(1, kernel_init=self.kernel_init)(halting_input)
+        halting_prob = nn.sigmoid(halting_logit / self.halting_temperature)
         halting_prob = jnp.clip(halting_prob.squeeze(axis=-1), _PROB_EPS, 1.0 - _PROB_EPS)
         return new_carry, halting_prob
 
@@ -723,6 +759,9 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
     docstring. With `min_steps == max_steps` this is a no-op regardless
     (every step is already forced, so no halting-loss gradient ever reaches
     `IRUStep` in the first place - see the forced-step handling below).
+
+    `halting_temperature` is forwarded to the shared `IRUStep`'s halting head
+    - see that class's docstring.
     """
 
     hidden_dim: int
@@ -733,6 +772,7 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
     stop_gradient_halting_input: bool = False
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -793,6 +833,7 @@ class IRUAdaptiveComputationTimeTorso(nn.Module):
             self.num_layers,
             self.kernel_init,
             stop_gradient_halting_input=self.stop_gradient_halting_input,
+            halting_temperature=self.halting_temperature,
         )
 
         # `carry` holds every stacked layer's own cell state
@@ -960,6 +1001,9 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
     steps), this only isolates a given step's halting-loss gradient from
     its own state-producing weights; it doesn't need to protect other
     steps' weights the way it does in `IRUAdaptiveComputationTimeTorso`.
+
+    `halting_temperature` is forwarded to every per-step `IRUStep`'s halting
+    head - see that class's docstring.
     """
 
     hidden_dim: int
@@ -970,6 +1014,7 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
     use_input_layer_norm: bool = False
     convergence_threshold: float = 0.1
     stop_gradient_halting_input: bool = False
+    halting_temperature: float = 1.0
 
     @nn.compact
     def __call__(
@@ -1059,6 +1104,7 @@ class UnsharedIRUAdaptiveComputationTimeTorso(nn.Module):
                 self.num_layers,
                 self.kernel_init,
                 stop_gradient_halting_input=self.stop_gradient_halting_input,
+                halting_temperature=self.halting_temperature,
                 name=f"iru_step_{step}",
             )
             carry, halting_prob = step_fn(carry, input_embedding)

@@ -348,6 +348,14 @@ NO_LAYER_NORM_ARCHES = (
 # pick whether --num-heads/--mlp-dim are swept for a given architecture in
 # build_grid() and applied in Job.command().
 TRANSFORMER_ARCHES = ("cnn+transformer",)
+# Architectures whose pre_torso has a halting_temperature param - every
+# ACTStep/RecurrentACTStep/IRUStep-based torso (cnn+mlp/cnn+gru/cnn+iru, see
+# stoix/networks/torso_compute.py). *Not* TransformerChainOfThoughtTorso/
+# TransformerExplicitCoTTorso (TRANSFORMER_ARCHES/EXPLICIT_COT_ARCH), which
+# have no such param yet. Used to pick whether --halting-temperature is
+# swept for a given architecture in build_grid() and applied in
+# Job.command().
+HALTING_TEMPERATURE_ARCHES = ("cnn+mlp", "cnn+gru", "cnn+iru")
 MINATAR_GAMES = (
     "asterix",
     "breakout",
@@ -463,6 +471,7 @@ class Job:
     clip_eps: float
     clip_value_loss: bool
     latent_kl_coef: float
+    halting_temperature: float
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
@@ -542,6 +551,8 @@ class Job:
             extra.append(f"deta{self.delightful_eta:g}")
         if self.latent_kl_coef:
             extra.append(f"lkl{self.latent_kl_coef:g}")
+        if self.halting_temperature != 1.0:
+            extra.append(f"ht{self.halting_temperature:g}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}")
         if self.critic_weight_decay:
@@ -637,6 +648,13 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
+        if self.arch in HALTING_TEMPERATURE_ARCHES:
+            # Divides the halting head's logit before the sigmoid - see
+            # stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep
+            # docstrings. Every network yaml for these architectures already
+            # declares halting_temperature (plain `=`, not `++`); no such
+            # param on TRANSFORMER_ARCHES/EXPLICIT_COT_ARCH yet.
+            cmd.append(f"network.actor_network.pre_torso.halting_temperature={self.halting_temperature:g}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the
             # sweep lands in the same W&B project. run_id is pinned to
@@ -874,6 +892,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             critic_before_actor,
         ),
         latent_kl_coef,
+        halting_temperature,
         seed,
     ) in itertools.product(
         args.envs,
@@ -889,6 +908,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         delightful_combos,
         ppo_combos,
         args.latent_kl_coef,
+        args.halting_temperature,
         range(args.seeds),
     ):
         # Neither axis applies to both kinds of system at once (see
@@ -911,6 +931,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         # every other system (including explicit-CoT PPO systems).
         if system not in LATENT_KL_PPO_SYSTEMS:
             latent_kl_coef = args.latent_kl_coef[0]
+        # halting_temperature only exists on HALTING_TEMPERATURE_ARCHES -
+        # forced to the first requested value (default 1.0, a no-op) for
+        # every other architecture.
+        if arch not in HALTING_TEMPERATURE_ARCHES:
+            halting_temperature = args.halting_temperature[0]
         jobs.append(
             Job(
                 env=env,
@@ -932,6 +957,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 clip_eps=clip_eps,
                 clip_value_loss=clip_value_loss,
                 latent_kl_coef=latent_kl_coef,
+                halting_temperature=halting_temperature,
                 standardize_advantages=standardize_advantages,
                 recompute_advantages=recompute_advantages,
                 critic_before_actor=critic_before_actor,
@@ -1211,6 +1237,18 @@ def main() -> None:
         "EXPLICIT_COT_PPO_SYSTEMS) - forced to the first value for every other system.",
     )
     parser.add_argument(
+        "--halting-temperature",
+        default="1.0",
+        help="Comma-separated network.actor_network.pre_torso.halting_temperature values - "
+        "divides the halting head's logit before the sigmoid (see "
+        "stoix.networks.torso_compute's ACTStep/RecurrentACTStep/IRUStep docstrings): below 1.0 "
+        "sharpens the halting probability towards 0/1, above 1.0 softens it towards 0.5, 1.0 is "
+        "a no-op. Only applies to architecture in {cnn+mlp, cnn+gru, cnn+iru} "
+        "(HALTING_TEMPERATURE_ARCHES); ignored (forced to the first value) for every other "
+        "architecture. A no-op whenever min_steps == max_steps (halting is always forced, so "
+        "the halting head is never actually queried for a decision).",
+    )
+    parser.add_argument(
         "--use-layer-norm",
         default="false",
         help="Comma-separated bools (true/false) - LayerNorm inside AdaptiveComputationTimeTorso's "
@@ -1375,6 +1413,7 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
+    args.halting_temperature = [float(x) for x in args.halting_temperature.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
@@ -1472,6 +1511,10 @@ def main() -> None:
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
+    )
+    print(
+        f"  halting_temperature={args.halting_temperature} "
+        f"(HALTING_TEMPERATURE_ARCHES only: {HALTING_TEMPERATURE_ARCHES})"
     )
     print(
         f"  use_layer_norm={args.use_layer_norm} (cnn+mlp only) "
