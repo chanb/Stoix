@@ -652,6 +652,8 @@ class Job:
     mlp_dim: int
     vocab_size: int
     use_latent_feedback: bool
+    use_sandwich_norm: bool
+    use_rmsnorm: bool
     qv_critic: str
     seed: int
     total_timesteps: float
@@ -736,6 +738,10 @@ class Job:
             extra.append("sgh")
         if self.use_latent_feedback:
             extra.append("lf")
+        if self.use_sandwich_norm:
+            extra.append("sn")
+        if self.use_rmsnorm:
+            extra.append("rms")
         if extra:
             parts.append("-".join(extra))
 
@@ -819,6 +825,14 @@ class Job:
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
+            # Sandwich LayerNorm placement / RMSNorm instead of LayerNorm - every
+            # TransformerBlock-based torso only, same applicability as num_heads/
+            # mlp_dim above - see stoix/networks/torso_compute_transformer.py's
+            # TransformerBlock/_norm_cls.
+            cmd.append(
+                f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
+            )
+            cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
@@ -999,6 +1013,13 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 if arch in STOP_GRADIENT_HALTING_ARCHES
                 else [args.stop_gradient_halting_input[0]]
             )
+            # use_sandwich_norm/use_rmsnorm only exist on TransformerBlock-based
+            # torsos - same applicability as num_heads/mlp_dim above (see
+            # is_transformer_arch).
+            use_sandwich_norm_options = (
+                args.use_sandwich_norm if is_transformer_arch else [args.use_sandwich_norm[0]]
+            )
+            use_rmsnorm_options = args.use_rmsnorm if is_transformer_arch else [args.use_rmsnorm[0]]
             if arch in EXPLICIT_COT_ARCHES:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
@@ -1017,12 +1038,18 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for vocab_size, use_latent_feedback, stop_gradient_halting_input in (
-                                itertools.product(
-                                    vocab_size_options,
-                                    use_latent_feedback_options,
-                                    stop_gradient_halting_input_options,
-                                )
+                            for (
+                                vocab_size,
+                                use_latent_feedback,
+                                stop_gradient_halting_input,
+                                use_sandwich_norm,
+                                use_rmsnorm,
+                            ) in itertools.product(
+                                vocab_size_options,
+                                use_latent_feedback_options,
+                                stop_gradient_halting_input_options,
+                                use_sandwich_norm_options,
+                                use_rmsnorm_options,
                             ):
                                 system_arch_ln_combos.append(
                                     (
@@ -1036,6 +1063,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                         vocab_size,
                                         use_latent_feedback,
                                         stop_gradient_halting_input,
+                                        use_sandwich_norm,
+                                        use_rmsnorm,
                                     )
                                 )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -1079,6 +1108,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 vocab_size,
                 use_latent_feedback,
                 stop_gradient_halting_input,
+                use_sandwich_norm,
+                use_rmsnorm,
             ),
             (min_steps, max_steps),
             hidden_dim,
@@ -1196,6 +1227,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     mlp_dim=mlp_dim,
                     vocab_size=vocab_size,
                     use_latent_feedback=use_latent_feedback,
+                    use_sandwich_norm=use_sandwich_norm,
+                    use_rmsnorm=use_rmsnorm,
                     qv_critic=qv_critic,
                     seed=seed,
                     total_timesteps=args.total_timesteps,
@@ -1488,6 +1521,25 @@ def main() -> None:
         "arches (EXPLICIT_COT_ARCHES); ignored (forced to the first value) for every other "
         "architecture. Default false.",
     )
+    parser.add_argument(
+        "--use-sandwich-norm",
+        default="false",
+        help="Comma-separated bools (true/false) - sandwich LayerNorm placement "
+        "(network.actor_network.pre_torso.use_sandwich_norm): normalizes each TransformerBlock "
+        "sub-layer's residual sum, not just its input as in plain pre-norm - see "
+        "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. Only applies "
+        "to TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES (every other architecture has no "
+        "TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
+    )
+    parser.add_argument(
+        "--use-rmsnorm",
+        default="false",
+        help="Comma-separated bools (true/false) - RMSNorm instead of LayerNorm "
+        "(network.actor_network.pre_torso.use_rmsnorm): switches every norm inside the "
+        "pre_torso (use_input_layer_norm's and every TransformerBlock norm) from nn.LayerNorm "
+        "to nn.RMSNorm - see stoix/networks/torso_compute_transformer.py's _norm_cls. Same "
+        "applicability as --use-sandwich-norm. Default false.",
+    )
 
     parser.add_argument(
         "--sokoban-generator",
@@ -1598,6 +1650,12 @@ def main() -> None:
     args.vocab_size = [int(x) for x in args.vocab_size.split(",")]
     args.use_latent_feedback = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_latent_feedback.split(",")
+    ]
+    args.use_sandwich_norm = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_sandwich_norm.split(",")
+    ]
+    args.use_rmsnorm = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_rmsnorm.split(",")
     ]
     args.sokoban_generator = args.sokoban_generator.split(",")
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
