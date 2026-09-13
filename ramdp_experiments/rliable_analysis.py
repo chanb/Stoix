@@ -1,14 +1,15 @@
 #!/usr/bin/env python
-"""IQM and probability-of-improvement comparison across qac_variants (and,
-for Transformer-ExplicitCoT, vocab_size) using rliable
+"""IQM, probability-of-improvement, sample-efficiency-curve, and
+performance-profile comparison across qac_variants (and, for
+Transformer-ExplicitCoT, vocab_size) using rliable
 (https://github.com/google-research/rliable), for one or more lightsout
 wandb-cache CSVs (see fetch_wandb_lightsout_hd64.py) - e.g.
 wandb_cache_hd64-sep7.csv and wandb_cache_hd64-sep8.csv.
 
 Comparisons are scoped to ONE ARCHITECTURE at a time (IRU-ACT,
 Transformer-CoT, Transformer-ExplicitCoT never appear in the same figure) -
-one IQM and one probability-of-improvement figure per (dataset, architecture,
-metric).
+one IQM, one probability-of-improvement, one sample-efficiency-curve, and one
+performance-profile figure per (dataset, architecture, metric).
 
 Run separately for four scores (`--metric` choices, or all by default):
   - discounted_return: actor/episode_discounted_return/mean, final value
@@ -26,25 +27,35 @@ Run separately for four scores (`--metric` choices, or all by default):
     batch artifact.
 
 "Algorithms" (rliable's unit of comparison) are every (qac_variant,
-vocab_size) combo present AT THE ADAPTIVE BUDGET (min_steps=1, max_steps=5)
-for that architecture - fixed-budget configs are excluded because they
-aren't different *algorithms*, they're different resource allocations for
-the same REINFORCE algorithm, and mixing them in would blur the comparison
-rliable is meant for. For Transformer-ExplicitCoT, which has a vocab_size
-axis, every vocab_size is its own variant (rather than picking one "primary"
-vocab_size as plot_wandb_lightsout_hd64_extra.py's pareto/heatmap plots do),
-so e.g. "REINFORCE, vocab=2" and "REINFORCE, vocab=8" are compared against
-each other just like different qac_variants are.
+vocab_size, budget) combo present for that architecture, at BOTH the
+adaptive budget (min_steps=1, max_steps=5) and every fixed ("uniform")
+budget (min_steps == max_steps) - so e.g. "PPO (adaptive[1-5])" and
+"PPO (uniform=3)" are compared against each other, not just against other
+adaptive variants. Fixed budgets only ever sweep qac_variant="reinforce"
+(there's no halting decision to train at a fixed budget), so they show up
+as a handful of "uniform=N" points per architecture. For
+Transformer-ExplicitCoT, which has a vocab_size axis, every vocab_size is
+its own variant (rather than picking one "primary" vocab_size as
+plot_wandb_lightsout_hd64_extra.py's pareto/heatmap plots do), so e.g.
+"REINFORCE, vocab=2" and "REINFORCE, vocab=8" are compared against each
+other just like different qac_variants are.
 
 This is a single task (this one lightsout env/scenario) with 5 seeds per
 algorithm, so IQM and the bootstrap CIs reduce to a straightforward
 run-level (not task-level) comparison. Probability of improvement is
 computed for the FULL pairwise matrix within each architecture (every
-variant against every other variant of that same architecture) - for
-IRU-ACT/Transformer-CoT (3 qac_variants, no vocab axis) that's 3 pairs; for
-Transformer-ExplicitCoT (qac_variants x vocab_sizes) it can be a couple
-dozen, which is why it's one figure per architecture rather than one giant
-combined figure.
+variant/budget against every other variant/budget of that same
+architecture), which is why it's one figure per architecture rather than
+one giant combined figure.
+
+The sample-efficiency curve plots IQM (with bootstrap CIs) as a function of
+training progress (eval checkpoint, x-axis in real timesteps) rather than
+just the final value - it uses only the eval_idx values common to every
+algorithm/seed in the figure, so every curve shares one x-axis. The
+performance profile plots, for each algorithm, the fraction of runs scoring
+above a threshold tau as tau sweeps the full observed range - useful here
+mainly for eyeballing the seed-to-seed score distribution's shape (e.g. is
+it two clusters, or a long tail) rather than just its IQM.
 
 Usage:
   python ramdp_experiments/rliable_analysis.py \\
@@ -68,9 +79,12 @@ import plot_wandb_lightsout_hd64 as base
 
 pd = base.pd
 plt = base.plt
+sns = base.sns
 compute_final_values = base.compute_final_values
 expand_vocab_agnostic_budget1 = base.expand_vocab_agnostic_budget1
 variant_row_label = base.variant_row_label
+budget_label = base.budget_label
+step_axis = base.step_axis
 ARCH_ORDER = base.ARCH_ORDER
 
 METRIC_SPECS = {
@@ -86,7 +100,7 @@ METRIC_SPECS = {
     ),
 }
 
-AlgoSpec = Tuple[str, str, int]  # (arch, qac_variant, vocab_size)
+AlgoSpec = Tuple[str, str, int, int, int]  # (arch, qac_variant, vocab_size, min_steps, max_steps)
 
 DPI = 600
 
@@ -105,31 +119,38 @@ def load_dataset(csv_path: Path) -> pd.DataFrame:
 
 
 def build_algorithms_for_arch(sub_arch: pd.DataFrame, arch: str) -> Dict[str, AlgoSpec]:
-    """{algorithm_label: (arch, qac_variant, vocab_size)} for one
-    architecture's adaptive[1-5] budget. Every (qac_variant, vocab_size)
-    combo present is its own variant - for Transformer-ExplicitCoT this
-    means every vocab_size is separately comparable, not just a single
-    "primary" one."""
-    adaptive = sub_arch[sub_arch["min_steps"] != sub_arch["max_steps"]]
+    """{algorithm_label: (arch, qac_variant, vocab_size, min_steps,
+    max_steps)} for one architecture, covering BOTH the adaptive[1-5]
+    budget and every fixed ("uniform") budget. Every (qac_variant,
+    vocab_size, budget) combo present is its own variant - for
+    Transformer-ExplicitCoT this means every vocab_size is separately
+    comparable, not just a single "primary" one. Adaptive variants are
+    listed first (sorted by qac_variant, vocab_size), followed by uniform
+    budgets in increasing order."""
     combos = sorted(
-        adaptive[["qac_variant", "vocab_size"]].drop_duplicates().itertuples(index=False, name=None),
-        key=lambda k: (k[0] != "reinforce", k[0], k[1]),
+        sub_arch[["qac_variant", "vocab_size", "min_steps", "max_steps"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None),
+        key=lambda k: (k[2] == k[3], k[2], k[3], k[0] != "reinforce", k[0], k[1]),
     )
     algorithms: Dict[str, AlgoSpec] = {}
-    for qac_variant, vocab_size in combos:
-        label = variant_row_label(qac_variant, False, vocab_size)
-        algorithms[label] = (arch, qac_variant, vocab_size)
+    for qac_variant, vocab_size, min_steps, max_steps in combos:
+        label = f"{variant_row_label(qac_variant, False, vocab_size)} ({budget_label(min_steps, max_steps)})"
+        algorithms[label] = (arch, qac_variant, vocab_size, min_steps, max_steps)
     return algorithms
 
 
-def algorithm_scores(df: pd.DataFrame, arch: str, qac_variant: str, vocab_size: int, metric: str) -> np.ndarray:
+def algorithm_scores(
+    df: pd.DataFrame, arch: str, qac_variant: str, vocab_size: int, min_steps: int, max_steps: int, metric: str
+) -> np.ndarray:
     """(n_seeds, 1) array of final values for one algorithm/metric - the
     shape rliable expects: (num_runs x num_tasks), one task here."""
     sub = df[
         (df["arch"] == arch)
         & (df["qac_variant"] == qac_variant)
         & (df["vocab_size"] == vocab_size)
-        & (df["min_steps"] != df["max_steps"])
+        & (df["min_steps"] == min_steps)
+        & (df["max_steps"] == max_steps)
     ]
     final = compute_final_values(sub, metric)
     return final["value"].to_numpy().reshape(-1, 1)
@@ -240,6 +261,105 @@ def run_poi(df: pd.DataFrame, algorithms: Dict[str, AlgoSpec], metric: str, xlab
     plt.close(fig)
 
 
+def build_efficiency_scores(
+    df: pd.DataFrame, algorithms: Dict[str, AlgoSpec], metric: str
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """(eval_idx, {label: (n_seeds, 1, n_frames) array}) for rliable's
+    sample efficiency curve - `eval_idx` is restricted to the checkpoints
+    present for every seed of every algorithm, so all curves in the figure
+    share one x-axis."""
+    per_algo: Dict[str, pd.DataFrame] = {}
+    common_eval_idx = None
+    for label, spec in algorithms.items():
+        arch, qac_variant, vocab_size, min_steps, max_steps = spec
+        sub = df[
+            (df["arch"] == arch)
+            & (df["qac_variant"] == qac_variant)
+            & (df["vocab_size"] == vocab_size)
+            & (df["min_steps"] == min_steps)
+            & (df["max_steps"] == max_steps)
+        ]
+        pivot = sub.pivot_table(index="eval_idx", columns="seed", values=metric).dropna(how="any")
+        if pivot.empty:
+            continue
+        per_algo[label] = pivot
+        idx = set(pivot.index)
+        common_eval_idx = idx if common_eval_idx is None else (common_eval_idx & idx)
+
+    if not per_algo or not common_eval_idx:
+        return np.array([]), {}
+
+    eval_idx = np.array(sorted(common_eval_idx))
+    score_dict = {label: pivot.loc[eval_idx].to_numpy().T[:, None, :] for label, pivot in per_algo.items()}
+    return eval_idx, score_dict
+
+
+def run_efficiency_curve(
+    df: pd.DataFrame,
+    sub_arch: pd.DataFrame,
+    algorithms: Dict[str, AlgoSpec],
+    metric: str,
+    ylabel: str,
+    output_path: Path,
+) -> None:
+    eval_idx, score_dict = build_efficiency_scores(df, algorithms, metric)
+    if not score_dict:
+        print(f"  (no data for {output_path}, skipping)")
+        return
+    algo_order = [label for label in algorithms if label in score_dict]
+    frames = step_axis(sub_arch).reindex(eval_idx).to_numpy()
+
+    iqm_func = lambda scores: np.array(  # noqa: E731
+        [metrics.aggregate_iqm(scores[..., frame]) for frame in range(scores.shape[-1])]
+    )
+    point_estimates, interval_estimates = rly.get_interval_estimates(score_dict, iqm_func, reps=2000)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    plot_utils.plot_sample_efficiency_curve(
+        frames,
+        point_estimates,
+        interval_estimates,
+        algorithms=algo_order,
+        xlabel="Timesteps",
+        ylabel=ylabel,
+        ax=ax,
+    )
+    ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    ax.legend(loc="best", fontsize="small")
+    fig.savefig(output_path, bbox_inches="tight", dpi=DPI)
+    print(f"Saved {output_path}")
+    plt.close(fig)
+
+
+def run_performance_profile(
+    df: pd.DataFrame, algorithms: Dict[str, AlgoSpec], metric: str, xlabel: str, output_path: Path
+) -> None:
+    score_dict = build_score_dict(df, algorithms, metric)
+    algo_order = [label for label in algorithms if score_dict[label].size > 0]
+    if not algo_order:
+        print(f"  (no data for {output_path}, skipping)")
+        return
+    score_dict = {label: score_dict[label] for label in algo_order}
+
+    all_scores = np.concatenate([scores.ravel() for scores in score_dict.values()])
+    thresholds = np.linspace(all_scores.min(), all_scores.max(), 81)
+    score_distributions, score_distributions_cis = rly.create_performance_profile(score_dict, thresholds)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    plot_utils.plot_performance_profiles(
+        score_distributions,
+        thresholds,
+        performance_profile_cis=score_distributions_cis,
+        colors=dict(zip(algo_order, sns.color_palette("colorblind", n_colors=len(algo_order)))),
+        xlabel=xlabel,
+        ax=ax,
+    )
+    ax.legend(loc="upper right", fontsize="small")
+    fig.savefig(output_path, bbox_inches="tight", dpi=DPI)
+    print(f"Saved {output_path}")
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csvs", type=Path, nargs="+", help="wandb_cache_hd64-*.csv files, one per dataset")
@@ -286,6 +406,21 @@ def main() -> None:
                     metric_col,
                     "P(X > Y)",
                     args.output_dir / f"rliable_{dataset_label}_{safe_name}_{metric_key}_poi.pdf",
+                )
+                run_efficiency_curve(
+                    df,
+                    sub_arch,
+                    algorithms,
+                    metric_col,
+                    iqm_label,
+                    args.output_dir / f"rliable_{dataset_label}_{safe_name}_{metric_key}_efficiency.pdf",
+                )
+                run_performance_profile(
+                    df,
+                    algorithms,
+                    metric_col,
+                    f"{iqm_label.removeprefix('IQM: ')} ($\\tau$)",
+                    args.output_dir / f"rliable_{dataset_label}_{safe_name}_{metric_key}_profile.pdf",
                 )
 
 
