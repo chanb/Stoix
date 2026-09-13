@@ -105,7 +105,7 @@ import numpy as np
 from flax import linen as nn
 from flax.linen.initializers import Initializer, normal, orthogonal
 
-from stoix.networks.torso_compute_transformer import TransformerBlock
+from stoix.networks.torso_compute_transformer import TransformerBlock, _norm_cls
 from stoix.networks.utils import parse_activation_fn
 
 _NEG_INF = jnp.finfo(jnp.float32).min
@@ -159,6 +159,8 @@ class _ExplicitCoTBackbone(nn.Module):
     activation: str
     kernel_init: Initializer
     use_latent_feedback: bool
+    use_sandwich_norm: bool = False
+    use_rmsnorm: bool = False
 
     def setup(self) -> None:
         self.pos_embedding = self.param(
@@ -178,7 +180,13 @@ class _ExplicitCoTBackbone(nn.Module):
         )
         self.blocks = [
             TransformerBlock(
-                self.hidden_dim, self.num_heads, self.mlp_dim, self.activation, self.kernel_init
+                self.hidden_dim,
+                self.num_heads,
+                self.mlp_dim,
+                self.activation,
+                self.kernel_init,
+                self.use_sandwich_norm,
+                self.use_rmsnorm,
             )
             for _ in range(self.num_layers)
         ]
@@ -261,6 +269,15 @@ class TransformerExplicitCoTTorso(nn.Module):
     token's bare embedding to a gated fusion of that embedding with the
     hidden state that produced it (the Full-Bandwidth Transformer's "latent
     feedback decoding", arXiv:2608.08888) - see the module docstring.
+
+    `use_sandwich_norm` is forwarded to every shared `TransformerBlock`
+    (`stoix.networks.torso_compute_transformer.TransformerBlock`) - see that
+    class's docstring for what it changes and why it matters for a
+    weight-tied, recurrent-in-depth architecture like this one.
+
+    `use_rmsnorm` switches every norm in this torso - `use_input_layer_norm`'s
+    norm on the initial token, and every norm inside the shared
+    `TransformerBlock`s - from `nn.LayerNorm` to `nn.RMSNorm`.
     """
 
     hidden_dim: int
@@ -274,6 +291,8 @@ class TransformerExplicitCoTTorso(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_input_layer_norm: bool = False
     use_latent_feedback: bool = False
+    use_sandwich_norm: bool = False
+    use_rmsnorm: bool = False
 
     @nn.compact
     def __call__(
@@ -323,7 +342,7 @@ class TransformerExplicitCoTTorso(nn.Module):
 
         initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
-            initial_token = nn.LayerNorm()(initial_token)
+            initial_token = _norm_cls(self.use_rmsnorm)()(initial_token)
 
         # See `_ExplicitCoTBackbone` for why a single shared instance (rather
         # than separately-constructed submodules per code path below) is
@@ -339,6 +358,8 @@ class TransformerExplicitCoTTorso(nn.Module):
             self.activation,
             self.kernel_init,
             self.use_latent_feedback,
+            self.use_sandwich_norm,
+            self.use_rmsnorm,
         )
 
         # Per-step "act now" legality, precomputed once as a constant boolean

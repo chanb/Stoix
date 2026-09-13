@@ -56,8 +56,21 @@ _PROB_EPS = 1e-6
 _NEG_INF = jnp.finfo(jnp.float32).min
 
 
+def _norm_cls(use_rmsnorm: bool):
+    """`nn.RMSNorm` if `use_rmsnorm` else `nn.LayerNorm` - every norm site in
+    `TransformerBlock` (and, via it,
+    `stoix.networks.torso_compute_explicit_cot`, which reuses
+    `TransformerBlock`) switches to RMSNorm when `use_rmsnorm=True`. RMSNorm
+    rescales by the root-mean-square activation only (no mean-centering, no
+    learned bias), so it's cheaper per call and, unlike LayerNorm, leaves the
+    residual stream's mean untouched - the standard swap in recurrent-depth/
+    weight-tied transformer designs that also use sandwich norm (see
+    `TransformerBlock`'s `use_sandwich_norm`)."""
+    return nn.RMSNorm if use_rmsnorm else nn.LayerNorm
+
+
 class TransformerBlock(nn.Module):
-    """A single pre-norm transformer block: self-attention + MLP.
+    """A single transformer block: self-attention + MLP, pre-norm by default.
 
     Exposes two forward modes, built on the *same* projection weights
     (`setup()`, not `@nn.compact`, specifically so both are available
@@ -81,6 +94,26 @@ class TransformerBlock(nn.Module):
     logical model - if those weights could drift apart, replay would be
     scoring a rollout against a different policy than the one that actually
     produced it, corrupting the policy gradient.
+
+    `use_sandwich_norm` (default `False`) additionally normalizes each
+    sub-layer's residual sum, not just its input - i.e. `n2(x + Attn(n1(x)))`
+    then `n4(x' + MLP(n3(x')))` instead of the plain pre-norm `x +
+    Attn(n1(x))`/`x' + MLP(n3(x'))`, matching the "sandwich" layer-norm
+    placement used in some recurrent-depth transformers (e.g. the block
+    design described in arXiv:2502.05171's section 3.2) to keep a residual
+    stream that gets reused across many weight-tied iterations - as it is
+    here, `num_layers` blocks re-applied every CoT step, up to `max_steps`
+    times, all sharing one set of weights - from drifting to ever-larger
+    magnitude the more times it's iterated. Without it, only each sub-layer's
+    *input* is normalized (standard pre-norm); the residual itself is never
+    rescaled, so the same weights have to work correctly regardless of how
+    much the accumulated residual has grown by the time they're applied
+    again.
+
+    `use_rmsnorm` (default `False`) switches every norm in this block from
+    `nn.LayerNorm` to `nn.RMSNorm` - see `_norm_cls`. Independent of
+    `use_sandwich_norm`: it only changes which norm module is used
+    everywhere it's already placed, not where norms are placed.
     """
 
     hidden_dim: int
@@ -88,6 +121,8 @@ class TransformerBlock(nn.Module):
     mlp_dim: int
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    use_sandwich_norm: bool = False
+    use_rmsnorm: bool = False
 
     def setup(self) -> None:
         assert self.hidden_dim % self.num_heads == 0, (
@@ -103,17 +138,22 @@ class TransformerBlock(nn.Module):
         self.out_proj = nn.DenseGeneral(
             features=self.hidden_dim, axis=(-2, -1), kernel_init=self.kernel_init, name="out"
         )
-        self.attn_norm = nn.LayerNorm()
-        self.mlp_norm = nn.LayerNorm()
+        norm_cls = _norm_cls(self.use_rmsnorm)
+        self.attn_norm = norm_cls()
+        self.mlp_norm = norm_cls()
         self.mlp_dense_0 = nn.Dense(self.mlp_dim, kernel_init=self.kernel_init)
         self.mlp_dense_1 = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)
+        if self.use_sandwich_norm:
+            self.attn_post_norm = norm_cls()
+            self.mlp_post_norm = norm_cls()
 
     def _mlp(self, tokens: chex.Array) -> chex.Array:
         y = self.mlp_norm(tokens)
         y = self.mlp_dense_0(y)
         y = parse_activation_fn(self.activation)(y)
         y = self.mlp_dense_1(y)
-        return tokens + y
+        y = tokens + y
+        return self.mlp_post_norm(y) if self.use_sandwich_norm else y
 
     def __call__(self, tokens: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
         y = self.attn_norm(tokens)
@@ -126,6 +166,8 @@ class TransformerBlock(nn.Module):
         weights = jax.nn.softmax(scores, axis=-1)
         attn_out = jnp.einsum("...hqk,...khd->...qhd", weights, v)
         tokens = tokens + self.out_proj(attn_out)
+        if self.use_sandwich_norm:
+            tokens = self.attn_post_norm(tokens)
         return self._mlp(tokens)
 
     def step(
@@ -162,6 +204,8 @@ class TransformerBlock(nn.Module):
         attn_out = jnp.einsum("...hk,...khd->...hd", weights, cached_values)
 
         token = token + self.out_proj(attn_out)
+        if self.use_sandwich_norm:
+            token = self.attn_post_norm(token)
         return self._mlp(token), cached_keys, cached_values
 
 
@@ -196,6 +240,8 @@ class _CoTStep(nn.Module):
     deterministic: bool
     stop_gradient_halting_input: bool = False
     halting_temperature: float = 1.0
+    use_sandwich_norm: bool = False
+    use_rmsnorm: bool = False
 
     @nn.compact
     def __call__(
@@ -226,7 +272,13 @@ class _CoTStep(nn.Module):
         )
         blocks = [
             TransformerBlock(
-                self.hidden_dim, self.num_heads, self.mlp_dim, self.activation, self.kernel_init
+                self.hidden_dim,
+                self.num_heads,
+                self.mlp_dim,
+                self.activation,
+                self.kernel_init,
+                self.use_sandwich_norm,
+                self.use_rmsnorm,
             )
             for _ in range(self.num_layers)
         ]
@@ -425,6 +477,15 @@ class TransformerChainOfThoughtTorso(nn.Module):
     it towards 0.5 (higher-entropy, more exploratory halting decisions);
     `1.0` is the standard sigmoid with no rescaling. Forwarded to the shared
     `_CoTStep`'s halting head - see that class.
+
+    `use_sandwich_norm` (default `False`) is forwarded to every shared
+    `TransformerBlock` - see that class's docstring for what it changes and
+    why it matters specifically for a weight-tied, recurrent-in-depth
+    architecture like this one.
+
+    `use_rmsnorm` (default `False`) switches every norm in this torso -
+    `use_input_layer_norm`'s norm on the initial token, and every norm inside
+    the shared `TransformerBlock`s - from `nn.LayerNorm` to `nn.RMSNorm`.
     """
 
     hidden_dim: int
@@ -439,6 +500,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
     convergence_threshold: float = 0.1
     stop_gradient_halting_input: bool = False
     halting_temperature: float = 1.0
+    use_sandwich_norm: bool = False
+    use_rmsnorm: bool = False
 
     @nn.compact
     def __call__(
@@ -493,7 +556,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         # model width.
         initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
-            initial_token = nn.LayerNorm()(initial_token)
+            initial_token = _norm_cls(self.use_rmsnorm)()(initial_token)
 
         # Pre-allocate each layer's KV-cache; positions written by
         # `_CoTStep`/`TransformerBlock.step` are set incrementally, and
@@ -537,6 +600,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
             deterministic,
             self.stop_gradient_halting_input,
             self.halting_temperature,
+            self.use_sandwich_norm,
+            self.use_rmsnorm,
         )
 
         initial_carry = (
