@@ -695,6 +695,8 @@ class Job:
     use_dpo_loss: bool
     dpo_alpha: float
     dpo_beta: float
+    use_expectile_value_loss: bool
+    expectile: float
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
@@ -770,6 +772,8 @@ class Job:
                 ppo += "-cba"
             if self.use_dpo_loss:
                 ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
+            if self.use_expectile_value_loss:
+                ppo += f"-iql{self.expectile:g}"
             parts.append(ppo)
 
         extra = []
@@ -869,6 +873,13 @@ class Job:
             cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
             cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
             cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
+            # Expectile regression for V's loss only (never Q) - both
+            # ff_ppo.py's own systems and ff_ppo_explicit_* (unlike
+            # latent_kl_coef above, same applicability as use_dpo_loss) -
+            # see stoix/utils/loss.py's expectile_loss and ff_ppo.py's/
+            # ff_ppo_explicit_cot.py's module docstrings.
+            cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
+            cmd.append(f"system.expectile={self.expectile:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
@@ -995,6 +1006,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         else:
             dpo_combos.append((False, args.dpo_alpha[0], args.dpo_beta[0]))
     dpo_combos = list(dict.fromkeys(dpo_combos))
+
+    # (use_expectile_value_loss, expectile) combos: expectile only matters
+    # (and is only swept) when use_expectile_value_loss=True, mirroring
+    # dpo_combos above. Forced to a single (False, ...) value for every
+    # non-PPO system in the main product loop below.
+    expectile_combos = []
+    for use_expectile in args.use_expectile_value_loss:
+        if use_expectile:
+            for expectile in args.expectile:
+                expectile_combos.append((True, expectile))
+        else:
+            expectile_combos.append((False, args.expectile[0]))
+    expectile_combos = list(dict.fromkeys(expectile_combos))
 
     ppo_combos = list(
         itertools.product(
@@ -1148,6 +1172,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ),
             latent_kl_coef,
             (use_dpo_loss, dpo_alpha, dpo_beta),
+            (use_expectile_value_loss, expectile),
             qv_critic,
             seed,
         ) in itertools.product(
@@ -1165,6 +1190,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ppo_combos,
             args.latent_kl_coef,
             dpo_combos,
+            expectile_combos,
             args.qv_critic,
             range(args.seeds),
         ):
@@ -1195,6 +1221,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for ff_reinforce/ff_qac_*.
             if system not in PPO_SYSTEMS:
                 use_dpo_loss, dpo_alpha, dpo_beta = False, args.dpo_alpha[0], args.dpo_beta[0]
+            # use_expectile_value_loss/expectile exist on every PPO_SYSTEMS
+            # system (same applicability as use_dpo_loss above) - forced to
+            # a non-expectile default for ff_reinforce/ff_qac_*.
+            if system not in PPO_SYSTEMS:
+                use_expectile_value_loss, expectile = False, args.expectile[0]
             # qv_critic (shared vs separate-torso Q-V critic) only exists on
             # systems with a genuine Q-V critic (QAC_SYSTEMS) - forced to the
             # first requested value for "reinforce" systems (V-only critic,
@@ -1226,6 +1257,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     use_dpo_loss=use_dpo_loss,
                     dpo_alpha=dpo_alpha,
                     dpo_beta=dpo_beta,
+                    use_expectile_value_loss=use_expectile_value_loss,
+                    expectile=expectile,
                     standardize_advantages=standardize_advantages,
                     recompute_advantages=recompute_advantages,
                     critic_before_actor=critic_before_actor,
@@ -1471,6 +1504,32 @@ def main() -> None:
         "by Lu et al. (2022)'s meta-optimisation.",
     )
     parser.add_argument(
+        "--use-expectile-value-loss",
+        default="false",
+        help="Comma-separated bools (true/false) - system.use_expectile_value_loss: whether V's "
+        "loss (only V, not Q, where it exists) uses expectile regression "
+        "(stoix.utils.loss.expectile_loss, Kostrikov et al. 2021's Implicit Q-Learning, "
+        "https://arxiv.org/abs/2110.06169) instead of PPO's clipped value loss / plain L2 (per "
+        "--clip-value-loss). False (default) recovers the original clip_value_loss/L2 "
+        "behaviour exactly. Applies to every system in PPO_SYSTEMS (both ff_ppo.py's own "
+        "systems and ff_ppo_explicit_*, same applicability as --use-dpo-loss); forced to false "
+        "for ff_reinforce/ff_qac_*, which have no such config knob.",
+    )
+    parser.add_argument(
+        "--expectile",
+        default="0.1",
+        help="Comma-separated system.expectile values - V's target expectile, only used (and "
+        "only swept) when --use-expectile-value-loss includes true - paired with it via "
+        "expectile_combos so a sweep isn't needlessly duplicated across every "
+        "use_expectile_value_loss=false job (mirrors --dpo-alpha/--use-dpo-loss). <0.5 makes V "
+        "deliberately (and persistently, not uncertainty-dependent) underestimate the return "
+        "distribution - for the Q-V systems this softens pruning of tried-but-average actions "
+        "rather than driving directed exploration, and for qac_variant='reinforce' it just "
+        "reinforces whichever action was sampled a bit more; >0.5 would make V overestimate "
+        "instead (IQL's usual direction); 0.5 recovers plain squared-error regression. Default "
+        "0.1.",
+    )
+    parser.add_argument(
         "--qv-critic",
         default="shared",
         help=f"Comma-separated subset of {{{','.join(QV_CRITIC_CHOICES)}}} - whether the critic's "
@@ -1623,6 +1682,10 @@ def main() -> None:
     ]
     args.dpo_alpha = [float(x) for x in args.dpo_alpha.split(",")]
     args.dpo_beta = [float(x) for x in args.dpo_beta.split(",")]
+    args.use_expectile_value_loss = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_expectile_value_loss.split(",")
+    ]
+    args.expectile = [float(x) for x in args.expectile.split(",")]
     args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
@@ -1711,6 +1774,10 @@ def main() -> None:
     )
     print(
         f"  use_dpo_loss={args.use_dpo_loss} dpo_alpha={args.dpo_alpha} dpo_beta={args.dpo_beta} "
+        f"(PPO systems only: {PPO_SYSTEMS})"
+    )
+    print(
+        f"  use_expectile_value_loss={args.use_expectile_value_loss} expectile={args.expectile} "
         f"(PPO systems only: {PPO_SYSTEMS})"
     )
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")

@@ -160,6 +160,23 @@ Grid axes:
                  delightful_eta is only meaningfully swept alongside delightful=True).
                  Defaults 2.0/0.6, the values found by Lu et al. (2022)'s
                  meta-optimisation. Same applicability as use_dpo_loss.
+  - use_expectile_value_loss: system.use_expectile_value_loss - whether V's loss (only
+                 V, not Q, where it exists) uses expectile regression (stoix.utils.loss.
+                 expectile_loss, Kostrikov et al. 2021's Implicit Q-Learning,
+                 https://arxiv.org/abs/2110.06169) at expectile system.expectile, instead
+                 of PPO's clipped value loss / plain L2 (per clip_value_loss above). False
+                 (default) recovers the original clip_value_loss/L2 behaviour exactly.
+                 Applies to every system in PPO_SYSTEMS, same as use_dpo_loss above.
+  - expectile: system.expectile - V's target expectile when use_expectile_value_loss=True,
+                 paired with it via expectile_combos (mirrors dpo_alpha/dpo_beta above).
+                 <0.5 makes V deliberately (and persistently, not uncertainty-dependent like
+                 real optimism-under-uncertainty exploration) underestimate the return
+                 distribution - for the Q-V systems this softens pruning of tried-but-average
+                 actions rather than driving directed exploration towards untried ones, and
+                 for qac_variant="reinforce" (no Q head) it just reinforces whichever action
+                 was sampled a bit more; >0.5 would make V overestimate instead (IQL's usual
+                 direction); 0.5 recovers plain squared-error regression. Default 0.1. Same
+                 applicability as use_expectile_value_loss.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
                  cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
@@ -308,7 +325,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -505,6 +522,17 @@ HALTING_TEMPERATURE_ARCHES = (
     "cnn+gru",
     "cnn+iru",
 ) + TRANSFORMER_ARCHES
+# Architectures whose pre_torso has a halting_hidden_dims param - only
+# TransformerChainOfThoughtTorso (TRANSFORMER_ARCHES), via its HaltingHead -
+# see stoix/networks/torso_compute_transformer.py. Unlike
+# HALTING_TEMPERATURE_ARCHES, does *not* include mlp/gru/iru/iru_unshared
+# (those torsos' halting heads are still a bare nn.Dense(1) - the MLP option
+# hasn't been added there) or EXPLICIT_COT_ARCH (TransformerExplicitCoTTorso
+# has no separate halting head at all - halting is a discrete token choice,
+# see stoix/networks/torso_compute_explicit_cot.py). Used to pick whether
+# --halting-hidden-dims is swept for a given architecture in build_grid()
+# and applied in Job.command().
+HALTING_HIDDEN_DIMS_ARCHES = TRANSFORMER_ARCHES
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
@@ -610,9 +638,12 @@ class Job:
     latent_kl_coef: float
     halting_ent_coef: float
     halting_temperature: float
+    halting_hidden_dims: Tuple[int, ...]
     use_dpo_loss: bool
     dpo_alpha: float
     dpo_beta: float
+    use_expectile_value_loss: bool
+    expectile: float
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
@@ -655,7 +686,7 @@ class Job:
         a real list of tags (see stoix/utils/logger.py) so each axis stays
         independently filterable instead of buried in one long string. Uses
         short axis prefixes (mn/mx/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/
-        iln/stdadv/radv/cba/sn/rms/dpo) rather than run_name's full field names, and
+        iln/stdadv/radv/cba/sn/rms/dpo/iql) rather than run_name's full field names, and
         ARCH_SHORT_TAG/expl/reinf abbreviations, since W&B's group field (the
         parts joined by "_", see WandBLogger) gets unwieldy at run_name's
         length otherwise. Capped at MAX_GROUP_TAG_LEN (see _cap_tag_length)
@@ -702,6 +733,8 @@ class Job:
                 ppo += "-cba"
             if self.use_dpo_loss:
                 ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
+            if self.use_expectile_value_loss:
+                ppo += f"-iql{self.expectile:g}"
             parts.append(ppo)
 
         extra = []
@@ -713,6 +746,8 @@ class Job:
             extra.append(f"hec{self.halting_ent_coef:g}")
         if self.halting_temperature != 1.0:
             extra.append(f"ht{self.halting_temperature:g}")
+        if self.halting_hidden_dims:
+            extra.append(f"hh{'x'.join(str(d) for d in self.halting_hidden_dims)}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}")
         if self.critic_weight_decay:
@@ -818,6 +853,13 @@ class Job:
             cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
             cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
             cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
+            # Expectile regression for V's loss only (never Q) - both
+            # ff_ppo.py's own systems and ff_ppo_explicit_* (same
+            # applicability as halting_ent_coef/use_dpo_loss above) - see
+            # stoix/utils/loss.py's expectile_loss and ff_ppo.py's/
+            # ff_ppo_explicit_cot.py's module docstrings.
+            cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
+            cmd.append(f"system.expectile={self.expectile:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
@@ -904,6 +946,15 @@ class Job:
             # for these architectures already declares halting_temperature
             # (plain `=`, not `++`); no such param on EXPLICIT_COT_ARCH yet.
             cmd.append(f"network.actor_network.pre_torso.halting_temperature={self.halting_temperature:g}")
+        if self.arch in HALTING_HIDDEN_DIMS_ARCHES:
+            # Hidden layer widths of the halting head's MLP - () (default) is
+            # a bare linear readout (the original nn.Dense(1) design), a
+            # non-empty tuple gives it that many Dense+activation hidden
+            # layers first - see
+            # stoix.networks.torso_compute_transformer.HaltingHead. `++`:
+            # not declared in the yaml (new param).
+            dims = ",".join(str(d) for d in self.halting_hidden_dims)
+            cmd.append(f"++network.actor_network.pre_torso.halting_hidden_dims=[{dims}]")
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
         if self.arch not in CNN_ARCHES:
@@ -963,6 +1014,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         else:
             dpo_combos.append((False, args.dpo_alpha[0], args.dpo_beta[0]))
     dpo_combos = list(dict.fromkeys(dpo_combos))
+
+    # (use_expectile_value_loss, expectile) combos: expectile only matters
+    # (and is only swept) when use_expectile_value_loss=True, mirroring
+    # dpo_combos above. Forced to a single (False, ...) value for every
+    # non-PPO system in the main product loop below.
+    expectile_combos = []
+    for use_expectile in args.use_expectile_value_loss:
+        if use_expectile:
+            for expectile in args.expectile:
+                expectile_combos.append((True, expectile))
+        else:
+            expectile_combos.append((False, args.expectile[0]))
+    expectile_combos = list(dict.fromkeys(expectile_combos))
 
     # (epochs, num_minibatches, clip_eps, clip_value_loss, gae_lambda,
     # standardize_advantages, recompute_advantages, critic_before_actor) combos:
@@ -1160,7 +1224,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         latent_kl_coef,
         halting_ent_coef,
         halting_temperature,
+        halting_hidden_dims,
         (use_dpo_loss, dpo_alpha, dpo_beta),
+        (use_expectile_value_loss, expectile),
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -1178,7 +1244,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.latent_kl_coef,
         args.halting_ent_coef,
         args.halting_temperature,
+        args.halting_hidden_dims,
         dpo_combos,
+        expectile_combos,
         range(args.seeds),
     ):
         # Neither axis applies to both kinds of system at once (see
@@ -1214,11 +1282,21 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         # non-DPO default for ff_reinforce/ff_qac_*.
         if system not in PPO_SYSTEMS:
             use_dpo_loss, dpo_alpha, dpo_beta = False, args.dpo_alpha[0], args.dpo_beta[0]
+        # use_expectile_value_loss/expectile exist on every PPO_SYSTEMS
+        # system (same applicability as halting_ent_coef/use_dpo_loss above)
+        # - forced to a non-expectile default for ff_reinforce/ff_qac_*.
+        if system not in PPO_SYSTEMS:
+            use_expectile_value_loss, expectile = False, args.expectile[0]
         # halting_temperature only exists on HALTING_TEMPERATURE_ARCHES -
         # forced to the first requested value (default 1.0, a no-op) for
         # every other architecture.
         if arch not in HALTING_TEMPERATURE_ARCHES:
             halting_temperature = args.halting_temperature[0]
+        # halting_hidden_dims only exists on HALTING_HIDDEN_DIMS_ARCHES -
+        # forced to the first requested value (default (), a no-op) for
+        # every other architecture.
+        if arch not in HALTING_HIDDEN_DIMS_ARCHES:
+            halting_hidden_dims = args.halting_hidden_dims[0]
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         jobs.append(
@@ -1245,9 +1323,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 latent_kl_coef=latent_kl_coef,
                 halting_ent_coef=halting_ent_coef,
                 halting_temperature=halting_temperature,
+                halting_hidden_dims=halting_hidden_dims,
                 use_dpo_loss=use_dpo_loss,
                 dpo_alpha=dpo_alpha,
                 dpo_beta=dpo_beta,
+                use_expectile_value_loss=use_expectile_value_loss,
+                expectile=expectile,
                 standardize_advantages=standardize_advantages,
                 recompute_advantages=recompute_advantages,
                 critic_before_actor=critic_before_actor,
@@ -1589,6 +1670,32 @@ def main() -> None:
         "by Lu et al. (2022)'s meta-optimisation.",
     )
     parser.add_argument(
+        "--use-expectile-value-loss",
+        default="false",
+        help="Comma-separated bools (true/false) - system.use_expectile_value_loss: whether V's "
+        "loss (only V, not Q, where it exists) uses expectile regression "
+        "(stoix.utils.loss.expectile_loss, Kostrikov et al. 2021's Implicit Q-Learning, "
+        "https://arxiv.org/abs/2110.06169) instead of PPO's clipped value loss / plain L2 (per "
+        "--clip-value-loss). False (default) recovers the original clip_value_loss/L2 "
+        "behaviour exactly. Applies to every system in PPO_SYSTEMS (both ff_ppo.py's own "
+        "systems and ff_ppo_explicit_*, same applicability as --use-dpo-loss); forced to false "
+        "for ff_reinforce/ff_qac_*, which have no such config knob.",
+    )
+    parser.add_argument(
+        "--expectile",
+        default="0.1",
+        help="Comma-separated system.expectile values - V's target expectile, only used (and "
+        "only swept) when --use-expectile-value-loss includes true - paired with it via "
+        "expectile_combos so a sweep isn't needlessly duplicated across every "
+        "use_expectile_value_loss=false job (mirrors --dpo-alpha/--use-dpo-loss). <0.5 makes V "
+        "deliberately (and persistently, not uncertainty-dependent) underestimate the return "
+        "distribution - for the Q-V systems this softens pruning of tried-but-average actions "
+        "rather than driving directed exploration, and for qac_variant='reinforce' it just "
+        "reinforces whichever action was sampled a bit more; >0.5 would make V overestimate "
+        "instead (IQL's usual direction); 0.5 recovers plain squared-error regression. Default "
+        "0.1.",
+    )
+    parser.add_argument(
         "--halting-temperature",
         default="1.0",
         help="Comma-separated network.actor_network.pre_torso.halting_temperature values - "
@@ -1602,6 +1709,21 @@ def main() -> None:
         "(forced to the first value) "
         "for every other architecture. A no-op whenever min_steps == max_steps (halting is "
         "always forced, so the halting head is never actually queried for a decision).",
+    )
+    parser.add_argument(
+        "--halting-hidden-dims",
+        default="none",
+        help="Comma-separated network.actor_network.pre_torso.halting_hidden_dims values - "
+        "hidden layer widths of the halting head's MLP (see "
+        "stoix.networks.torso_compute_transformer.HaltingHead), each value itself an "
+        "'x'-joined tuple of layer widths, e.g. '--halting-hidden-dims none,64,128x128' sweeps "
+        "a bare linear readout (the original design), one 64-unit hidden layer, and two "
+        "128-unit hidden layers. 'none' (default) or an empty string means a bare linear "
+        "readout - the original nn.Dense(1) design, a no-op. Only applies to architecture in "
+        "{transformer, cnn+transformer} (HALTING_HIDDEN_DIMS_ARCHES) - unlike "
+        "--halting-temperature, does *not* apply to mlp/gru/iru/iru_unshared (their halting "
+        "heads don't have this option yet); ignored (forced to the first value) for every "
+        "other architecture.",
     )
     parser.add_argument(
         "--use-layer-norm",
@@ -1832,7 +1954,15 @@ def main() -> None:
     ]
     args.dpo_alpha = [float(x) for x in args.dpo_alpha.split(",")]
     args.dpo_beta = [float(x) for x in args.dpo_beta.split(",")]
+    args.use_expectile_value_loss = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_expectile_value_loss.split(",")
+    ]
+    args.expectile = [float(x) for x in args.expectile.split(",")]
     args.halting_temperature = [float(x) for x in args.halting_temperature.split(",")]
+    args.halting_hidden_dims = [
+        () if part.strip().lower() in ("", "none") else tuple(int(d) for d in part.split("x"))
+        for part in args.halting_hidden_dims.split(",")
+    ]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")
@@ -1957,8 +2087,16 @@ def main() -> None:
         f"(PPO systems only: {PPO_SYSTEMS})"
     )
     print(
+        f"  use_expectile_value_loss={args.use_expectile_value_loss} expectile={args.expectile} "
+        f"(PPO systems only: {PPO_SYSTEMS})"
+    )
+    print(
         f"  halting_temperature={args.halting_temperature} "
         f"(HALTING_TEMPERATURE_ARCHES only: {HALTING_TEMPERATURE_ARCHES})"
+    )
+    print(
+        f"  halting_hidden_dims={args.halting_hidden_dims} "
+        f"(HALTING_HIDDEN_DIMS_ARCHES only: {HALTING_HIDDEN_DIMS_ARCHES})"
     )
     print(
         f"  use_layer_norm={args.use_layer_norm} (mlp/cnn+mlp only) "

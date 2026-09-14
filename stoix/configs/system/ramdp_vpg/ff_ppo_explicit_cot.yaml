@@ -56,7 +56,24 @@ clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"
   # PPO-style clipping against the old value/Q estimate recorded at rollout time
   # (stoix.utils.loss.clipped_value_loss), or plain L2 regression to the target instead
   # (rlax.l2_loss, as in ff_reinforce.py/ff_qac.py). Only affects the critic - the actor's
-  # ratio is always clipped regardless of this setting.
+  # ratio is always clipped regardless of this setting. Ignored for V (not Q) when
+  # use_expectile_value_loss=True, which takes over V's loss regardless of this flag.
+use_expectile_value_loss: False # Whether V's loss (only V - Q, where it exists, still uses
+  # clip_value_loss/plain L2 above) uses expectile regression (stoix.utils.loss.expectile_loss,
+  # as in Kostrikov et al. 2021's Implicit Q-Learning, https://arxiv.org/abs/2110.06169) at
+  # expectile `expectile` below, instead of PPO's clipped value loss / plain L2. False (default)
+  # recovers the original clip_value_loss/L2 behaviour exactly. See ff_ppo.py's module docstring
+  # for the caveats: a fixed expectile below 0.5 makes V deliberately (and persistently, not
+  # uncertainty-dependent like real optimism-under-uncertainty exploration) underestimate the
+  # return distribution - for the Q-V variants this mostly softens how aggressively
+  # tried-but-average actions get pruned, not directed exploration towards untried ones; for
+  # qac_variant="reinforce" (no Q head) there is no per-action information in the loss at all,
+  # so it just reinforces whichever action was sampled a bit more.
+expectile: 0.1 # V's target expectile when use_expectile_value_loss=True (ignored otherwise).
+  # < 0.5 makes V converge to a lower expectile of the return distribution than its
+  # conditional mean (deliberately pessimistic); > 0.5 would instead make it optimistic
+  # (IQL's usual direction); 0.5 recovers plain squared-error regression. See
+  # stoix.utils.loss.expectile_loss and ff_ppo.py's module docstring.
 ent_coef: 0.01 # Entropy regularisation term for the environment action's distribution.
 halting_ent_coef: 0.0 # Entropy regularisation term for the CoT-step distribution's own
   # entropy (thought tokens and the halting "act now" class together - there's no separate

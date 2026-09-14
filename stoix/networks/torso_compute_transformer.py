@@ -209,6 +209,30 @@ class TransformerBlock(nn.Module):
         return self._mlp(token), cached_keys, cached_values
 
 
+class HaltingHead(nn.Module):
+    """Maps a "thought" to a single halting logit.
+
+    `hidden_dims=()` (the default) is a bare linear readout - the original
+    design, and still what every existing config gets. A non-empty
+    `hidden_dims` instead runs the input through that many `Dense +
+    activation` hidden layers (each of the corresponding width) before the
+    final linear readout to logit space, giving the halting decision a
+    nonlinear MLP instead of a single linear projection of the shared
+    transformer state.
+    """
+
+    hidden_dims: Tuple[int, ...] = ()
+    activation: str = "relu"
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+
+    @nn.compact
+    def __call__(self, x: chex.Array) -> chex.Array:
+        for dim in self.hidden_dims:
+            x = nn.Dense(dim, kernel_init=self.kernel_init)(x)
+            x = parse_activation_fn(self.activation)(x)
+        return nn.Dense(1, kernel_init=self.kernel_init)(x)
+
+
 class _CoTStep(nn.Module):
     """One CoT step, meant to be lifted into a weight-tied loop via `nn.scan`.
 
@@ -240,6 +264,7 @@ class _CoTStep(nn.Module):
     deterministic: bool
     stop_gradient_halting_input: bool = False
     halting_temperature: float = 1.0
+    halting_hidden_dims: Tuple[int, ...] = ()
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
 
@@ -282,7 +307,9 @@ class _CoTStep(nn.Module):
             )
             for _ in range(self.num_layers)
         ]
-        halting_head = nn.Dense(1, kernel_init=self.kernel_init)
+        halting_head = HaltingHead(
+            self.halting_hidden_dims, self.activation, self.kernel_init
+        )
 
         x = current_token + pos_embedding[step_idx]
         new_cached_keys = []
@@ -478,6 +505,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `1.0` is the standard sigmoid with no rescaling. Forwarded to the shared
     `_CoTStep`'s halting head - see that class.
 
+    `halting_hidden_dims` (default `()`, a bare linear readout) sets the
+    hidden layer widths of the halting head's MLP - e.g. `(64,)` for one
+    ReLU hidden layer before the final linear logit. Uses `activation` for
+    the hidden layers. See `HaltingHead`.
+
     `use_sandwich_norm` (default `False`) is forwarded to every shared
     `TransformerBlock` - see that class's docstring for what it changes and
     why it matters specifically for a weight-tied, recurrent-in-depth
@@ -500,6 +532,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     convergence_threshold: float = 0.1
     stop_gradient_halting_input: bool = False
     halting_temperature: float = 1.0
+    halting_hidden_dims: Tuple[int, ...] = ()
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
 
@@ -600,6 +633,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             deterministic,
             self.stop_gradient_halting_input,
             self.halting_temperature,
+            self.halting_hidden_dims,
             self.use_sandwich_norm,
             self.use_rmsnorm,
         )

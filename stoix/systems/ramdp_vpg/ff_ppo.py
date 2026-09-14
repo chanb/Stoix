@@ -134,6 +134,31 @@ and Q for "naive"/"fac") is trained with PPO's own clipped value loss
 recorded at rollout time by default, or with plain L2 regression
 (`rlax.l2_loss`) when `config.system.clip_value_loss=False`.
 
+Optionally (`config.system.use_expectile_value_loss=True`), V's loss (only
+V - Q, where it exists, is left as configured by `clip_value_loss` above)
+instead uses expectile regression (`stoix.utils.loss.expectile_loss`, as in
+Kostrikov et al. 2021's Implicit Q-Learning) at expectile
+`config.system.expectile`. With `expectile < 0.5` this makes V converge to a
+*lower* expectile of the return distribution than plain L2 regression's
+conditional mean - i.e. V deliberately underestimates - which biases the
+advantage (`Q - V` or `targets - V`) positive more often. This is *not*
+optimism-under-uncertainty exploration in the UCB/optimistic-initialization
+sense: that requires the bias to be uncertainty-dependent and shrink as a
+given state/action gets visited, which a fixed `expectile` does not do (it
+underestimates by roughly the same amount everywhere, indefinitely) - and
+for `qac_variant="reinforce"` (no Q head, `advantage = targets - V(s)`)
+there is no per-action information in the loss at all, so a lower V just
+reinforces whichever action was actually sampled a bit more, with no
+preference for untried alternatives. For the Q-V variants, where Q *does*
+carry genuine per-action signal, the more accurate framing is "prune tried,
+merely-average actions less aggressively": actions whose real Q sits just
+below an honest V no longer get penalized once V is deliberately deflated
+below them, so the actor stops suppressing them - a softer failure mode than
+directed exploration, but one that can still slow premature policy collapse.
+`expectile=0.5` recovers plain (unweighted) squared-error
+regression to the same target `clip_value_loss=False` would, just without
+the old-estimate clip.
+
 The entropy bonus itself has two independent terms: `config.system.ent_coef`
 on the environment action's distribution entropy (`actor_policy.entropy()`,
 as in any PPO), and `config.system.halting_ent_coef` on the halting
@@ -235,7 +260,13 @@ from stoix.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from stoix.utils.logger import LogEvent, StoixLogger
-from stoix.utils.loss import clipped_value_loss, dpo_loss, dpo_surrogate, ppo_clip_loss
+from stoix.utils.loss import (
+    clipped_value_loss,
+    dpo_loss,
+    dpo_surrogate,
+    expectile_loss,
+    ppo_clip_loss,
+)
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
@@ -313,10 +344,15 @@ def get_learner_fn(
         return q_sa  # "cond_naive"
 
     def _value_loss_fn(
-        pred: chex.Array, behavior: chex.Array, targets: chex.Array
+        pred: chex.Array, behavior: chex.Array, targets: chex.Array, use_expectile: bool = False
     ) -> chex.Array:
-        """PPO's clipped value loss against `behavior`, or plain L2 to
-        `targets`, per `config.system.clip_value_loss`."""
+        """PPO's clipped value loss against `behavior`, plain L2 to
+        `targets`, or (when `use_expectile=True` - only ever passed for V,
+        never Q, see `config.system.use_expectile_value_loss` and the module
+        docstring) expectile regression to `targets`
+        (`stoix.utils.loss.expectile_loss`) at `config.system.expectile`."""
+        if use_expectile:
+            return expectile_loss(pred, targets, config.system.expectile)
         if config.system.clip_value_loss:
             return clipped_value_loss(pred, behavior, targets, config.system.clip_eps)
         return rlax.l2_loss(pred, targets).mean()
@@ -594,7 +630,12 @@ def get_learner_fn(
             the joint `_update_minibatch` below for the full explanation)."""
             if is_qac:
                 value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
-                value_loss = _value_loss_fn(value, traj_batch.value, targets)
+                value_loss = _value_loss_fn(
+                    value,
+                    traj_batch.value,
+                    targets,
+                    use_expectile=config.system.use_expectile_value_loss,
+                )
 
                 q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
                 if qac_variant == "fac":
@@ -613,7 +654,12 @@ def get_learner_fn(
                 loss_info = {"value_loss": value_loss, "q_loss": q_loss}
             else:  # "reinforce"
                 value = critic_apply_fn(critic_params, traj_batch.obs)
-                value_loss = _value_loss_fn(value, traj_batch.value, targets)
+                value_loss = _value_loss_fn(
+                    value,
+                    traj_batch.value,
+                    targets,
+                    use_expectile=config.system.use_expectile_value_loss,
+                )
 
                 critic_total_loss = config.system.vf_coef * value_loss
                 loss_info = {"value_loss": value_loss}
@@ -972,7 +1018,12 @@ def get_learner_fn(
                     """Calculate the critic loss."""
                     if is_qac:
                         value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
-                        value_loss = _value_loss_fn(value, traj_batch.value, targets)
+                        value_loss = _value_loss_fn(
+                            value,
+                            traj_batch.value,
+                            targets,
+                            use_expectile=config.system.use_expectile_value_loss,
+                        )
 
                         q_output = _q_output(
                             critic_params, traj_batch.obs, traj_batch.compute_time
@@ -1006,7 +1057,12 @@ def get_learner_fn(
                         }
                     else:  # "reinforce"
                         value = critic_apply_fn(critic_params, traj_batch.obs)
-                        value_loss = _value_loss_fn(value, traj_batch.value, targets)
+                        value_loss = _value_loss_fn(
+                            value,
+                            traj_batch.value,
+                            targets,
+                            use_expectile=config.system.use_expectile_value_loss,
+                        )
 
                         critic_total_loss = config.system.vf_coef * value_loss
                         loss_info = {

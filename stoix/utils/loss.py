@@ -81,6 +81,29 @@ def dpo_loss(
     return dpo_surrogate(pi_log_prob_t, b_pi_log_prob_t, gae_t, alpha, beta).mean()
 
 
+def expectile_loss(
+    pred_t: chex.Array, target_t: chex.Array, expectile: float
+) -> chex.Array:
+    """Expectile regression loss (Kostrikov et al., 2021, "Offline
+    Reinforcement Learning with Implicit Q-Learning", https://arxiv.org/abs/
+    2110.06169) - an asymmetrically-weighted squared error that makes `pred_t`
+    converge to the `expectile`-th expectile of `target_t`'s conditional
+    distribution, rather than plain L2's conditional mean (`expectile=0.5`
+    recovers unweighted squared error exactly).
+
+    `diff = target_t - pred_t` is weighted by `expectile` when positive
+    (target above the current prediction) and by `1 - expectile` when
+    negative (prediction above target). `expectile > 0.5` therefore penalizes
+    "prediction too low" less than "prediction too high", pulling `pred_t` up
+    towards an *upper* expectile (IQL's use, approximating a soft max over
+    actions); `expectile < 0.5` does the opposite, pulling `pred_t` down
+    towards a *lower* expectile - deliberately biasing it below the
+    conditional mean."""
+    diff = target_t - pred_t
+    weight = jnp.where(diff > 0, expectile, 1.0 - expectile)
+    return (weight * jnp.square(diff)).mean()
+
+
 def clipped_value_loss(
     pred_value_t: chex.Array, behavior_value_t: chex.Array, targets_t: chex.Array, epsilon: float
 ) -> chex.Array:
