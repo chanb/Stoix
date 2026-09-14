@@ -42,7 +42,16 @@ gae_lambda: 1.0 # GAE(lambda) mixing parameter for the critic's regression targe
   # for "reinforce", whose advantage is `targets - V(s)`, this makes the
   # advantage itself GAE(lambda) rather than the n-step-to-end special case.
 clip_eps: 0.2 # Clipping value for the PPO actor ratio, and for the critic's value/Q loss
-  # when clip_value_loss=True.
+  # when clip_value_loss=True. Ignored for the actor ratio (env action and CoT-step surrogates)
+  # when use_dpo_loss=True - still used for the critic's value/Q loss regardless.
+use_dpo_loss: False # Whether the env-action and CoT-step actor surrogates use Discovered Policy
+  # Optimisation (stoix.utils.loss.dpo_loss/dpo_surrogate, Lu et al. 2022,
+  # https://arxiv.org/abs/2210.05639) instead of PPO's clipped surrogate (stoix.utils.loss.
+  # ppo_clip_loss). False (default) recovers the original ppo_clip_loss behaviour exactly.
+dpo_alpha: 2.0 # DPO's alpha (positive-advantage drift coefficient) - only used when
+  # use_dpo_loss=True. 2.0 is the value found by Lu et al. (2022)'s meta-optimisation.
+dpo_beta: 0.6 # DPO's beta (negative-advantage drift coefficient) - only used when
+  # use_dpo_loss=True. 0.6 is the value found by Lu et al. (2022)'s meta-optimisation.
 clip_value_loss: True # Whether the critic's value loss (and Q loss, for "naive"/"fac") uses
   # PPO-style clipping against the old value/Q estimate recorded at rollout time
   # (stoix.utils.loss.clipped_value_loss), or plain L2 regression to the target instead

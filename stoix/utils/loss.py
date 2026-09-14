@@ -47,13 +47,20 @@ def ppo_penalty_loss(
     return loss_actor, kl_div
 
 
-def dpo_loss(
+def dpo_surrogate(
     pi_log_prob_t: chex.Array,
     b_pi_log_prob_t: chex.Array,
     gae_t: chex.Array,
     alpha: float,
     beta: float,
 ) -> chex.Array:
+    """Unreduced per-element Discovered Policy Optimisation (DPO) surrogate
+    loss (Lu et al., 2022, https://arxiv.org/abs/2210.05639) - `dpo_loss`
+    below is just `.mean()` of this. Exposed separately so a caller that
+    needs a *masked* mean (e.g. over per-step decisions that are only valid
+    up to each example's own trajectory length, as in ff_ppo.py's
+    halting/CoT-step loss) can reduce it themselves instead of averaging over
+    every element unconditionally."""
     log_diff = pi_log_prob_t - b_pi_log_prob_t
     ratio = jnp.exp(log_diff)
     is_pos = (gae_t >= 0.0).astype(jnp.float32)
@@ -61,8 +68,17 @@ def dpo_loss(
     drift1 = jax.nn.relu(r1 * gae_t - alpha * jax.nn.tanh(r1 * gae_t / alpha))
     drift2 = jax.nn.relu(log_diff * gae_t - beta * jax.nn.tanh(log_diff * gae_t / beta))
     drift = drift1 * is_pos + drift2 * (1 - is_pos)
-    loss_actor = -(ratio * gae_t - drift).mean()
-    return loss_actor
+    return -(ratio * gae_t - drift)
+
+
+def dpo_loss(
+    pi_log_prob_t: chex.Array,
+    b_pi_log_prob_t: chex.Array,
+    gae_t: chex.Array,
+    alpha: float,
+    beta: float,
+) -> chex.Array:
+    return dpo_surrogate(pi_log_prob_t, b_pi_log_prob_t, gae_t, alpha, beta).mean()
 
 
 def clipped_value_loss(

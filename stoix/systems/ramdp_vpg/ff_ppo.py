@@ -235,7 +235,7 @@ from stoix.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from stoix.utils.logger import LogEvent, StoixLogger
-from stoix.utils.loss import clipped_value_loss, ppo_clip_loss
+from stoix.utils.loss import clipped_value_loss, dpo_loss, dpo_surrogate, ppo_clip_loss
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
@@ -494,9 +494,18 @@ def get_learner_fn(
             )
             env_log_prob = actor_policy.log_prob(traj_batch.action)
 
-            action_loss = ppo_clip_loss(
-                env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
-            )
+            if config.system.use_dpo_loss:
+                action_loss = dpo_loss(
+                    env_log_prob,
+                    traj_batch.env_log_prob,
+                    advantage,
+                    config.system.dpo_alpha,
+                    config.system.dpo_beta,
+                )
+            else:
+                action_loss = ppo_clip_loss(
+                    env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
+                )
             action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
             action_clip_fraction = jnp.mean(
                 (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
@@ -509,17 +518,24 @@ def get_learner_fn(
 
             halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
             advantage_per_step = advantage[..., None]
-            halting_surrogate1 = halting_ratio * advantage_per_step
-            halting_surrogate2 = (
-                jnp.clip(
-                    halting_ratio, 1.0 - config.system.clip_eps, 1.0 + config.system.clip_eps
+            if config.system.use_dpo_loss:
+                halting_per_step_loss = dpo_surrogate(
+                    halting_log_prob,
+                    traj_batch.halting_log_prob,
+                    advantage_per_step,
+                    config.system.dpo_alpha,
+                    config.system.dpo_beta,
                 )
-                * advantage_per_step
-            )
-            halting_loss = (
-                jnp.sum(-jnp.minimum(halting_surrogate1, halting_surrogate2) * valid_step)
-                / num_valid_steps
-            )
+            else:
+                halting_surrogate1 = halting_ratio * advantage_per_step
+                halting_surrogate2 = (
+                    jnp.clip(
+                        halting_ratio, 1.0 - config.system.clip_eps, 1.0 + config.system.clip_eps
+                    )
+                    * advantage_per_step
+                )
+                halting_per_step_loss = -jnp.minimum(halting_surrogate1, halting_surrogate2)
+            halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
             halting_clip_fraction = (
                 jnp.sum(
                     (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
@@ -820,9 +836,18 @@ def get_learner_fn(
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
 
-                    action_loss = ppo_clip_loss(
-                        env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
-                    )
+                    if config.system.use_dpo_loss:
+                        action_loss = dpo_loss(
+                            env_log_prob,
+                            traj_batch.env_log_prob,
+                            advantage,
+                            config.system.dpo_alpha,
+                            config.system.dpo_beta,
+                        )
+                    else:
+                        action_loss = ppo_clip_loss(
+                            env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
+                        )
                     action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
                     action_clip_fraction = jnp.mean(
                         (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(
@@ -849,26 +874,33 @@ def get_learner_fn(
 
                     halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
                     advantage_per_step = advantage[..., None]
-                    halting_surrogate1 = halting_ratio * advantage_per_step
-                    halting_surrogate2 = (
-                        jnp.clip(
-                            halting_ratio,
-                            1.0 - config.system.clip_eps,
-                            1.0 + config.system.clip_eps,
+                    if config.system.use_dpo_loss:
+                        halting_per_step_loss = dpo_surrogate(
+                            halting_log_prob,
+                            traj_batch.halting_log_prob,
+                            advantage_per_step,
+                            config.system.dpo_alpha,
+                            config.system.dpo_beta,
                         )
-                        * advantage_per_step
-                    )
+                    else:
+                        halting_surrogate1 = halting_ratio * advantage_per_step
+                        halting_surrogate2 = (
+                            jnp.clip(
+                                halting_ratio,
+                                1.0 - config.system.clip_eps,
+                                1.0 + config.system.clip_eps,
+                            )
+                            * advantage_per_step
+                        )
+                        halting_per_step_loss = -jnp.minimum(
+                            halting_surrogate1, halting_surrogate2
+                        )
                     # Masked mean over every pondering step actually taken
                     # across the whole minibatch (not a per-example mean
                     # averaged over examples), so trajectories with more
                     # valid steps don't get down-weighted relative to
                     # shorter ones.
-                    halting_loss = (
-                        jnp.sum(
-                            -jnp.minimum(halting_surrogate1, halting_surrogate2) * valid_step
-                        )
-                        / num_valid_steps
-                    )
+                    halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
                     halting_clip_fraction = (
                         jnp.sum(
                             (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(

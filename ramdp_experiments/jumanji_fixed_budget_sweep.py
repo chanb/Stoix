@@ -692,6 +692,9 @@ class Job:
     clip_value_loss: bool
     gae_lambda: float
     latent_kl_coef: float
+    use_dpo_loss: bool
+    dpo_alpha: float
+    dpo_beta: float
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
@@ -765,6 +768,8 @@ class Job:
                 ppo += "-radv"
             if self.critic_before_actor:
                 ppo += "-cba"
+            if self.use_dpo_loss:
+                ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
             parts.append(ppo)
 
         extra = []
@@ -856,6 +861,14 @@ class Job:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
                 cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
+            # Discovered Policy Optimisation actor surrogate - both ff_ppo.py's
+            # own systems and ff_ppo_explicit_* (unlike latent_kl_coef above,
+            # which only exists on ff_ppo.py's continuous "thought" states) -
+            # see stoix/utils/loss.py's dpo_loss/dpo_surrogate and
+            # ff_ppo.py's/ff_ppo_explicit_cot.py's module docstrings.
+            cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
+            cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
+            cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
@@ -968,6 +981,20 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         else:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
+
+    # (use_dpo_loss, dpo_alpha, dpo_beta) combos: alpha/beta only matter (and
+    # are only swept) when use_dpo_loss=True, mirroring delightful_combos
+    # above. Forced to a single (False, ..., ...) value for every non-PPO
+    # system in the main product loop below.
+    dpo_combos = []
+    for use_dpo in args.use_dpo_loss:
+        if use_dpo:
+            for alpha in args.dpo_alpha:
+                for beta in args.dpo_beta:
+                    dpo_combos.append((True, alpha, beta))
+        else:
+            dpo_combos.append((False, args.dpo_alpha[0], args.dpo_beta[0]))
+    dpo_combos = list(dict.fromkeys(dpo_combos))
 
     ppo_combos = list(
         itertools.product(
@@ -1120,6 +1147,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_before_actor,
             ),
             latent_kl_coef,
+            (use_dpo_loss, dpo_alpha, dpo_beta),
             qv_critic,
             seed,
         ) in itertools.product(
@@ -1136,6 +1164,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
+            dpo_combos,
             args.qv_critic,
             range(args.seeds),
         ):
@@ -1160,6 +1189,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for every other system (including explicit-CoT PPO systems).
             if system not in LATENT_KL_PPO_SYSTEMS:
                 latent_kl_coef = args.latent_kl_coef[0]
+            # use_dpo_loss/dpo_alpha/dpo_beta exist on every PPO_SYSTEMS
+            # system (unlike latent_kl_coef above, both ff_ppo.py's own
+            # systems and ff_ppo_explicit_*) - forced to a non-DPO default
+            # for ff_reinforce/ff_qac_*.
+            if system not in PPO_SYSTEMS:
+                use_dpo_loss, dpo_alpha, dpo_beta = False, args.dpo_alpha[0], args.dpo_beta[0]
             # qv_critic (shared vs separate-torso Q-V critic) only exists on
             # systems with a genuine Q-V critic (QAC_SYSTEMS) - forced to the
             # first requested value for "reinforce" systems (V-only critic,
@@ -1188,6 +1223,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     clip_value_loss=clip_value_loss,
                     gae_lambda=gae_lambda,
                     latent_kl_coef=latent_kl_coef,
+                    use_dpo_loss=use_dpo_loss,
+                    dpo_alpha=dpo_alpha,
+                    dpo_beta=dpo_beta,
                     standardize_advantages=standardize_advantages,
                     recompute_advantages=recompute_advantages,
                     critic_before_actor=critic_before_actor,
@@ -1406,6 +1444,33 @@ def main() -> None:
         "only (LATENT_KL_PPO_SYSTEMS), not ff_ppo_explicit_*.",
     )
     parser.add_argument(
+        "--use-dpo-loss",
+        default="false",
+        help="Comma-separated bools (true/false) - system.use_dpo_loss: whether the env-action "
+        "actor surrogate uses Discovered Policy Optimisation (stoix.utils.loss.dpo_loss/"
+        "dpo_surrogate, Lu et al. 2022, https://arxiv.org/abs/2210.05639) instead of PPO's "
+        "clipped surrogate (stoix.utils.loss.ppo_clip_loss). False (default) recovers the "
+        "original ppo_clip_loss behaviour exactly. Applies to every system in PPO_SYSTEMS (both "
+        "ff_ppo.py's own systems and ff_ppo_explicit_*, unlike --latent-kl-coef above); forced "
+        "to false for ff_reinforce/ff_qac_*, which have no such config knob.",
+    )
+    parser.add_argument(
+        "--dpo-alpha",
+        default="2.0",
+        help="Comma-separated system.dpo_alpha values - DPO's positive-advantage drift "
+        "coefficient, only used (and only swept) when --use-dpo-loss includes true - paired "
+        "with --use-dpo-loss/--dpo-beta via dpo_combos so a sweep isn't needlessly duplicated "
+        "across every use_dpo_loss=false job (mirrors --delightful-eta/--delightful). Default "
+        "2.0, the value found by Lu et al. (2022)'s meta-optimisation.",
+    )
+    parser.add_argument(
+        "--dpo-beta",
+        default="0.6",
+        help="Comma-separated system.dpo_beta values - DPO's negative-advantage drift "
+        "coefficient, same applicability/pairing as --dpo-alpha. Default 0.6, the value found "
+        "by Lu et al. (2022)'s meta-optimisation.",
+    )
+    parser.add_argument(
         "--qv-critic",
         default="shared",
         help=f"Comma-separated subset of {{{','.join(QV_CRITIC_CHOICES)}}} - whether the critic's "
@@ -1553,6 +1618,11 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
+    args.use_dpo_loss = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_dpo_loss.split(",")
+    ]
+    args.dpo_alpha = [float(x) for x in args.dpo_alpha.split(",")]
+    args.dpo_beta = [float(x) for x in args.dpo_beta.split(",")]
     args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
@@ -1638,6 +1708,10 @@ def main() -> None:
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
+    )
+    print(
+        f"  use_dpo_loss={args.use_dpo_loss} dpo_alpha={args.dpo_alpha} dpo_beta={args.dpo_beta} "
+        f"(PPO systems only: {PPO_SYSTEMS})"
     )
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator}")

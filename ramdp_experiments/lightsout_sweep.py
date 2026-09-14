@@ -147,6 +147,19 @@ Grid axes:
                  ff_ppo_explicit_cot.py's module docstrings. Applies to every system in
                  PPO_SYSTEMS (unlike latent_kl_coef above, both ff_ppo.py's own systems
                  and ff_ppo_explicit_*) - ff_reinforce/ff_qac_* have no such config knob.
+  - use_dpo_loss: system.use_dpo_loss - whether the env-action (and halting/CoT-step)
+                 actor surrogate uses Discovered Policy Optimisation
+                 (stoix.utils.loss.dpo_loss/dpo_surrogate, Lu et al. 2022,
+                 https://arxiv.org/abs/2210.05639) instead of PPO's clipped surrogate.
+                 False (default) recovers the original ppo_clip_loss behaviour exactly.
+                 Applies to every system in PPO_SYSTEMS, same as halting_ent_coef above.
+  - dpo_alpha/dpo_beta: system.dpo_alpha/system.dpo_beta - DPO's positive-/negative-
+                 advantage drift coefficients, only used when use_dpo_loss=True (paired
+                 with it via dpo_combos, so a dpo_alpha/dpo_beta sweep isn't needlessly
+                 duplicated across every use_dpo_loss=False job - mirrors how
+                 delightful_eta is only meaningfully swept alongside delightful=True).
+                 Defaults 2.0/0.6, the values found by Lu et al. (2022)'s
+                 meta-optimisation. Same applicability as use_dpo_loss.
   - use_layer_norm: LayerNorm inside the shared ACTStep of
                  AdaptiveComputationTimeTorso; mlp/cnn+mlp only (transformer,
                  cnn+transformer, gru, iru, cnn+gru, cnn+iru, and
@@ -276,6 +289,8 @@ Usage:
       --systems ff_ppo_explicit_fac,ff_ppo_explicit_reinforce   # explicit-CoT PPO sweep
   python ramdp_experiments/lightsout_sweep.py --architectures transformer \\
       --use-sandwich-norm true,false --use-rmsnorm true,false   # transformer norm sweep
+  python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_fac \\
+      --use-dpo-loss true,false --dpo-alpha 1.0,2.0 --dpo-beta 0.4,0.6   # DPO vs. PPO-clip sweep
 """
 
 from __future__ import annotations
@@ -595,6 +610,9 @@ class Job:
     latent_kl_coef: float
     halting_ent_coef: float
     halting_temperature: float
+    use_dpo_loss: bool
+    dpo_alpha: float
+    dpo_beta: float
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
@@ -637,7 +655,7 @@ class Job:
         a real list of tags (see stoix/utils/logger.py) so each axis stays
         independently filterable instead of buried in one long string. Uses
         short axis prefixes (mn/mx/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/
-        iln/stdadv/radv/cba/sn/rms) rather than run_name's full field names, and
+        iln/stdadv/radv/cba/sn/rms/dpo) rather than run_name's full field names, and
         ARCH_SHORT_TAG/expl/reinf abbreviations, since W&B's group field (the
         parts joined by "_", see WandBLogger) gets unwieldy at run_name's
         length otherwise. Capped at MAX_GROUP_TAG_LEN (see _cap_tag_length)
@@ -682,6 +700,8 @@ class Job:
                 ppo += "-radv"
             if self.critic_before_actor:
                 ppo += "-cba"
+            if self.use_dpo_loss:
+                ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
             parts.append(ppo)
 
         extra = []
@@ -790,6 +810,14 @@ class Job:
             # exists on ff_ppo.py's continuous "thought" states) - see
             # ff_ppo.py's/ff_ppo_explicit_cot.py's module docstrings.
             cmd.append(f"system.halting_ent_coef={self.halting_ent_coef:g}")
+            # Discovered Policy Optimisation actor surrogate - both ff_ppo.py's
+            # own systems and ff_ppo_explicit_* (same applicability as
+            # halting_ent_coef above) - see stoix/utils/loss.py's
+            # dpo_loss/dpo_surrogate and ff_ppo.py's/ff_ppo_explicit_cot.py's
+            # module docstrings.
+            cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
+            cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
+            cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
         else:
             cmd.append(f"system.delightful={self.delightful}")
         if self.arch in TRANSFORMER_ARCHES or self.arch == EXPLICIT_COT_ARCH:
@@ -921,6 +949,20 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         else:
             delightful_combos.append((False, args.delightful_eta[0]))
     delightful_combos = list(dict.fromkeys(delightful_combos))
+
+    # (use_dpo_loss, dpo_alpha, dpo_beta) combos: alpha/beta only matter (and
+    # are only swept) when use_dpo_loss=True, mirroring delightful_combos
+    # above. Forced to a single (False, ..., ...) value for every non-PPO
+    # system in the main product loop below, same as halting_ent_coef.
+    dpo_combos = []
+    for use_dpo in args.use_dpo_loss:
+        if use_dpo:
+            for alpha in args.dpo_alpha:
+                for beta in args.dpo_beta:
+                    dpo_combos.append((True, alpha, beta))
+        else:
+            dpo_combos.append((False, args.dpo_alpha[0], args.dpo_beta[0]))
+    dpo_combos = list(dict.fromkeys(dpo_combos))
 
     # (epochs, num_minibatches, clip_eps, clip_value_loss, gae_lambda,
     # standardize_advantages, recompute_advantages, critic_before_actor) combos:
@@ -1118,6 +1160,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         latent_kl_coef,
         halting_ent_coef,
         halting_temperature,
+        (use_dpo_loss, dpo_alpha, dpo_beta),
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -1135,6 +1178,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.latent_kl_coef,
         args.halting_ent_coef,
         args.halting_temperature,
+        dpo_combos,
         range(args.seeds),
     ):
         # Neither axis applies to both kinds of system at once (see
@@ -1165,6 +1209,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         # ppo_combos above.
         if system not in PPO_SYSTEMS:
             halting_ent_coef = args.halting_ent_coef[0]
+        # use_dpo_loss/dpo_alpha/dpo_beta exist on every PPO_SYSTEMS system
+        # (same applicability as halting_ent_coef above) - forced to a
+        # non-DPO default for ff_reinforce/ff_qac_*.
+        if system not in PPO_SYSTEMS:
+            use_dpo_loss, dpo_alpha, dpo_beta = False, args.dpo_alpha[0], args.dpo_beta[0]
         # halting_temperature only exists on HALTING_TEMPERATURE_ARCHES -
         # forced to the first requested value (default 1.0, a no-op) for
         # every other architecture.
@@ -1196,6 +1245,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 latent_kl_coef=latent_kl_coef,
                 halting_ent_coef=halting_ent_coef,
                 halting_temperature=halting_temperature,
+                use_dpo_loss=use_dpo_loss,
+                dpo_alpha=dpo_alpha,
+                dpo_beta=dpo_beta,
                 standardize_advantages=standardize_advantages,
                 recompute_advantages=recompute_advantages,
                 critic_before_actor=critic_before_actor,
@@ -1509,6 +1561,34 @@ def main() -> None:
         "for ff_reinforce/ff_qac_*, which have no such config knob.",
     )
     parser.add_argument(
+        "--use-dpo-loss",
+        default="false",
+        help="Comma-separated bools (true/false) - system.use_dpo_loss: whether the env-action "
+        "(and halting/CoT-step) actor surrogate uses Discovered Policy Optimisation "
+        "(stoix.utils.loss.dpo_loss/dpo_surrogate, Lu et al. 2022, "
+        "https://arxiv.org/abs/2210.05639) instead of PPO's clipped surrogate "
+        "(stoix.utils.loss.ppo_clip_loss). False (default) recovers the original ppo_clip_loss "
+        "behaviour exactly. Applies to every system in PPO_SYSTEMS (both ff_ppo.py's own "
+        "systems and ff_ppo_explicit_*, same applicability as --halting-ent-coef); forced to "
+        "false for ff_reinforce/ff_qac_*, which have no such config knob.",
+    )
+    parser.add_argument(
+        "--dpo-alpha",
+        default="2.0",
+        help="Comma-separated system.dpo_alpha values - DPO's positive-advantage drift "
+        "coefficient, only used (and only swept) when --use-dpo-loss includes true - paired "
+        "with --use-dpo-loss/--dpo-beta via dpo_combos so a sweep isn't needlessly duplicated "
+        "across every use_dpo_loss=false job (mirrors --delightful-eta/--delightful). Default "
+        "2.0, the value found by Lu et al. (2022)'s meta-optimisation.",
+    )
+    parser.add_argument(
+        "--dpo-beta",
+        default="0.6",
+        help="Comma-separated system.dpo_beta values - DPO's negative-advantage drift "
+        "coefficient, same applicability/pairing as --dpo-alpha. Default 0.6, the value found "
+        "by Lu et al. (2022)'s meta-optimisation.",
+    )
+    parser.add_argument(
         "--halting-temperature",
         default="1.0",
         help="Comma-separated network.actor_network.pre_torso.halting_temperature values - "
@@ -1747,6 +1827,11 @@ def main() -> None:
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.halting_ent_coef = [float(x) for x in args.halting_ent_coef.split(",")]
+    args.use_dpo_loss = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_dpo_loss.split(",")
+    ]
+    args.dpo_alpha = [float(x) for x in args.dpo_alpha.split(",")]
+    args.dpo_beta = [float(x) for x in args.dpo_beta.split(",")]
     args.halting_temperature = [float(x) for x in args.halting_temperature.split(",")]
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [
@@ -1867,6 +1952,10 @@ def main() -> None:
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
     )
     print(f"  halting_ent_coef={args.halting_ent_coef} (PPO systems only: {PPO_SYSTEMS})")
+    print(
+        f"  use_dpo_loss={args.use_dpo_loss} dpo_alpha={args.dpo_alpha} dpo_beta={args.dpo_beta} "
+        f"(PPO systems only: {PPO_SYSTEMS})"
+    )
     print(
         f"  halting_temperature={args.halting_temperature} "
         f"(HALTING_TEMPERATURE_ARCHES only: {HALTING_TEMPERATURE_ARCHES})"
