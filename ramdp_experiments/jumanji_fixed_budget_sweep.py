@@ -722,15 +722,20 @@ class Job:
     @property
     def group_tag_parts(self) -> List[str]:
         """The group tag broken into semantic chunks - env/difficulty, algo,
-        budget, network hparams, PPO hparams, misc flags - instead of one
-        flat dash-joined string. `group_tag` still joins these with "-" for
-        run_name/filenames/manifest (unchanged, filesystem-safe); the parts
-        list is for `logger.loggers.wandb.group_tag`, which Neptune stores as
-        a real list of tags (see stoix/utils/logger.py) so each axis stays
-        independently filterable instead of buried in one long string.
-        Capped at MAX_GROUP_TAG_LEN (see _cap_tag_length) so a config with
-        several optional flags set at once can't silently exceed W&B's
-        128-char group-field limit.
+        budget, gamma, network hparams, PPO hparams, misc flags - instead of
+        one flat dash-joined string. Includes gamma even though it's fixed
+        (not swept) per invocation - see the `gamma` field/--gamma - so two
+        separate sweep runs launched with different --gamma still get
+        distinct group tags/run_names/output dirs (and a distinct hash from
+        _cap_tag_length once truncated), instead of silently colliding.
+        `group_tag` still joins these with "-" for run_name/filenames/manifest
+        (unchanged, filesystem-safe); the parts list is for
+        `logger.loggers.wandb.group_tag`, which Neptune stores as a real list
+        of tags (see stoix/utils/logger.py) so each axis stays independently
+        filterable instead of buried in one long string. Capped at
+        MAX_GROUP_TAG_LEN (see _cap_tag_length) so a config with several
+        optional flags set at once can't silently exceed W&B's 128-char
+        group-field limit.
         """
         system_short = (
             self.system.removeprefix("ff_").replace("explicit", "expl").replace("reinforce", "reinf")
@@ -740,6 +745,7 @@ class Job:
             f"{self.env}-{self.difficulty.tag}",
             f"{system_short}-{arch_short}",
             f"b{self.budget}",
+            f"g{self.gamma:g}",
         ]
 
         net = (

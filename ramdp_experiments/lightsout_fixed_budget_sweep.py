@@ -517,13 +517,18 @@ class Job:
     @property
     def group_tag_parts(self) -> List[str]:
         """The group tag broken into semantic chunks - env, algo/arch,
-        budget, network hparams, PPO hparams, misc flags - instead of one
-        flat dash-joined string. `group_tag` still joins these with "-" for
-        run_name/filenames/manifest (unchanged, filesystem-safe); the parts
-        list is for `logger.loggers.wandb.group_tag`, which Neptune stores as
-        a real list of tags (see stoix/utils/logger.py) so each axis stays
-        independently filterable instead of buried in one long string. Uses
-        short axis prefixes (b/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/iln/radv/cba/sn/rms/dpo/iql)
+        budget, gamma, network hparams, PPO hparams, misc flags - instead of
+        one flat dash-joined string. Includes gamma even though it's fixed
+        (not swept) per invocation - see the `gamma` field/--gamma - so two
+        separate sweep runs launched with different --gamma still get
+        distinct group tags/run_names/output dirs (and a distinct hash from
+        _cap_tag_length once truncated), instead of silently colliding.
+        `group_tag` still joins these with "-" for run_name/filenames/manifest
+        (unchanged, filesystem-safe); the parts list is for
+        `logger.loggers.wandb.group_tag`, which Neptune stores as a real list
+        of tags (see stoix/utils/logger.py) so each axis stays independently
+        filterable instead of buried in one long string. Uses short axis
+        prefixes (b/g/hd/lr/clr/ec/nl/nh/md/ep/mb/clip/deta/ln/iln/radv/cba/sn/rms/dpo/iql)
         rather than run_name's full field names, and ARCH_SHORT_TAG/expl/reinf
         abbreviations, since W&B's group field (the parts joined by "_", see
         WandBLogger) gets unwieldy at run_name's length otherwise. Capped at
@@ -534,7 +539,7 @@ class Job:
             "reinforce", "reinf"
         )
         arch_short = ARCH_SHORT_TAG.get(self.arch, self.arch)
-        parts = [self.env, f"{system_short}-{arch_short}", f"b{self.budget}"]
+        parts = [self.env, f"{system_short}-{arch_short}", f"b{self.budget}", f"g{self.gamma:g}"]
 
         net = (
             f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-ec{self.ent_coef:g}"

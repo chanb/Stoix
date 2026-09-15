@@ -41,9 +41,14 @@ Produces, per architecture:
      overlaid in the same panel, so one figure shows the whole compute/
      algorithm sweep's training dynamics per architecture.
 
+Pass --trim N to the pareto plots (plot_pareto, plot_pareto_row) to drop the
+N highest- and N lowest-performing seeds from each budget/qac_variant group
+before averaging (a trimmed mean/SEM), so one or two outlier seeds don't
+dominate a group of only ~5.
+
 Usage:
   python ramdp_experiments/plot_wandb_lightsout_hd64_extra.py \\
-      ramdp_experiments/wandb_cache_hd64.csv --output-dir ramdp_experiments/wandb_plots_extra
+      ramdp_experiments/wandb_cache_hd64.csv --output-dir ramdp_experiments/wandb_plots_extra [--trim N]
 """
 
 from __future__ import annotations
@@ -130,8 +135,30 @@ def determine_primary_vocab(sub_arch: pd.DataFrame) -> int:
     return counts.idxmax()
 
 
+def _trim_by_performance(g: pd.DataFrame, trim: int) -> pd.DataFrame:
+    """Drops the `trim` lowest- and `trim` highest-value_perf seeds from a
+    (budget or qac_variant) group, for a trimmed mean/SEM robust to one or
+    two outlier seeds. No-op if there aren't enough seeds left over (need
+    more than 2*trim to begin with)."""
+    if trim <= 0 or len(g) <= 2 * trim:
+        return g
+    return g.sort_values("value_perf").iloc[trim : len(g) - trim]
+
+
+def _group_stats(g: pd.DataFrame, trim: int) -> "tuple[float, float, float, float, int]":
+    """(perf_mean, perf_sem, comp_mean, comp_sem, n) for one group, after
+    trimming (see _trim_by_performance)."""
+    g = _trim_by_performance(g, trim)
+    n = len(g)
+    perf_mean = g["value_perf"].mean()
+    perf_sem = g["value_perf"].std() / np.sqrt(n) if n > 1 else 0.0
+    comp_mean = g["value_compute"].mean()
+    comp_sem = g["value_compute"].std() / np.sqrt(n) if n > 1 else 0.0
+    return perf_mean, perf_sem, comp_mean, comp_sem, n
+
+
 def plot_pareto(
-    df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path, vocab_size: int | None = None
+    df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path, vocab_size: int | None = None, trim: int = 0
 ) -> None:
     """Final compute (ponder steps) vs. final performance for one
     architecture (and, for Transformer-ExplicitCoT, one vocab_size). Fixed-
@@ -145,7 +172,10 @@ def plot_pareto(
     expand_vocab_agnostic_budget1 already folded the shared vocab_size=1
     budget=1 point into every vocab_size group upstream). When omitted
     (non-eCoT architectures, which have no vocab_size axis), falls back to
-    the "primary" vocab_size (the sentinel, a no-op for those archs)."""
+    the "primary" vocab_size (the sentinel, a no-op for those archs).
+
+    `trim` drops the `trim` highest- and lowest-performing seeds from each
+    budget/qac_variant group before averaging (see _trim_by_performance)."""
     return_metrics = METRICS[:2]
     compute_metric = METRICS[2]
     qac_markers = {"reinforce": "D", "cond_fac": "s", "cond_naive": "^"}
@@ -172,30 +202,23 @@ def plot_pareto(
 
         fixed = merged[merged["min_steps"] == merged["max_steps"]]
         if not fixed.empty:
-            stats = fixed.groupby("min_steps").agg(
-                perf_mean=("value_perf", "mean"),
-                perf_sem=("value_perf", lambda s: s.std() / np.sqrt(len(s))),
-                comp_mean=("value_compute", "mean"),
-                comp_sem=("value_compute", lambda s: s.std() / np.sqrt(len(s))),
-            ).sort_index()
-            ax.errorbar(
-                stats["comp_mean"],
-                stats["perf_mean"],
-                xerr=stats["comp_sem"],
-                yerr=stats["perf_sem"],
-                marker="o",
-                color=fixed_color,
-                linestyle="none",
-                capsize=2,
-                label="Uniform budget",
-            )
+            for i, (mn, g) in enumerate(sorted(fixed.groupby("min_steps"))):
+                perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
+                ax.errorbar(
+                    [comp_mean],
+                    [perf_mean],
+                    xerr=[comp_sem],
+                    yerr=[perf_sem],
+                    marker="o",
+                    color=fixed_color,
+                    linestyle="none",
+                    capsize=2,
+                    label="Uniform budget" if i == 0 else None,
+                )
 
         adaptive = merged[merged["min_steps"] != merged["max_steps"]]
         for qac_variant, g in adaptive.groupby("qac_variant"):
-            perf_mean = g["value_perf"].mean()
-            perf_sem = g["value_perf"].std() / np.sqrt(len(g))
-            comp_mean = g["value_compute"].mean()
-            comp_sem = g["value_compute"].std() / np.sqrt(len(g))
+            perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
             ax.errorbar(
                 [comp_mean],
                 [perf_mean],
@@ -284,6 +307,7 @@ def plot_pareto_row(
     out_dir: Path,
     title: str,
     ylim: "tuple[float, float] | None" = None,
+    trim: int = 0,
 ) -> None:
     """Single combined figure, one row: one column per (architecture,
     vocab_size) - the same grouping as the per-file plot_pareto figures -
@@ -292,7 +316,9 @@ def plot_pareto_row(
     `ylim`, when given, is applied to every panel so performance is directly
     comparable architecture-to-architecture; x-ticks are fixed at
     PARETO_GRID_XTICKS regardless of each panel's data range, for a
-    consistent budget axis across panels."""
+    consistent budget axis across panels. `trim` drops the `trim` highest-
+    and lowest-performing seeds from each budget/qac_variant group before
+    averaging (see _trim_by_performance)."""
     columns = pareto_columns(df)
     n_cols = len(columns)
     qac_markers = {"reinforce": "D", "cond_fac": "s", "cond_naive": "^"}
@@ -316,31 +342,24 @@ def plot_pareto_row(
 
         fixed = merged[merged["min_steps"] == merged["max_steps"]]
         if not fixed.empty:
-            stats = fixed.groupby("min_steps").agg(
-                perf_mean=("value_perf", "mean"),
-                perf_sem=("value_perf", lambda s: s.std() / np.sqrt(len(s))),
-                comp_mean=("value_compute", "mean"),
-                comp_sem=("value_compute", lambda s: s.std() / np.sqrt(len(s))),
-            ).sort_index()
-            ax.errorbar(
-                stats["comp_mean"],
-                stats["perf_mean"],
-                xerr=stats["comp_sem"],
-                yerr=stats["perf_sem"],
-                marker="o",
-                markersize=6,
-                color=fixed_color,
-                linestyle="none",
-                capsize=3,
-                label="Uniform budget",
-            )
+            for i, (mn, g) in enumerate(sorted(fixed.groupby("min_steps"))):
+                perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
+                ax.errorbar(
+                    [comp_mean],
+                    [perf_mean],
+                    xerr=[comp_sem],
+                    yerr=[perf_sem],
+                    marker="o",
+                    markersize=6,
+                    color=fixed_color,
+                    linestyle="none",
+                    capsize=3,
+                    label="Uniform budget" if i == 0 else None,
+                )
 
         adaptive = merged[merged["min_steps"] != merged["max_steps"]]
         for qac_variant, g in adaptive.groupby("qac_variant"):
-            perf_mean = g["value_perf"].mean()
-            perf_sem = g["value_perf"].std() / np.sqrt(len(g))
-            comp_mean = g["value_compute"].mean()
-            comp_sem = g["value_compute"].std() / np.sqrt(len(g))
+            perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
             ax.errorbar(
                 [comp_mean],
                 [perf_mean],
@@ -844,6 +863,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", type=Path, help="CSV produced by fetch_wandb_lightsout_hd64.py")
     parser.add_argument("--output-dir", type=Path, default=Path("ramdp_experiments/wandb_plots_extra"))
+    parser.add_argument(
+        "--trim",
+        type=int,
+        default=0,
+        help="For the pareto plots (plot_pareto, plot_pareto_row), drop this many highest- and "
+        "lowest-performing seeds from each budget/qac_variant group before averaging (trimmed "
+        "mean/SEM). 0 (default) keeps the plain mean/SEM over all seeds.",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -858,6 +885,7 @@ def main() -> None:
     df = df[(df["arch"] != "IRU-ACT") | (df["total_timesteps"] == 300_000_000)]
     df = expand_vocab_agnostic_budget1(df)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_trim{args.trim}" if args.trim > 0 else ""
 
     variant_palette = all_variant_vocab_palette(df)
 
@@ -872,12 +900,19 @@ def main() -> None:
                 plot_pareto(
                     df,
                     arch,
-                    args.output_dir / f"lightsout_hd64_{safe_name}_vocab{vocab_size}_pareto.pdf",
+                    args.output_dir / f"lightsout_hd64_{safe_name}_vocab{vocab_size}_pareto{suffix}.pdf",
                     args.output_dir,
                     vocab_size=vocab_size,
+                    trim=args.trim,
                 )
         else:
-            plot_pareto(df, arch, args.output_dir / f"lightsout_hd64_{safe_name}_pareto.pdf", args.output_dir)
+            plot_pareto(
+                df,
+                arch,
+                args.output_dir / f"lightsout_hd64_{safe_name}_pareto{suffix}.pdf",
+                args.output_dir,
+                trim=args.trim,
+            )
         plot_seed_variance(
             df, arch, variant_palette, args.output_dir / f"lightsout_hd64_{safe_name}_seed_variance.pdf", args.output_dir
         )
@@ -900,10 +935,11 @@ def main() -> None:
             spec["metric"],
             compute_metric,
             spec["label"],
-            args.output_dir / f"lightsout_hd64_pareto_{spec['fname']}.pdf",
+            args.output_dir / f"lightsout_hd64_pareto_{spec['fname']}{suffix}.pdf",
             args.output_dir,
             title=f"{spec['label']} vs. compute (all architectures)",
             ylim=spec["ylim"],
+            trim=args.trim,
         )
 
     for spec in LEARNING_CURVE_ROWS:
