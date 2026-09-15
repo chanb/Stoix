@@ -6,23 +6,6 @@ from typing_extensions import NamedTuple
 from stoix.base_types import Action, Done, Value
 
 
-class ExplicitCoTTransition(NamedTuple):
-    """Like `stoix.systems.ramdp_vpg.ramdp_vpg_types.Transition`, but also
-    stores the explicit thought tokens emitted by the actor's torso (see
-    `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`),
-    so the exact token trajectory - thoughts and the halting "act now" token
-    together - can be replayed when computing the actor loss."""
-
-    done: Done
-    action: Action
-    value: Value
-    reward: chex.Array
-    obs: chex.Array
-    info: Dict
-    compute_time: chex.Array
-    thought_tokens: chex.Array
-
-
 class PPOExplicitCoTTransition(NamedTuple):
     """Like `stoix.systems.ramdp_vpg.ppo_types.PPOTransition`, but also
     stores the explicit thought tokens emitted by the actor's torso (see
@@ -50,4 +33,25 @@ class PPOExplicitCoTTransition(NamedTuple):
     compute_time: chex.Array
     thought_tokens: chex.Array
     env_log_prob: chex.Array
+    cot_log_prob: chex.Array
+
+
+class PPOMergedActionCoTTransition(NamedTuple):
+    """Like `PPOExplicitCoTTransition`, but for
+    `TransformerMergedActionCoTTorso`: there is no separate `env_log_prob` -
+    the halting step's `cot_log_prob` entry already covers the environment
+    action, since choosing that step's class both halts and resolves the
+    action in the same draw (see that torso's module docstring). `cot_log_prob`
+    has shape `(*batch, max_steps)`, one entry per CoT step, zeroed past the
+    step the trajectory actually halted at."""
+
+    done: Done
+    action: Action
+    value: Value
+    q_value: Value
+    reward: chex.Array
+    obs: chex.Array
+    info: Dict
+    compute_time: chex.Array
+    thought_tokens: chex.Array
     cot_log_prob: chex.Array

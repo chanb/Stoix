@@ -1,131 +1,62 @@
-"""Compute-time-aware PPO with an *explicit* chain of thought (RAMDP-PPO,
+"""Compute-time-aware PPO with an explicit chain of thought whose vocabulary
+merges thought tokens and the environment action (RAMDP-PPO, merged-action
 explicit CoT).
 
-Variant of `stoix.systems.ramdp_vpg.ff_ppo` whose actor's torso is
-`stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`
-instead of a latent-CoT torso. At every pondering step, the actor
-samples a token from a learned vocabulary that has one extra class meaning
-"predict the environment action now" - so halting *is* emitting that token,
-in the same sense as any other thought token or the environment action
-itself. A thought token's embedding (not a raw hidden state) is fed back in
-as context for the next step, so the resulting chain of thought is a
-literal, inspectable sequence of token ids.
+Variant of `stoix.systems.ramdp_vpg.ff_ppo_explicit_cot` whose actor's torso
+is
+`stoix.networks.torso_compute_explicit_cot_merged.TransformerMergedActionCoTTorso`
+instead of `TransformerExplicitCoTTorso`: at every pondering step, the actor
+samples a token from a learned vocabulary that has `num_actions` extra
+classes (one per environment action) beyond the `vocab_size` thought classes,
+instead of one generic "act now" bit - so choosing one of them both halts
+*and* resolves the environment action in the same draw, in exactly the same
+sense as any other thought token. There is no separate action head reading a
+continuous hidden state - see that torso's module docstring for the full
+rationale (closer to how chain-of-thought LLMs sample their final answer
+from the same vocabulary as every "thinking" token).
 
-Everything about *how* this is trained follows `ff_ppo.py`, unmodified:
+Everything about *how* this is trained follows `ff_ppo_explicit_cot.py`,
+except for the one thing the merge actually changes:
 
-  - `config.system.qac_variant` selects how the advantage is computed - the
-    same four Q-V variants ("fac"/"naive"/"cond_naive"/"cond_fac", all using
-    `stoix.networks.base_qac.ValueAndQCritic`) plus "reinforce" (G-V, using
-    `stoix.networks.base.FeedForwardCritic`).
-  - `config.system.gae_lambda` controls the critic's regression target
-    (`targets`/`g_targets`) via GAE(lambda)
-    (`stoix.utils.multistep.batch_truncated_generalized_advantage_estimation`)
-    rather than a plain to-the-end Monte-Carlo return - 1.0 (the default)
-    recovers the original return exactly, <1.0 trades bias for lower
-    variance. Orthogonal to `qac_variant`: for the four Q-V variants it only
-    changes what trains V/Q, since their advantage is Q(s,a,c) - V(s)
-    either way; for "reinforce", whose advantage is `targets - V(s)`, it
-    makes the advantage itself GAE(lambda). See `ff_ppo.py`'s module
-    docstring for the full rationale.
-  - Two quantities derived from the critic can be recomputed at the end of
-    every PPO epoch from that epoch's just-updated critic params, rather
-    than staying frozen at their rollout-time values for the whole update -
-    both gated by the single flag `config.system.recompute_advantages`
-    (default `False`); see `ff_ppo.py`'s module docstring for the full
-    rationale. `targets` (the n-step return that trains the critic itself)
-    is rebuilt each epoch from a freshly bootstrapped value estimate only
-    when `recompute_advantages=True` - `False` skips that rebuild (and the
-    `new_value`/`new_last_val` forward passes that only feed it) and leaves
-    `targets` pinned at its pre-epoch-loop value, saving compute. The
-    advantage's "what changed" term (Q(s,a,c) for the four Q-V variants,
-    V(s) for "reinforce") is likewise refreshed only when
-    `recompute_advantages=True` - with the default `recompute_advantages
-    =False`, it instead stays pinned at its rollout-time value for every
-    epoch, as in vanilla PPO. When it is refreshed, the advantage's other,
-    fixed-baseline term is not: for the
-    Q-V variants, V stays pinned at `traj_batch.value` (the rollout-time
-    estimate) rather than the epoch's fresh value, so the actor's signal
-    reflects only how the critic's opinion of the action changed, not drift
-    from both terms moving together; "reinforce" has no such baseline to
-    preserve, so both G and V refresh together each epoch.
-  - `config.system.critic_before_actor` (default `False`) replaces the
-    joint per-minibatch actor+critic update with two fully sequential
-    phases: `config.system.epochs` epochs of critic-only minibatch updates,
-    followed by `config.system.epochs` epochs of actor-only minibatch
-    updates - i.e. `for each epoch: for each minibatch: update critic` then
-    `for each epoch: for each minibatch: update actor`, instead of updating
-    both networks together in every minibatch. Aimed at the cold-start
-    failure mode where the Q-V variants' advantage (`Q(s,a,c) - V(s)`) is
-    ~0 everywhere until the freshly-initialised critic has learned to
-    differentiate actions, starving the actor of gradient for a long
-    stretch of training. `advantages`/`targets` are always refreshed once
-    from the fully-trained critic at the boundary between the two phases
-    (regardless of `recompute_advantages`, which otherwise only governs the
-    within-critic-phase epoch-to-epoch refresh) - see `ff_ppo.py`'s module
-    docstring for the full rationale and exact refresh semantics, which
-    this file's implementation mirrors exactly. Roughly doubles the
-    per-rollout update compute when enabled.
-  - PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is applied
-    *per decision*, not once over the joint trajectory: the environment
-    action gets its own ratio/clip (`env_log_prob` vs. its rollout-time
-    value), and each CoT step (every thought token and the halting token)
-    gets its own ratio/clip too (`cot_log_prob`, shape `(*batch, max_steps)`,
-    vs. its rollout-time value), masked to the steps actually taken and
-    averaged over them. This mirrors how token-level PPO/GRPO clips each
-    generated token in LLM RL, rather than summing log-probs into one ratio
-    for the whole sequence first: summing `max_steps` weight-tied CoT terms
-    before exponentiating would make the *effective* per-step trust region
-    shrink as `max_steps` grows (weight-tying, see
-    `stoix.networks.torso_compute_transformer.TransformerBlock`, makes
-    per-step log-prob shifts from one gradient step highly correlated, so
-    the unnormalized sum grows roughly linearly with `max_steps` rather than
-    with its square root), clipping longer-budget runs far more readily than
-    short ones for reasons unrelated to whether the update is actually good.
-    The two clipped surrogates are added together (each already an average
-    over its own decisions) before the entropy bonus. The entropy bonus
-    itself has two independent terms, mirroring `ff_ppo.py`:
-    `config.system.ent_coef` on the environment action's distribution
-    entropy, and `config.system.halting_ent_coef` on the CoT-step
-    distribution's own entropy (`per_step_entropy` from the torso - there's
-    no separate halting probability to isolate here, since halting *is*
-    choosing the "act now" class among the same per-step categorical, see
-    `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`'s
-    module docstring). `ent_coef` alone never reaches the CoT-step
-    distribution (`actor_policy` is only the environment action's), so
-    without a dedicated `halting_ent_coef` nothing regularizes the halting
-    decision's own exploration and it's otherwise free to collapse to a
-    degenerate, non-adaptive compute-time before discovering genuine
-    per-example structure. `halting_ent_coef=0.0` (the default) recovers the
-    original behaviour exactly.
-  - The critic (V, and Q for "naive"/"fac") is trained with PPO's own clipped
-    value loss against the `old` value/Q estimate recorded at rollout time by
-    default, or with plain L2 regression when `config.system.clip_value_loss
-    =False`. Optionally (`config.system.use_expectile_value_loss=True`), V's
-    loss (only V - Q, where it exists, still uses clip_value_loss/plain L2)
-    instead uses expectile regression (`stoix.utils.loss.expectile_loss`, as
-    in Kostrikov et al. 2021's Implicit Q-Learning) at expectile
-    `config.system.expectile` - see `ff_ppo.py`'s module docstring for the
-    caveats: a fixed `expectile < 0.5` makes V deliberately (and
-    persistently, not uncertainty-dependent) underestimate the return
-    distribution, biasing the advantage positive more often - for the Q-V
-    variants this mostly softens how aggressively tried-but-average actions
-    get pruned, not directed exploration towards untried ones.
-  - No `config.system.delightful` gate - PPO's clipped surrogate already
-    serves an analogous role.
+  - `ff_ppo_explicit_cot.py` clips the environment action and each CoT step
+    *separately* (`action_loss`/`env_log_prob` vs. `cot_loss`/`cot_log_prob`)
+    because they come from two different distributions (a `CategoricalHead`
+    vs. the per-step token categorical). Here there is only ever *one*
+    distribution - the halting step's class already *is* the action, so its
+    ratio/clip is already part of the per-step CoT surrogate. There is
+    therefore only one clipped surrogate (covering every CoT step, including
+    the one that halted) and one entropy bonus (`config.system.ent_coef`, on
+    that same per-step categorical) - not two of each. This mirrors
+    token-level PPO/GRPO in LLM RL even more directly than
+    `ff_ppo_explicit_cot.py` did: every generated token, "answer" token
+    included, is clipped by the same per-token ratio against the same
+    per-token entropy coefficient, because they all come from the same
+    output head.
+  - Everything else - `config.system.qac_variant`'s four Q-V variants plus
+    "reinforce", `config.system.gae_lambda`'s GAE(lambda) critic target,
+    `config.system.recompute_advantages`, `config.system.critic_before_actor`,
+    the critic's clipped/expectile value loss - is unmodified from
+    `ff_ppo_explicit_cot.py`; see that file's module docstring for the full
+    rationale on each. `_q_output`/`_q_at_action_and_compute_time` are
+    untouched - `action`/`compute_time` keep the same meaning and dtype as
+    before, only how `action` was produced upstream changed.
 
-And everything about *what gets replayed* follows the same principle: since
-`TransformerExplicitCoTTorso`'s sampling pass doesn't itself report the
-log-probability of the token trajectory it just sampled, each rollout step
-makes a second, replay-mode forward pass (`torso_kwargs={"target_tokens":
-thought_tokens}`) at the same rollout-time parameters, purely to read off
-`cot_log_prob` - mirroring `ff_ppo.py`'s second `target_compute_time` pass.
-`TransformerExplicitCoTTorso` has no latent-convergence diagnostics, so
-`first_convergence_step`/`num_close_steps` are not tracked here -
-`PPOExplicitCoTTransition` carries `thought_tokens` in their place, needed to
-replay the exact trajectory at each epoch's parameters.
+And everything about *what gets replayed* follows the same shape as
+`ff_ppo_explicit_cot.py`: since `TransformerMergedActionCoTTorso`'s sampling
+pass doesn't itself report the log-probability of the token trajectory it
+just sampled, each rollout step makes a second, replay-mode forward pass
+(`torso_kwargs={"target_tokens": thought_tokens}`) at the same rollout-time
+parameters, purely to read off `cot_log_prob` - mirroring
+`ff_ppo_explicit_cot.py`'s equivalent second pass, just without a leading
+`env_log_prob` to also collect (there isn't one). `get_merged_action_act_fn_
+with_compute_time` below plays the same role for evaluation that
+`ff_ppo_explicit_cot.py`'s own `get_distribution_act_fn_with_compute_time`
+plays there - defined here directly since the two act-fns differ (this one
+reads the action straight off the torso's rollout output, with no
+distribution/head to `.mode()`/`.sample()` from).
 
-This file intentionally duplicates most of `ff_ppo.py` rather than modifying
-it, so that system is left untouched.
+This file intentionally duplicates most of `ff_ppo_explicit_cot.py` rather
+than modifying it, so that system is left untouched.
 """
 
 import copy
@@ -153,10 +84,10 @@ from stoix.base_types import (
     LearnerFn,
 )
 from stoix.networks.base import FeedForwardCritic
-from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
+from stoix.networks.base_compute import FeedForwardActorFromTorso as Actor
 from stoix.networks.base_qac import SeparateValueAndQCritic, ValueAndQCritic
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
-from stoix.systems.ramdp_vpg.explicit_cot_types import PPOExplicitCoTTransition
+from stoix.systems.ramdp_vpg.explicit_cot_types import PPOMergedActionCoTTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
     update_discounted_return,
@@ -169,51 +100,43 @@ from stoix.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from stoix.utils.logger import LogEvent, StoixLogger
-from stoix.utils.loss import (
-    clipped_value_loss,
-    dpo_loss,
-    dpo_surrogate,
-    expectile_loss,
-    ppo_clip_loss,
-)
+from stoix.utils.loss import clipped_value_loss, dpo_surrogate, expectile_loss
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
 
-def get_distribution_act_fn_with_compute_time(
+def get_merged_action_act_fn_with_compute_time(
     config: DictConfig,
     actor_apply: ActorApply,
 ) -> ComputeAwareActFn:
-    """Like the equivalent in `stoix.systems.ramdp_vpg.ff_reinforce`, but for
-    an actor whose torso also emits explicit thought tokens, i.e. returns
-    `(action_distribution, compute_time, thought_tokens)`. The emitted tokens
-    aren't needed for evaluation metrics, so they're dropped here.
-
-    `TransformerExplicitCoTTorso` has no latent-convergence diagnostics (its
-    "thoughts" are discrete token ids, not a continuous state), so this always
-    reports the sentinel `first_convergence_step=-1`, `num_close_steps=0`,
-    matching `evaluator.py`'s shared `ComputeAwareActFn` interface."""
+    """Like `ff_ppo_explicit_cot.py`'s own
+    `get_distribution_act_fn_with_compute_time`, but for
+    `TransformerMergedActionCoTTorso`: the torso's rollout-mode output
+    already *is* the resolved `action` - there is no distribution to call
+    `.mode()`/`.sample()` on, since `deterministic` already picks the
+    greedy class (thought or halt-with-action) at each step. No
+    latent-convergence diagnostics either, so this always reports the
+    sentinel `first_convergence_step=-1`, `num_close_steps=0`, matching
+    `evaluator.py`'s shared `ComputeAwareActFn` interface."""
 
     def act_fn(
         params: FrozenDict, observation: chex.Array, key: chex.PRNGKey
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         if config.arch.evaluation_greedy:
-            pi, compute_time, _thought_tokens = actor_apply(
+            action, compute_time, _thought_tokens = actor_apply(
                 params, observation, torso_kwargs={"deterministic": True}
             )
-            action = pi.mode()
         else:
-            halting_key, action_key = jax.random.split(key)
-            pi, compute_time, _thought_tokens = actor_apply(
-                params, observation, torso_kwargs={"rng": halting_key}
+            action, compute_time, _thought_tokens = actor_apply(
+                params, observation, torso_kwargs={"rng": key}
             )
-            action = pi.sample(seed=action_key)
         first_convergence_step = -jnp.ones_like(compute_time)
         num_close_steps = jnp.zeros_like(compute_time)
         return action, compute_time, first_convergence_step, num_close_steps
 
     return act_fn
+
 
 def get_learner_fn(
     env: Environment,
@@ -243,14 +166,8 @@ def get_learner_fn(
     def _q_output(
         critic_params: FrozenDict, obs: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
-        """Get the critic's raw `q_value` output. "cond_naive" conditions the
-        network on the realised `compute_time` as an extra input; "cond_fac"
-        shares that same conditioned architecture/parameter count but is
-        always queried at the fixed reference `compute_time=1`, so - like
-        "fac" - its raw output is `c`-invariant and stays a genuine Q(s,·,1)
-        that the `gamma ** (c - 1)` scaling in `_q_at_action_and_compute_time`
-        is the *only* source of `c`-dependence for. The other variants apply
-        `compute_time` afterwards instead, see `_q_at_action_and_compute_time`."""
+        """Get the critic's raw `q_value` output - see `ff_ppo_explicit_cot.py`
+        for the full explanation, unchanged here."""
         if qac_variant == "cond_naive":
             return critic_apply_fn(
                 critic_params, obs, method="q_value", compute_time=compute_time
@@ -267,14 +184,8 @@ def get_learner_fn(
     def _q_at_action_and_compute_time(
         q_output: chex.Array, action: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
-        """Read Q(s, a, c) off `_q_output`'s raw output, however it's
-        parameterised: "naive" indexes a `(num_actions, max_steps)` table by
-        both `action` and `compute_time`; "fac" indexes Q(s,·,1) by `action`
-        then scales by `gamma ** (compute_time - 1)`; "cond_naive" indexes
-        the already-conditioned Q(s,·,c) by `action` only; "cond_fac" indexes
-        Q(s,·,1) (from `_q_output`'s fixed `compute_time=1` query) by
-        `action`, then applies the same `gamma ** (compute_time - 1)` scaling
-        as "fac"."""
+        """Read Q(s, a, c) off `_q_output`'s raw output - see
+        `ff_ppo_explicit_cot.py` for the full explanation, unchanged here."""
         if qac_variant == "naive":
             compute_time_idx = (compute_time - 1).astype(jnp.int32)
             q_at_c = jnp.take_along_axis(
@@ -289,11 +200,8 @@ def get_learner_fn(
     def _value_loss_fn(
         pred: chex.Array, behavior: chex.Array, targets: chex.Array, use_expectile: bool = False
     ) -> chex.Array:
-        """PPO's clipped value loss against `behavior`, plain L2 to
-        `targets`, or (when `use_expectile=True` - only ever passed for V,
-        never Q, see `config.system.use_expectile_value_loss` and the module
-        docstring) expectile regression to `targets`
-        (`stoix.utils.loss.expectile_loss`) at `config.system.expectile`."""
+        """PPO's clipped value loss, plain L2, or expectile regression - see
+        `ff_ppo_explicit_cot.py` for the full explanation, unchanged here."""
         if use_expectile:
             return expectile_loss(pred, targets, config.system.expectile)
         if config.system.clip_value_loss:
@@ -305,7 +213,7 @@ def get_learner_fn(
     ) -> Tuple[RamdpOnPolicyLearnerState, Tuple]:
         def _env_step(
             learner_state: RamdpOnPolicyLearnerState, _: Any
-        ) -> Tuple[RamdpOnPolicyLearnerState, PPOExplicitCoTTransition]:
+        ) -> Tuple[RamdpOnPolicyLearnerState, PPOMergedActionCoTTransition]:
             (
                 params,
                 opt_states,
@@ -317,20 +225,22 @@ def get_learner_fn(
                 episode_discounted_return,
             ) = learner_state
 
-            key, policy_key, cot_key = jax.random.split(key, 3)
-            actor_policy, compute_time, thought_tokens = actor_apply_fn(
+            key, cot_key = jax.random.split(key)
+            # The torso's rollout output already is the resolved action -
+            # unlike `ff_ppo_explicit_cot.py`, there is no separate
+            # `action_head`/`actor_policy.sample(...)` step afterwards.
+            action, compute_time, thought_tokens = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"rng": cot_key},
             )
-            action = actor_policy.sample(seed=policy_key)
-            env_log_prob = actor_policy.log_prob(action)
 
             # Second replay-mode pass to get cot_log_prob at these same
             # (rollout-time) params, giving PPO a fixed "old" log_prob -
-            # per-step (not summed), so each CoT step can be ratio/clipped
-            # individually rather than as one joint trajectory ratio.
-            _, _, cot_log_prob, _ = actor_apply_fn(
+            # per-step (not summed), so each CoT step - including the one
+            # that halted, which now also carries the action choice - can be
+            # ratio/clipped individually rather than as one joint ratio.
+            _, cot_log_prob, _ = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_tokens": thought_tokens},
@@ -370,7 +280,7 @@ def get_learner_fn(
                 "compute_time": compute_time,
             }
 
-            transition = PPOExplicitCoTTransition(
+            transition = PPOMergedActionCoTTransition(
                 done,
                 action,
                 value,
@@ -380,7 +290,6 @@ def get_learner_fn(
                 info,
                 compute_time,
                 thought_tokens,
-                env_log_prob,
                 cot_log_prob,
             )
             learner_state = RamdpOnPolicyLearnerState(
@@ -431,54 +340,36 @@ def get_learner_fn(
         )
 
         if is_qac:
-            # Q - V: directly Q(s_t, a_t, c_t) - V(s_t), no n-step/Monte-Carlo
-            # return involved at all (see `ff_qac.py`). `g_targets` here is
-            # used only to train the critic, never the advantage.
             advantages = traj_batch.q_value - traj_batch.value
         else:
-            # G - V: REINFORCE-with-baseline, as in `ff_reinforce.py`.
             advantages = g_targets - traj_batch.value
         targets = g_targets
 
         if config.system.standardize_advantages:
             advantages = jax.nn.standardize(advantages, axis=(0, 1))
 
-        # --- config.system.critic_before_actor machinery (see module
-        # docstring) - `_actor_loss_fn`/`_critic_loss_fn` below are exact
-        # copies of the ones nested inside the joint `_update_minibatch`
-        # further down, hoisted to this scope so both the sequential path
-        # here and the joint path below can each use their own copy without
-        # the two paths depending on one another. ---
+        # --- config.system.critic_before_actor machinery (see
+        # `ff_ppo_explicit_cot.py`'s module docstring) - `_actor_loss_fn`/
+        # `_critic_loss_fn` below are exact copies of the ones nested inside
+        # the joint `_update_minibatch` further down, hoisted to this scope
+        # so both the sequential path here and the joint path below can each
+        # use their own copy without depending on one another. ---
 
         def _actor_loss_fn(
             actor_params: FrozenDict,
-            traj_batch: PPOExplicitCoTTransition,
+            traj_batch: PPOMergedActionCoTTransition,
             advantage: chex.Array,
         ) -> Tuple:
             """Calculate the actor loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
-            actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
+            # Replay the token trajectory actually taken during rollout - the
+            # halting step's ratio/clip already covers the action choice, so
+            # there is no separate `env_log_prob`/`action_loss` here (unlike
+            # `ff_ppo_explicit_cot.py`).
+            _, cot_log_prob, cot_entropy = actor_apply_fn(
                 actor_params,
                 traj_batch.obs,
                 torso_kwargs={"target_tokens": traj_batch.thought_tokens},
-            )
-            env_log_prob = actor_policy.log_prob(traj_batch.action)
-
-            if config.system.use_dpo_loss:
-                action_loss = dpo_loss(
-                    env_log_prob,
-                    traj_batch.env_log_prob,
-                    advantage,
-                    config.system.dpo_alpha,
-                    config.system.dpo_beta,
-                )
-            else:
-                action_loss = ppo_clip_loss(
-                    env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
-                )
-            action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
-            action_clip_fraction = jnp.mean(
-                (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
             )
 
             step_idx = jnp.arange(max_steps)
@@ -502,53 +393,36 @@ def get_learner_fn(
                     * advantage_per_step
                 )
                 cot_per_step_loss = -jnp.minimum(cot_surrogate1, cot_surrogate2)
-            cot_loss = jnp.sum(cot_per_step_loss * valid_step) / num_valid_steps
-            cot_clip_fraction = (
+            loss_actor = jnp.sum(cot_per_step_loss * valid_step) / num_valid_steps
+            clip_fraction = (
                 jnp.sum(
                     (jnp.abs(cot_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
                     * valid_step
                 )
                 / num_valid_steps
             )
-            # Entropy bonus on the halting decision - there's no separate
-            # halting probability here (halting *is* choosing the "act now"
-            # class among the per-step categorical, see
-            # `TransformerExplicitCoTTorso`'s module docstring), so this is
-            # the entropy of that whole per-step distribution, same
-            # `valid_step` masking as `cot_loss` above. `ent_coef` alone
-            # never reaches it (`actor_policy.entropy()` is only the
-            # environment action's distribution), so without this nothing
-            # keeps the CoT policy from collapsing to a degenerate,
-            # non-adaptive compute-time before it discovers any genuine
-            # per-example structure - see `ff_ppo.py`'s module docstring for
-            # the same rationale (there, for a separate Bernoulli halting
-            # head instead of a folded-in categorical class).
-            cot_entropy_bonus = jnp.sum(cot_entropy * valid_step) / num_valid_steps
+            # Entropy bonus on the whole per-step categorical (thought
+            # tokens and the halting-with-action classes together) - there's
+            # no separate action distribution to regularize any more, unlike
+            # `ff_ppo_explicit_cot.py`'s `ent_coef`/`halting_ent_coef` pair;
+            # `config.system.ent_coef` alone now covers both what used to be
+            # the environment action's exploration and the halting
+            # decision's, since they're the same decision.
+            entropy = jnp.sum(cot_entropy * valid_step) / num_valid_steps
 
-            loss_actor = action_loss + cot_loss
-            entropy = actor_policy.entropy().mean()
-
-            total_loss_actor = (
-                loss_actor
-                - config.system.ent_coef * entropy
-                - config.system.halting_ent_coef * cot_entropy_bonus
-            )
+            total_loss_actor = loss_actor - config.system.ent_coef * entropy
             loss_info = {
                 "actor_loss": loss_actor,
-                "action_loss": action_loss,
-                "cot_loss": cot_loss,
                 "entropy": entropy,
-                "halting_entropy": cot_entropy_bonus,
                 "advantages": advantage,
                 "compute_time": traj_batch.compute_time,
-                "action_clip_fraction": action_clip_fraction,
-                "cot_clip_fraction": cot_clip_fraction,
+                "clip_fraction": clip_fraction,
             }
             return total_loss_actor, loss_info
 
         def _critic_loss_fn(
             critic_params: FrozenDict,
-            traj_batch: PPOExplicitCoTTransition,
+            traj_batch: PPOMergedActionCoTTransition,
             targets: chex.Array,
         ) -> Tuple:
             """Calculate the critic loss (see the identical copy nested in
@@ -593,7 +467,7 @@ def get_learner_fn(
         def _apply_actor_update(
             params: ActorCriticParams,
             opt_states: ActorCriticOptStates,
-            traj_batch: PPOExplicitCoTTransition,
+            traj_batch: PPOMergedActionCoTTransition,
             advantage: chex.Array,
         ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
             """Actor-only minibatch update - critic params/opt_state pass
@@ -623,7 +497,7 @@ def get_learner_fn(
         def _apply_critic_update(
             params: ActorCriticParams,
             opt_states: ActorCriticOptStates,
-            traj_batch: PPOExplicitCoTTransition,
+            traj_batch: PPOMergedActionCoTTransition,
             targets: chex.Array,
         ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
             """Critic-only minibatch update - actor params/opt_state pass
@@ -653,12 +527,9 @@ def get_learner_fn(
         def _refresh_targets_and_advantages(
             critic_params: FrozenDict,
         ) -> Tuple[chex.Array, chex.Array]:
-            """Recompute `targets`/`advantages` from `critic_params`,
-            mirroring the joint path's `recompute_advantages` refresh
-            further down. Used by `critic_before_actor`'s critic-only epochs
-            (gated by `recompute_advantages`, as usual) and, unconditionally,
-            once at the critic-to-actor phase boundary - see module
-            docstring."""
+            """Recompute `targets`/`advantages` from `critic_params` - see
+            `ff_ppo_explicit_cot.py` for the full explanation, unchanged
+            here."""
             if is_qac:
                 new_value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
                 new_last_val = critic_apply_fn(
@@ -728,10 +599,6 @@ def get_learner_fn(
             )
 
             if config.system.recompute_advantages:
-                # Mirrors the joint path's per-epoch refresh further down -
-                # only `targets` actually feeds the critic loss here;
-                # `advantages` is unused until the actor-only phase but
-                # cheap/harmless to keep refreshed too, for consistency.
                 epoch_targets, _ = _refresh_targets_and_advantages(params.critic_params)
 
             update_state = (params, opt_states, epoch_traj_batch, epoch_targets, key)
@@ -739,9 +606,7 @@ def get_learner_fn(
 
         def _update_epoch_actor_only(update_state: Tuple, _: Any) -> Tuple:
             """`critic_before_actor`'s actor-only epoch: one full shuffled
-            pass over the rollout's minibatches, actor params only. No
-            recompute here - the critic is frozen through this phase, so
-            `advantages` would not change even if refreshed."""
+            pass over the rollout's minibatches, actor params only."""
             params, opt_states, epoch_traj_batch, epoch_advantages, key = update_state
             key, shuffle_key = jax.random.split(key)
 
@@ -777,50 +642,30 @@ def get_learner_fn(
 
                 def _actor_loss_fn(
                     actor_params: FrozenDict,
-                    traj_batch: PPOExplicitCoTTransition,
+                    traj_batch: PPOMergedActionCoTTransition,
                     advantage: chex.Array,
                 ) -> Tuple:
                     """Calculate the actor loss.
 
-                    Per-decision PPO clipping (see module docstring): the
-                    environment action and each CoT step get their own
-                    ratio/clip against the shared, trajectory-level
-                    `advantage` - rather than summing `env_log_prob` and
-                    `cot_log_prob` into one joint log-prob and clipping a
-                    single ratio over that sum.
+                    A single per-step PPO-clipped surrogate covers every CoT
+                    step, including the one that halted - which now also
+                    carries the action choice, since halting and acting are
+                    the same class. There is no separate action ratio/clip
+                    the way `ff_ppo_explicit_cot.py` has, since there is no
+                    separate action distribution any more.
                     """
                     # Replay the token trajectory actually taken during
-                    # rollout, mirroring log_prob(traj_batch.action) below.
-                    actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
+                    # rollout, mirroring `_env_step`'s replay-mode pass.
+                    _, cot_log_prob, cot_entropy = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_tokens": traj_batch.thought_tokens},
                     )
-                    env_log_prob = actor_policy.log_prob(traj_batch.action)
-
-                    if config.system.use_dpo_loss:
-                        action_loss = dpo_loss(
-                            env_log_prob,
-                            traj_batch.env_log_prob,
-                            advantage,
-                            config.system.dpo_alpha,
-                            config.system.dpo_beta,
-                        )
-                    else:
-                        action_loss = ppo_clip_loss(
-                            env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
-                        )
-                    action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
-                    action_clip_fraction = jnp.mean(
-                        (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(
-                            jnp.float32
-                        )
-                    )
 
                     # `cot_log_prob`/`traj_batch.cot_log_prob`: `(*batch,
                     # max_steps)`, zeroed past the step each example actually
-                    # halted at (see `TransformerExplicitCoTTorso`). A step
-                    # is "actually taken" iff its index is before
+                    # halted at (see `TransformerMergedActionCoTTorso`). A
+                    # step is "actually taken" iff its index is before
                     # `compute_time` - reconstructed here rather than passed
                     # through the transition since it's a fixed function of
                     # `compute_time` alone (same at rollout time and at every
@@ -857,8 +702,8 @@ def get_learner_fn(
                     # the whole minibatch (not a per-example mean averaged
                     # over examples), so trajectories with more valid steps
                     # don't get down-weighted relative to shorter ones.
-                    cot_loss = jnp.sum(cot_per_step_loss * valid_step) / num_valid_steps
-                    cot_clip_fraction = (
+                    loss_actor = jnp.sum(cot_per_step_loss * valid_step) / num_valid_steps
+                    clip_fraction = (
                         jnp.sum(
                             (jnp.abs(cot_ratio - 1.0) > config.system.clip_eps).astype(
                                 jnp.float32
@@ -867,47 +712,28 @@ def get_learner_fn(
                         )
                         / num_valid_steps
                     )
-                    # Entropy bonus on the halting decision - there's no
-                    # separate halting probability here (halting *is*
-                    # choosing the "act now" class among the per-step
-                    # categorical, see `TransformerExplicitCoTTorso`'s
-                    # module docstring), so this is the entropy of that
-                    # whole per-step distribution, same `valid_step` masking
-                    # as `cot_loss` above. `ent_coef` alone never reaches it
-                    # (`actor_policy.entropy()` is only the environment
-                    # action's distribution), so without this nothing keeps
-                    # the CoT policy from collapsing to a degenerate,
-                    # non-adaptive compute-time before it discovers any
-                    # genuine per-example structure - see `ff_ppo.py`'s
-                    # module docstring for the same rationale (there, for a
-                    # separate Bernoulli halting head instead of a
-                    # folded-in categorical class).
-                    cot_entropy_bonus = jnp.sum(cot_entropy * valid_step) / num_valid_steps
+                    # Entropy bonus on the whole per-step categorical
+                    # (thought tokens and the halting-with-action classes
+                    # together) - `config.system.ent_coef` alone now covers
+                    # what used to need both `ent_coef` (on the environment
+                    # action's own distribution) and `halting_ent_coef` (on
+                    # the CoT-step distribution), since they're the same
+                    # distribution now - see module docstring.
+                    entropy = jnp.sum(cot_entropy * valid_step) / num_valid_steps
 
-                    loss_actor = action_loss + cot_loss
-                    entropy = actor_policy.entropy().mean()
-
-                    total_loss_actor = (
-                        loss_actor
-                        - config.system.ent_coef * entropy
-                        - config.system.halting_ent_coef * cot_entropy_bonus
-                    )
+                    total_loss_actor = loss_actor - config.system.ent_coef * entropy
                     loss_info = {
                         "actor_loss": loss_actor,
-                        "action_loss": action_loss,
-                        "cot_loss": cot_loss,
                         "entropy": entropy,
-                        "halting_entropy": cot_entropy_bonus,
                         "advantages": advantage,
                         "compute_time": traj_batch.compute_time,
-                        "action_clip_fraction": action_clip_fraction,
-                        "cot_clip_fraction": cot_clip_fraction,
+                        "clip_fraction": clip_fraction,
                     }
                     return total_loss_actor, loss_info
 
                 def _critic_loss_fn(
                     critic_params: FrozenDict,
-                    traj_batch: PPOExplicitCoTTransition,
+                    traj_batch: PPOMergedActionCoTTransition,
                     targets: chex.Array,
                 ) -> Tuple:
                     """Calculate the critic loss."""
@@ -924,9 +750,6 @@ def get_learner_fn(
                             critic_params, traj_batch.obs, traj_batch.compute_time
                         )
                         if qac_variant == "fac":
-                            # Scale the raw Q(s,·,1) prediction up to the true
-                            # Q(s,a,c) scale by gamma ** (c - 1), then regress
-                            # against `targets` (already on that true scale).
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
                             ).squeeze(-1) * config.system.gamma ** (
@@ -934,11 +757,6 @@ def get_learner_fn(
                             )
                             q_targets = targets
                         else:  # "naive", "cond_naive", "cond_fac"
-                            # "naive"/"cond_naive" are already in the true
-                            # Q(s,a,c) scale; "cond_fac" goes through the same
-                            # gamma ** (c - 1) rescaling as "fac" above (see
-                            # `_q_at_action_and_compute_time`). Either way,
-                            # regress directly against targets.
                             q_pred = _q_at_action_and_compute_time(
                                 q_output, traj_batch.action, traj_batch.compute_time
                             )
@@ -985,8 +803,6 @@ def get_learner_fn(
                     axis_name="device",
                 )
 
-                # Norm of the gradient actually applied by the optimizer,
-                # i.e. after averaging but before clipping.
                 actor_loss_info["actor_grad_norm"] = optax.global_norm(actor_grads)
                 critic_loss_info["critic_grad_norm"] = optax.global_norm(critic_grads)
 
@@ -1039,21 +855,6 @@ def get_learner_fn(
             )
 
             if config.system.recompute_advantages:
-                # `targets` (the n-step return that trains the critic in
-                # `_critic_loss_fn`) bootstraps off the value estimate at the
-                # tail of each n-step window (`v_t` below, mirroring the
-                # pre-epoch-loop computation above) - holding it fixed at its
-                # rollout-time bootstrap across every epoch would leave the
-                # critic regressing towards a target built from an
-                # increasingly stale value function as the critic itself
-                # moves epoch to epoch. So it's rebuilt here from this
-                # epoch's updated critic params, reusing `r_t`/`d_t`
-                # (rewards/discounts, unaffected by the critic) from the
-                # original computation. Skipped entirely (along with the
-                # `new_value`/`new_last_val` forward passes below) when
-                # `recompute_advantages=False`, since in that case `targets`
-                # and `advantages` both stay pinned at their pre-epoch-loop
-                # values anyway - recomputing either would be wasted compute.
                 if is_qac:
                     new_value = critic_apply_fn(
                         params.critic_params, traj_batch.obs, method="value"
@@ -1076,19 +877,6 @@ def get_learner_fn(
                 )
 
                 if is_qac:
-                    # Refresh the advantage's Q term with this epoch's
-                    # just-updated critic params before the next epoch trains
-                    # on it - the critic moves every epoch, so the
-                    # rollout-time `traj_batch.q_value` baked into
-                    # `advantages` before the epoch loop would otherwise go
-                    # increasingly stale by the later epochs. `traj_batch.value`
-                    # is deliberately used here instead of `new_value` above:
-                    # holding the V baseline fixed at its rollout-time
-                    # estimate isolates the actor's signal to "how has the
-                    # critic's opinion of this action changed since rollout",
-                    # rather than mixing in drift from Q and V moving
-                    # together epoch to epoch. (`new_value` above only feeds
-                    # the target's bootstrap, a separate use of V.)
                     q_output = _q_output(
                         params.critic_params, traj_batch.obs, traj_batch.compute_time
                     )
@@ -1097,9 +885,6 @@ def get_learner_fn(
                     )
                     advantages = q_value - traj_batch.value
                 else:  # "reinforce"
-                    # Both terms of G - V are this epoch's fresh critic
-                    # output: `new_value` for V, and `targets` above (itself
-                    # bootstrapped off `new_value`/`new_last_val`) for G.
                     advantages = targets - new_value
 
                 if config.system.standardize_advantages:
@@ -1116,25 +901,17 @@ def get_learner_fn(
             return update_state, loss_info
 
         if config.system.critic_before_actor:
-            # Phase 1: `epochs` epochs of critic-only updates (see module
-            # docstring). `advantages` isn't threaded through here - unused
-            # until the actor-only phase.
+            # Phase 1: `epochs` epochs of critic-only updates.
             critic_update_state = (params, opt_states, traj_batch, targets, key)
             critic_update_state, critic_loss_info = jax.lax.scan(
                 _update_epoch_critic_only, critic_update_state, None, config.system.epochs
             )
             params, opt_states, traj_batch, targets, key = critic_update_state
 
-            # Unconditional refresh at the phase boundary, regardless of
-            # `recompute_advantages`: the actor-only phase must see an
-            # advantage informed by the now-trained critic, not the stale
-            # rollout-time one - otherwise this option would do nothing for
-            # the actor. See module docstring.
             targets, advantages = _refresh_targets_and_advantages(params.critic_params)
 
             # Phase 2: `epochs` epochs of actor-only updates against that
-            # fixed advantage - the critic no longer moves, so there is
-            # nothing to recompute epoch-to-epoch here.
+            # fixed advantage.
             actor_update_state = (params, opt_states, traj_batch, advantages, key)
             actor_update_state, actor_loss_info = jax.lax.scan(
                 _update_epoch_actor_only, actor_update_state, None, config.system.epochs
@@ -1208,9 +985,11 @@ def learner_setup(
         "reinforce",
     ), f"Unknown qac_variant: {qac_variant}"
 
-    actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
-    actor_action_head = hydra.utils.instantiate(
-        config.network.actor_network.action_head, action_dim=num_actions
+    # `num_actions` sizes the torso's merged vocabulary directly (no separate
+    # `action_head` to instantiate with it - see
+    # `TransformerMergedActionCoTTorso`/`FeedForwardActorFromTorso`).
+    actor_torso = hydra.utils.instantiate(
+        config.network.actor_network.pre_torso, num_actions=num_actions
     )
     # A `value_pre_torso`/`q_pre_torso` pair selects `SeparateValueAndQCritic`:
     # V and Q each get their own torso and share no parameters.
@@ -1242,7 +1021,7 @@ def learner_setup(
             config.network.critic_network.input_layer
         )
 
-    actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
+    actor_network = Actor(torso=actor_torso, **actor_kwargs)
 
     if qac_variant in ("naive", "fac", "cond_naive", "cond_fac"):
         value_head = hydra.utils.instantiate(config.network.critic_network.value_head)
@@ -1397,7 +1176,7 @@ def run_experiment(_config: DictConfig) -> float:
         evaluator_setup_with_compute_time(
             eval_env=eval_env,
             key_e=key_e,
-            eval_act_fn=get_distribution_act_fn_with_compute_time(config, actor_network.apply),
+            eval_act_fn=get_merged_action_act_fn_with_compute_time(config, actor_network.apply),
             params=learner_state.params.actor_params,
             config=config,
         )
@@ -1498,7 +1277,7 @@ def run_experiment(_config: DictConfig) -> float:
 
 @hydra.main(
     config_path="../../configs/default/anakin",
-    config_name="default_ramdp_ff_ppo_explicit_cot.yaml",
+    config_name="default_ramdp_ff_ppo_explicit_cot_merged.yaml",
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
@@ -1508,8 +1287,8 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     eval_performance = run_experiment(cfg)
 
     print(
-        f"{Fore.CYAN}{Style.BRIGHT}Compute-time-aware PPO with explicit CoT (RAMDP-PPO, "
-        f"explicit CoT) experiment completed{Style.RESET_ALL}"
+        f"{Fore.CYAN}{Style.BRIGHT}Compute-time-aware PPO with merged-action explicit CoT "
+        f"(RAMDP-PPO, merged-action explicit CoT) experiment completed{Style.RESET_ALL}"
     )
     return eval_performance
 

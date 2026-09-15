@@ -47,3 +47,33 @@ class FeedForwardActorWithComputeTime(nn.Module):
         action_distribution = self.action_head(obs_embedding, **(head_kwargs or {}))
 
         return (action_distribution, *torso_extra)
+
+
+class FeedForwardActorFromTorso(nn.Module):
+    """Like `FeedForwardActorWithComputeTime`, but for a torso that is
+    already a complete actor - e.g.
+    `stoix.networks.torso_compute_explicit_cot_merged.TransformerMergedActionCoTTorso`,
+    whose per-step categorical folds the environment action into the same
+    vocabulary as the thought tokens, so choosing a class both halts and
+    resolves the action in one draw. There is no continuous embedding left
+    over for a head to turn into an action afterwards - the torso's first
+    return value is already the resolved output (an `action` in rollout
+    mode, a `log_prob` in replay mode) - so, unlike
+    `FeedForwardActorWithComputeTime`, this has no `action_head` field at
+    all; every torso output is threaded straight through to the caller.
+    `input_layer` is kept (unlike `action_head`) since the CNN+transformer
+    explicit-CoT network variants still need it ahead of the torso."""
+
+    torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        observation: Observation,
+        input_kwargs: Optional[Dict] = None,
+        torso_kwargs: Optional[Dict] = None,
+    ) -> Tuple:
+
+        obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
+        return self.torso(obs_embedding, **(torso_kwargs or {}))

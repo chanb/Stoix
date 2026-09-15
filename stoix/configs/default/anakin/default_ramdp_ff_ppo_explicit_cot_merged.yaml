@@ -1,8 +1,8 @@
 defaults:
   - logger: logger
   - arch: anakin
-  - system: ramdp_vpg/ff_reinforce_explicit_cot
-  - network: transformer_explicit_cot
+  - system: ramdp_vpg/ff_ppo_explicit_cot_merged
+  - network: transformer_explicit_cot_merged
   - env: gymnax/cartpole
   - _self_
 

@@ -57,8 +57,8 @@ Grid axes:
                  parameterized IRU layer instead of one shared step reused at
                  every iteration, so max_steps grows the parameter count) |
                  transformer_explicit_cot (TransformerExplicitCoTTorso, explicit
-                 token CoT - only implemented for system=ff_reinforce, via
-                 stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py; requested
+                 token CoT - only implemented for system in EXPLICIT_COT_PPO_SYSTEMS,
+                 via stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py; requested
                  (system, architecture) combos outside that are skipped)
   - budget:      fixed number of steps every example takes (max_steps == min_steps)
   - hidden_dim:  actor torso width (network.actor_network.pre_torso.hidden_dim)
@@ -196,7 +196,7 @@ Usage:
       --delightful-eta 1.0,3.0                                    # sweep delightful PG on/off
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures mlp \\
       --use-layer-norm true,false --use-input-layer-norm true,false  # sweep LayerNorm options
-  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_reinforce \\
+  python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_fac \\
       --architectures transformer_explicit_cot                       # explicit-CoT sweep
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures gru,iru  # recurrent-block sweep
@@ -388,21 +388,18 @@ SERVER_MODULES = {
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
 # doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
-# it's only trained by a dedicated script per system (ff_reinforce_explicit_cot.py
-# for ff_reinforce, ff_ppo_explicit_cot.py for ff_ppo_explicit_*), not the plain
-# ff_reinforce.py/ff_ppo.py, so it's handled separately.
+# it's only trained by a dedicated script per system (ff_ppo_explicit_cot.py
+# for ff_ppo_explicit_*), not the plain ff_ppo.py, so it's handled separately.
 EXPLICIT_COT_ARCH = "transformer_explicit_cot"
-EXPLICIT_COT_SCRIPT_BY_SYSTEM = {"ff_reinforce": "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"}
-EXPLICIT_COT_SCRIPT_BY_SYSTEM.update(
-    (system, "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py") for system in EXPLICIT_COT_PPO_SYSTEMS
-)
+EXPLICIT_COT_SCRIPT_BY_SYSTEM = {
+    system: "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py" for system in EXPLICIT_COT_PPO_SYSTEMS
+}
 # ff_ppo_explicit_fac/naive/cond_naive/cond_fac use the separate-torso Q-V
 # critic network (transformer_explicit_cot_qac_separate_qv.yaml);
 # ff_ppo_explicit_reinforce uses the plain V-only network
-# (transformer_explicit_cot.yaml), same as ff_reinforce - see
-# ff_ppo_explicit_cot.py's learner_setup.
+# (transformer_explicit_cot.yaml) - see ff_ppo_explicit_cot.py's
+# learner_setup.
 EXPLICIT_COT_NETWORK_BY_SYSTEM = {
-    "ff_reinforce": "transformer_explicit_cot",
     "ff_ppo_explicit_fac": "transformer_explicit_cot_qac_separate_qv",
     "ff_ppo_explicit_naive": "transformer_explicit_cot_qac_separate_qv",
     "ff_ppo_explicit_cond_naive": "transformer_explicit_cot_qac_separate_qv",

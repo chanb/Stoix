@@ -113,9 +113,7 @@ script's behavior differs):
     five ff_ppo_explicit_* systems (explicit chain-of-thought PPO, trains
     stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py) and its
     transformer_explicit_cot/cnn+transformer_explicit_cot architectures (see
-    EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS) - unlike minatar/lightsout,
-    ff_reinforce is also a valid EXPLICIT_COT_SYSTEMS member here since
-    ff_reinforce_explicit_cot.py is env-agnostic. CNN architectures (including
+    EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS). CNN architectures (including
     cnn+transformer_explicit_cot) are only valid for env in
     {sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requesting one for
     knapsack (no spatial structure) is skipped (not errored), same as
@@ -352,37 +350,29 @@ JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
 # doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
-# it's only trained by a dedicated script per system (ff_reinforce_explicit_cot.py
-# for ff_reinforce, ff_ppo_explicit_cot.py for ff_ppo_explicit_*), not the plain
-# ff_reinforce.py/ff_ppo.py, so it's handled separately. Two architectures use
-# it: transformer_explicit_cot (flattened observation) and
-# cnn+transformer_explicit_cot (CNNTorso input_layer feeding the same torso,
-# see cnn_transformer_explicit_cot*.yaml) - both listed in CNN_ARCHES/below so
-# the CNN-vs-flatten observation handling in Job.command() applies uniformly.
-# Unlike lightsout/minatar, ff_reinforce is env-agnostic here too (via
-# ff_reinforce_explicit_cot.py) so it's included alongside the ff_ppo_explicit_*
-# systems.
+# it's only trained by a dedicated script per system (ff_ppo_explicit_cot.py
+# for ff_ppo_explicit_*), not the plain ff_ppo.py, so it's handled separately.
+# Two architectures use it: transformer_explicit_cot (flattened observation)
+# and cnn+transformer_explicit_cot (CNNTorso input_layer feeding the same
+# torso, see cnn_transformer_explicit_cot*.yaml) - both listed in
+# CNN_ARCHES/below so the CNN-vs-flatten observation handling in
+# Job.command() applies uniformly.
 EXPLICIT_COT_ARCH = "transformer_explicit_cot"
 CNN_EXPLICIT_COT_ARCH = "cnn+transformer_explicit_cot"
 EXPLICIT_COT_ARCHES = (EXPLICIT_COT_ARCH, CNN_EXPLICIT_COT_ARCH)
-EXPLICIT_COT_SCRIPT_BY_SYSTEM = {"ff_reinforce": "stoix/systems/ramdp_vpg/ff_reinforce_explicit_cot.py"}
-EXPLICIT_COT_SCRIPT_BY_SYSTEM.update(
-    (system, "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py") for system in EXPLICIT_COT_PPO_SYSTEMS
-)
+EXPLICIT_COT_SCRIPT_BY_SYSTEM = {
+    system: "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py" for system in EXPLICIT_COT_PPO_SYSTEMS
+}
 # Network name depends on both system (which qac_variant, or plain V-only for
-# ff_reinforce/ff_ppo_explicit_reinforce) and arch (flattened observation vs
-# CNN input) - nested the same way ARCH_TO_NETWORK is. Every value here is a
-# shared-torso base name - ff_ppo_explicit_fac/naive/cond_naive/cond_fac
-# (in QAC_SYSTEMS) go through `_qv_network_name` in Job.command() to
-# optionally switch to the separate-torso variant (Job.qv_critic ==
-# "separate"); ff_ppo_explicit_reinforce/ff_reinforce use the plain V-only
-# network unconditionally (no Q-V choice at all, see QAC_SYSTEMS) - see
-# ff_ppo_explicit_cot.py's/ff_reinforce_explicit_cot.py's learner_setup.
+# ff_ppo_explicit_reinforce) and arch (flattened observation vs CNN input) -
+# nested the same way ARCH_TO_NETWORK is. Every value here is a shared-torso
+# base name - ff_ppo_explicit_fac/naive/cond_naive/cond_fac (in QAC_SYSTEMS)
+# go through `_qv_network_name` in Job.command() to optionally switch to the
+# separate-torso variant (Job.qv_critic == "separate");
+# ff_ppo_explicit_reinforce uses the plain V-only network unconditionally (no
+# Q-V choice at all, see QAC_SYSTEMS) - see ff_ppo_explicit_cot.py's
+# learner_setup.
 EXPLICIT_COT_NETWORK_BY_SYSTEM = {
-    "ff_reinforce": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot",
-    },
     "ff_ppo_explicit_fac": {
         EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
         CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
