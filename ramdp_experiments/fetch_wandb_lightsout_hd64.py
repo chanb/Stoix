@@ -151,11 +151,13 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
 
         # lightsout-5x4, iCoT
         "config.system.use_expectile_value_loss": "True",
-        "config.env.scenario.name": "lightsout-5x4",
+        "config.env.scenario.name": "lightsout-6x4",
         "config.network.actor_network.pre_torso.use_rmsnorm": "True",
         "config.network.actor_network.pre_torso.use_input_layer_norm": "True",
         "config.system.clip_value_loss": "False",
         "config.network.actor_network.pre_torso.use_sandwich_norm": "False",
+        "config.system.gamma": "0.995",
+        "config.system.actor_weight_decay": "0.1",
     })
     out = []
     for r in runs:

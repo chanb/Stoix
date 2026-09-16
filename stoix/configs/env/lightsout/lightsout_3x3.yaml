@@ -14,6 +14,8 @@ kwargs:
   difficulty_threshold: 0.5
   # Defaults to m * n (grid_size) if omitted.
   episode_length: 6
+  # Episode length for the eval env only. Defaults to `episode_length` if omitted.
+  # eval_episode_length: 6
 
 # Defines the metric that will be used to evaluate the performance of the agent.
 # This metric is returned at the end of an experiment and can be used for hyperparameter tuning.

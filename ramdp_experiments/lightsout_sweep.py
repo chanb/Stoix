@@ -30,7 +30,11 @@ CNNTorso input_layer, while non-CNN architectures flatten it to a
 Grid axes:
   - grid_size:   Lights Out puzzle grid, e.g. "3x3" - sets env.scenario.name=
                  lightsout-<grid_size> and env.kwargs.episode_length=m*n
-                 (overridable via --episode-length)
+                 (overridable via --episode-length). The eval env's episode
+                 length defaults to the same value, independently overridable
+                 via --eval-episode-length - see stoix/envs/lightsout/
+                 lightsout_env.py / stoix/utils/make_env.py's
+                 make_lightsout_env.
   - system:      ff_reinforce (PonderNet-style REINFORCE, G - V) | ff_qac_fac (Q - V,
                  runtime-factorized) | ff_qac_naive (Q - V, full table) | ff_ppo_fac
                  (PPO, Q - V runtime-factorized) | ff_ppo_naive (PPO, Q - V full table) |
@@ -748,6 +752,7 @@ class Job:
     rollout_length: int
     difficulty_threshold: float
     episode_length: int
+    eval_episode_length: int
     gamma: float
     output_dir: Path
     wandb: bool
@@ -894,6 +899,7 @@ class Job:
             f"env.scenario.name={self.env}",
             f"env.scenario.task_name=lightsout_{self.grid_size}",
             f"env.kwargs.episode_length={self.episode_length}",
+            f"env.kwargs.eval_episode_length={self.eval_episode_length}",
             f"env.kwargs.difficulty_threshold={self.difficulty_threshold:g}",
             f"network={network}",
             f"system.gamma={self.gamma:g}",
@@ -1424,6 +1430,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             halting_hidden_dims = args.halting_hidden_dims[0]
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
+        eval_episode_length = (
+            args.eval_episode_length if args.eval_episode_length is not None else episode_length
+        )
         jobs.append(
             Job(
                 grid_size=grid_size,
@@ -1474,6 +1483,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 rollout_length=args.rollout_length,
                 difficulty_threshold=args.difficulty_threshold,
                 episode_length=episode_length,
+                eval_episode_length=eval_episode_length,
                 gamma=args.gamma,
                 output_dir=args.output_dir,
                 wandb=args.wandb,
@@ -1999,6 +2009,14 @@ def main() -> None:
         "(m * n) per grid size if omitted.",
     )
     parser.add_argument(
+        "--eval-episode-length",
+        type=int,
+        default=None,
+        help="env.kwargs.eval_episode_length (the eval env's episode length; the train env keeps "
+        "using --episode-length), applied to every job (not swept). Defaults to --episode-length "
+        "(i.e. train == eval) if omitted - see stoix/envs/lightsout/lightsout_env.py.",
+    )
+    parser.add_argument(
         "--gamma",
         type=float,
         default=0.99,
@@ -2277,6 +2295,8 @@ def main() -> None:
     print(
         f"  difficulty_threshold={args.difficulty_threshold} "
         f"episode_length={args.episode_length if args.episode_length is not None else 'grid_size (default)'} "
+        f"eval_episode_length="
+        f"{args.eval_episode_length if args.eval_episode_length is not None else 'episode_length (default)'} "
         f"gamma={args.gamma}"
     )
     print(

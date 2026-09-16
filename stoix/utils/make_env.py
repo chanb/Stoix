@@ -440,8 +440,9 @@ def make_lightsout_env(scenario_name: str, config: DictConfig) -> Tuple[Environm
 
     `scenario_name` (`config.env.scenario.name`) must be of the form
     `"lightsout-<m>x<n>"`, e.g. `"lightsout-3x3"`, setting the puzzle grid size.
-    `episode_length` defaults to `m * n`; both it and `difficulty_threshold` may
-    be overridden via `config.env.kwargs`. The eval environment samples harder
+    `episode_length` defaults to `m * n`; it, `difficulty_threshold`, and
+    `eval_episode_length` (defaults to `episode_length` if omitted) may be
+    overridden via `config.env.kwargs`. The eval environment samples harder
     (higher-`dist`) goals than the train environment - see `LightsOutEnv`.
     """
     from stoix.envs.lightsout.lightsout_env import LightsOutEnv, default_config
@@ -455,15 +456,25 @@ def make_lightsout_env(scenario_name: str, config: DictConfig) -> Tuple[Environm
     m, n = int(match.group(1)), int(match.group(2))
 
     env_kwargs = config.env.get("kwargs", {}) or {}
+    episode_length = env_kwargs.get("episode_length", m * n)
+    difficulty_threshold = env_kwargs.get("difficulty_threshold")
+
     env_config = default_config()
     env_config.m = m
     env_config.n = n
-    env_config.episode_length = env_kwargs.get("episode_length", m * n)
-    if "difficulty_threshold" in env_kwargs:
-        env_config.difficulty_threshold = env_kwargs["difficulty_threshold"]
+    env_config.episode_length = episode_length
+    if difficulty_threshold is not None:
+        env_config.difficulty_threshold = difficulty_threshold
+
+    eval_env_config = default_config()
+    eval_env_config.m = m
+    eval_env_config.n = n
+    eval_env_config.episode_length = env_kwargs.get("eval_episode_length", episode_length)
+    if difficulty_threshold is not None:
+        eval_env_config.difficulty_threshold = difficulty_threshold
 
     env = LightsOutEnv(env_config, eval=False)
-    eval_env = LightsOutEnv(env_config, eval=True)
+    eval_env = LightsOutEnv(eval_env_config, eval=True)
 
     env = NoExtrasWrapper(env)
     eval_env = NoExtrasWrapper(eval_env)

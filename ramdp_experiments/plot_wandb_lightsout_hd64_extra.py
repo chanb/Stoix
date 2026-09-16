@@ -13,8 +13,8 @@ Produces, per architecture:
      per vocab_size instead (lightsout_hd64_transformer-explicitcot_vocab
      <N>_pareto.pdf) - the vocab_size=1/budget=1 point is shared across all
      of them (see expand_vocab_agnostic_budget1 in the main script).
-  2. lightsout_hd64_<arch>_seed_variance.pdf - per-seed strip plot + mean/SE
-     point, budget on x, instead of collapsing straight to mean +/- SEM;
+  2. lightsout_hd64_<arch>_seed_variance.pdf - per-seed strip plot + mean/CI
+     point, budget on x, instead of collapsing straight to mean with a 95% CI;
      shows whether spread is genuine or one outlier seed.
   3. lightsout_hd64_<arch>_heatmap.pdf - (variant x budget) heatmap of final
      performance; a compact grid instead of many line/row panels.
@@ -23,7 +23,7 @@ Produces, per architecture:
      learning *speed* from final performance.
   5. lightsout_hd64_<arch>_compute_spaghetti.pdf - per-seed compute-time
      trajectories (adaptive-budget configs only) as individual thin lines
-     instead of a mean +/- SEM band, to see whether halting behavior is
+     instead of a mean with a 95% CI band, to see whether halting behavior is
      consistent across seeds or not.
   6. lightsout_hd64_pareto_{actor,evaluator}_{episode,discounted}_return.pdf
      - four combined 1x5 figures (paper-sized fonts), one per actor/evaluator
@@ -43,7 +43,7 @@ Produces, per architecture:
 
 Pass --trim N to the pareto plots (plot_pareto, plot_pareto_row) to drop the
 N highest- and N lowest-performing seeds from each budget/qac_variant group
-before averaging (a trimmed mean/SEM), so one or two outlier seeds don't
+before averaging (a trimmed mean/CI), so one or two outlier seeds don't
 dominate a group of only ~5.
 
 Usage:
@@ -61,7 +61,7 @@ from matplotlib.ticker import FormatStrFormatter
 
 import plot_wandb_lightsout_hd64 as base
 
-last_k_eval = 1
+last_k_eval = 3
 plt = base.plt
 sns = base.sns
 pd = base.pd
@@ -73,8 +73,9 @@ place_legend_and_title = base.place_legend_and_title
 budget_label = base.budget_label
 variant_row_label = base.variant_row_label
 compute_final_values = base.compute_final_values
-mean_sem_curve = base.mean_sem_curve
+mean_ci_curve = base.mean_ci_curve
 step_axis = base.step_axis
+CI95_Z = base.CI95_Z
 expand_vocab_agnostic_budget1 = base.expand_vocab_agnostic_budget1
 METRICS = base.METRICS
 METRIC_LABELS = base.METRIC_LABELS
@@ -137,7 +138,7 @@ def determine_primary_vocab(sub_arch: pd.DataFrame) -> int:
 
 def _trim_by_performance(g: pd.DataFrame, trim: int) -> pd.DataFrame:
     """Drops the `trim` lowest- and `trim` highest-value_perf seeds from a
-    (budget or qac_variant) group, for a trimmed mean/SEM robust to one or
+    (budget or qac_variant) group, for a trimmed mean/CI robust to one or
     two outlier seeds. No-op if there aren't enough seeds left over (need
     more than 2*trim to begin with)."""
     if trim <= 0 or len(g) <= 2 * trim:
@@ -146,15 +147,16 @@ def _trim_by_performance(g: pd.DataFrame, trim: int) -> pd.DataFrame:
 
 
 def _group_stats(g: pd.DataFrame, trim: int) -> "tuple[float, float, float, float, int]":
-    """(perf_mean, perf_sem, comp_mean, comp_sem, n) for one group, after
-    trimming (see _trim_by_performance)."""
+    """(perf_mean, perf_ci, comp_mean, comp_ci, n) for one group, after
+    trimming (see _trim_by_performance). perf_ci/comp_ci are normal-
+    approximation 95% CI half-widths (CI95_Z * SEM)."""
     g = _trim_by_performance(g, trim)
     n = len(g)
     perf_mean = g["value_perf"].mean()
-    perf_sem = g["value_perf"].std() / np.sqrt(n) if n > 1 else 0.0
+    perf_ci = CI95_Z * g["value_perf"].std() / np.sqrt(n) if n > 1 else 0.0
     comp_mean = g["value_compute"].mean()
-    comp_sem = g["value_compute"].std() / np.sqrt(n) if n > 1 else 0.0
-    return perf_mean, perf_sem, comp_mean, comp_sem, n
+    comp_ci = CI95_Z * g["value_compute"].std() / np.sqrt(n) if n > 1 else 0.0
+    return perf_mean, perf_ci, comp_mean, comp_ci, n
 
 
 def plot_pareto(
@@ -203,12 +205,12 @@ def plot_pareto(
         fixed = merged[merged["min_steps"] == merged["max_steps"]]
         if not fixed.empty:
             for i, (mn, g) in enumerate(sorted(fixed.groupby("min_steps"))):
-                perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
+                perf_mean, perf_ci, comp_mean, comp_ci, n = _group_stats(g, trim)
                 ax.errorbar(
                     [comp_mean],
                     [perf_mean],
-                    xerr=[comp_sem],
-                    yerr=[perf_sem],
+                    xerr=[comp_ci],
+                    yerr=[perf_ci],
                     marker="o",
                     color=fixed_color,
                     linestyle="none",
@@ -218,12 +220,12 @@ def plot_pareto(
 
         adaptive = merged[merged["min_steps"] != merged["max_steps"]]
         for qac_variant, g in adaptive.groupby("qac_variant"):
-            perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
+            perf_mean, perf_ci, comp_mean, comp_ci, n = _group_stats(g, trim)
             ax.errorbar(
                 [comp_mean],
                 [perf_mean],
-                xerr=[comp_sem],
-                yerr=[perf_sem],
+                xerr=[comp_ci],
+                yerr=[perf_ci],
                 marker=qac_markers.get(qac_variant, "*"),
                 markersize=7,
                 color=qac_colors.get(qac_variant, "0.5"),
@@ -236,7 +238,7 @@ def plot_pareto(
         ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
         ax.set_title(METRIC_LABELS[metric], fontsize=9)
         if col == 0:
-            ax.set_ylabel("Final performance\n(mean of last {} evals, ± SEM)".format(last_k_eval), fontsize=8)
+            ax.set_ylabel("Final performance\n(mean of last {} evals, 95% CI)".format(last_k_eval), fontsize=8)
 
     fig.supxlabel("Final mean compute steps $c$")
     title = f"{arch_label(arch)}: Compute vs. Performance"
@@ -343,12 +345,12 @@ def plot_pareto_row(
         fixed = merged[merged["min_steps"] == merged["max_steps"]]
         if not fixed.empty:
             for i, (mn, g) in enumerate(sorted(fixed.groupby("min_steps"))):
-                perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
+                perf_mean, perf_ci, comp_mean, comp_ci, n = _group_stats(g, trim)
                 ax.errorbar(
                     [comp_mean],
                     [perf_mean],
-                    xerr=[comp_sem],
-                    yerr=[perf_sem],
+                    xerr=[comp_ci],
+                    yerr=[perf_ci],
                     marker="o",
                     markersize=6,
                     color=fixed_color,
@@ -359,12 +361,12 @@ def plot_pareto_row(
 
         adaptive = merged[merged["min_steps"] != merged["max_steps"]]
         for qac_variant, g in adaptive.groupby("qac_variant"):
-            perf_mean, perf_sem, comp_mean, comp_sem, n = _group_stats(g, trim)
+            perf_mean, perf_ci, comp_mean, comp_ci, n = _group_stats(g, trim)
             ax.errorbar(
                 [comp_mean],
                 [perf_mean],
-                xerr=[comp_sem],
-                yerr=[perf_sem],
+                xerr=[comp_ci],
+                yerr=[perf_ci],
                 marker=qac_markers.get(qac_variant, "*"),
                 markersize=9,
                 color=qac_colors.get(qac_variant, "0.5"),
@@ -452,7 +454,7 @@ def plot_learning_curves(
     vocab_size) - the same 5-column grouping as plot_pareto_row - with every
     fixed-budget curve (grayscale) and every adaptive-budget qac_variant
     curve (PPO/Factorized/Separated, each its own colorblind color)
-    overlaid in the same panel, mean +/- SEM across seeds. Unlike the main
+    overlaid in the same panel, mean with a 95% CI across seeds. Unlike the main
     script's plot_arch (one row per qac_variant), this puts the full
     compute/algorithm sweep for one architecture in a single panel."""
     columns = pareto_columns(df)
@@ -474,29 +476,29 @@ def plot_learning_curves(
         fixed_budgets = sorted(col_df.loc[col_df["min_steps"] == col_df["max_steps"], "min_steps"].unique())
         for mn in fixed_budgets:
             b_df = col_df[(col_df["min_steps"] == mn) & (col_df["max_steps"] == mn)]
-            result = mean_sem_curve(b_df, metric)
+            result = mean_ci_curve(b_df, metric)
             if result is None:
                 continue
-            eval_idx, mean, sem = result
+            eval_idx, mean, ci = result
             steps = step_axis(b_df).reindex(eval_idx).to_numpy()
             color = fixed_colors[mn]
             ax.plot(steps, mean, color=color, linewidth=1.3, label=f"Uniform budget={mn}")
-            ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
+            ax.fill_between(steps, mean - ci, mean + ci, color=color, alpha=0.15)
 
         adaptive_df = col_df[col_df["min_steps"] != col_df["max_steps"]]
         for qac_variant in QAC_VARIANT_ORDER:
             v_df = adaptive_df[adaptive_df["qac_variant"] == qac_variant]
-            result = mean_sem_curve(v_df, metric)
+            result = mean_ci_curve(v_df, metric)
             if result is None:
                 continue
-            eval_idx, mean, sem = result
+            eval_idx, mean, ci = result
             steps = step_axis(v_df).reindex(eval_idx).to_numpy()
             color = qac_colors[qac_variant]
             ax.plot(
                 steps, mean, color=color, linewidth=1.8,
                 label=f"Adaptive {variant_row_label(qac_variant, False)}",
             )
-            ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
+            ax.fill_between(steps, mean - ci, mean + ci, color=color, alpha=0.15)
 
         ax.grid(True, alpha=0.3)
         ax.tick_params(labelsize=fs["tick"])
@@ -541,7 +543,7 @@ def plot_seed_variance(
 ) -> None:
     """Per-seed final performance as a strip plot (budget on x, one column
     per seed's dot) plus a mean +/- SE point marker, instead of the main
-    script's mean +/- SEM line - makes it possible to spot a single outlier
+    script's mean with a 95% CI line - makes it possible to spot a single outlier
     seed driving a wide error bar."""
     sub_arch = df[df["arch"] == arch]
     return_metrics = METRICS[:2]
@@ -591,7 +593,7 @@ def plot_seed_variance(
             palette=variant_palette,
             ax=ax,
             dodge=0.4 if dodge else False,
-            errorbar="se",
+            errorbar=("se", CI95_Z),
             markers="D",
             markersize=4,
             linestyle="none",
@@ -606,7 +608,7 @@ def plot_seed_variance(
         ax.grid(True, alpha=0.3, axis="y")
         ax.tick_params(axis="x", rotation=45)
         if col == 0:
-            ax.set_ylabel("Final performance\n(per-seed dots + mean ± SE)", fontsize=8)
+            ax.set_ylabel("Final performance\n(per-seed dots + mean, 95% CI)", fontsize=8)
         else:
             ax.set_ylabel("")
 
@@ -773,7 +775,7 @@ def plot_steps_to_threshold(
             hue_order=hue_order,
             palette=variant_palette,
             ax=ax,
-            errorbar="se",
+            errorbar=("se", CI95_Z),
             capsize=0.08,
             err_kws={"linewidth": 1.0},
         )
@@ -786,7 +788,7 @@ def plot_steps_to_threshold(
         ax.tick_params(axis="x", rotation=45)
         ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
         if col == 0:
-            ax.set_ylabel(f"Timesteps to {int(frac * 100)}% of final\n(mean ± SE across seeds)", fontsize=8)
+            ax.set_ylabel(f"Timesteps to {int(frac * 100)}% of final\n(mean, 95% CI across seeds)", fontsize=8)
         else:
             ax.set_ylabel("")
 
@@ -807,7 +809,7 @@ def plot_steps_to_threshold(
 
 def plot_compute_spaghetti(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -> None:
     """Per-seed compute-time trajectories for adaptive-budget configs only,
-    as individual thin lines rather than a mean +/- SEM band - the main
+    as individual thin lines rather than a mean with a 95% CI band - the main
     script's compute-time panels only show the aggregate, which can hide a
     seed that never learns to halt early."""
     sub_arch = df[df["arch"] == arch]
@@ -869,7 +871,7 @@ def main() -> None:
         default=0,
         help="For the pareto plots (plot_pareto, plot_pareto_row), drop this many highest- and "
         "lowest-performing seeds from each budget/qac_variant group before averaging (trimmed "
-        "mean/SEM). 0 (default) keeps the plain mean/SEM over all seeds.",
+        "mean/CI). 0 (default) keeps the plain mean/CI over all seeds.",
     )
     args = parser.parse_args()
 

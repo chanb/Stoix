@@ -5,8 +5,8 @@ fetch_wandb_lightsout_hd64.py, which produces the input CSV).
 
 For each architecture, produces one figure: rows are (qac_variant, stop-
 gradient-halting) settings actually swept for that architecture, columns are
-the three metrics, and each line is one compute budget (mean +/- standard
-error across 5 seeds). qac_variant only varies at the adaptive budget (min_steps=1,
+the three metrics, and each line is one compute budget (mean with a 95%
+CI band across 5 seeds). qac_variant only varies at the adaptive budget (min_steps=1,
 max_steps=5) - fixed budgets (min_steps == max_steps) have a single
 "reinforce" row since there's no halting decision to train.
 
@@ -36,6 +36,7 @@ import seaborn as sns
 
 sns.set_palette("colorblind")
 doc_width_pt = 452.9679
+CI95_Z = 1.96  # normal-approximation 95% CI half-width, in units of SEM
 
 METRICS = [
     "actor/episode_return/mean",
@@ -144,10 +145,10 @@ def variant_row_label(qac_variant: str, sgh: bool, vocab_size: int = VOCAB_SIZE_
     return label
 
 
-def mean_sem_curve(sub: pd.DataFrame, metric: str):
-    """sub has one row per (seed, eval_idx). Returns (eval_idx, mean, sem)
+def mean_ci_curve(sub: pd.DataFrame, metric: str):
+    """sub has one row per (seed, eval_idx). Returns (eval_idx, mean, ci)
     aggregated across seeds, restricted to eval_idx present for every seed.
-    sem = std / sqrt(n_seeds)."""
+    ci = normal-approximation 95% CI half-width = CI95_Z * std / sqrt(n_seeds)."""
     pivot = sub.pivot_table(index="eval_idx", columns="seed", values=metric)
     pivot = pivot.dropna(how="any")
     if pivot.empty:
@@ -155,7 +156,8 @@ def mean_sem_curve(sub: pd.DataFrame, metric: str):
     x = pivot.index.to_numpy()
     mean = pivot.mean(axis=1).to_numpy()
     sem = pivot.std(axis=1).to_numpy() / np.sqrt(pivot.shape[1])
-    return x, mean, sem
+    ci = CI95_Z * sem
+    return x, mean, ci
 
 
 def step_axis(sub: pd.DataFrame):
@@ -227,7 +229,7 @@ def plot_budget_vs_performance(
     df: pd.DataFrame, arch: str, variant_colors: dict, output_path: Path, out_dir: Path
 ) -> None:
     """For one architecture: x-axis is the fixed compute budget, y-axis is
-    final performance (mean of the last 3 evals, mean +/- standard error
+    final performance (mean of the last 3 evals, mean with a 95% CI
     across 5 seeds); one panel per return metric. Adaptive-budget models (which don't
     have a single x position) are drawn as horizontal reference lines
     spanning the fixed-budget range instead. Architectures with a
@@ -259,11 +261,11 @@ def plot_budget_vs_performance(
 
             fixed = final_df[final_df["min_steps"] == final_df["max_steps"]]
             fixed_stats = fixed.groupby("min_steps")["value"].agg(["mean", "std", "count"]).sort_index()
-            fixed_sem = fixed_stats["std"] / np.sqrt(fixed_stats["count"])
+            fixed_ci = CI95_Z * fixed_stats["std"] / np.sqrt(fixed_stats["count"])
             ax.errorbar(
                 fixed_stats.index,
                 fixed_stats["mean"],
-                yerr=fixed_sem,
+                yerr=fixed_ci,
                 marker="o",
                 capsize=3,
                 color="0.25",
@@ -274,12 +276,12 @@ def plot_budget_vs_performance(
             adaptive = final_df[final_df["min_steps"] != final_df["max_steps"]]
             for qac_variant, g in adaptive.groupby("qac_variant"):
                 mean = g["value"].mean()
-                sem = g["value"].std() / np.sqrt(len(g))
+                ci = CI95_Z * g["value"].std() / np.sqrt(len(g))
                 color = variant_colors[(qac_variant, False)]
                 mn, mx = g["min_steps"].iloc[0], g["max_steps"].iloc[0]
                 label = f"{variant_row_label(qac_variant, False)} (adaptive[{mn}-{mx}])"
                 ax.axhline(mean, color=color, linestyle="--", linewidth=1.3, label=label)
-                ax.axhspan(mean - sem, mean + sem, color=color, alpha=0.12)
+                ax.axhspan(mean - ci, mean + ci, color=color, alpha=0.12)
 
             ax.set_xticks(all_fixed_budgets)
             ax.set_xlim(min(all_fixed_budgets) - 0.5, max(all_fixed_budgets) + 0.5)
@@ -290,7 +292,7 @@ def plot_budget_vs_performance(
                 ax.set_xlabel("Uniform compute budget")
             if col == 0:
                 row_label = f"vocab={vocab_size}\n\n" if has_vocab else ""
-                ax.set_ylabel(f"{row_label}Final performance\n(mean of last 3 evals, ± SEM)", fontsize=8)
+                ax.set_ylabel(f"{row_label}Final performance\n(mean of last 3 evals, 95% CI)", fontsize=8)
 
     by_label: Dict[str, object] = {}
     for r in range(n_rows):
@@ -343,14 +345,14 @@ def plot_arch(df: pd.DataFrame, arch: str, budget_colors: dict, output_path: Pat
             for mn, mx in budgets:
                 b_label = budget_label(mn, mx)
                 b_df = row_df[(row_df["min_steps"] == mn) & (row_df["max_steps"] == mx)]
-                result = mean_sem_curve(b_df, metric)
+                result = mean_ci_curve(b_df, metric)
                 if result is None:
                     continue
-                eval_idx, mean, sem = result
+                eval_idx, mean, ci = result
                 steps = step_axis(b_df).reindex(eval_idx).to_numpy()
                 color = budget_colors[b_label]
                 ax.plot(steps, mean, label=b_label, color=color, linewidth=1.2)
-                ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
+                ax.fill_between(steps, mean - ci, mean + ci, color=color, alpha=0.15)
             ax.grid(True, alpha=0.3)
             if row == 0:
                 ax.set_title(METRIC_LABELS[metric], fontsize=9)
@@ -394,14 +396,14 @@ def plot_headline_comparison(df: pd.DataFrame, output_path: Path, out_dir: Path)
         ax = axes[col]
         for arch in ARCH_ORDER:
             arch_df = sub[sub["arch"] == arch]
-            result = mean_sem_curve(arch_df, metric)
+            result = mean_ci_curve(arch_df, metric)
             if result is None:
                 continue
-            eval_idx, mean, sem = result
+            eval_idx, mean, ci = result
             steps = step_axis(arch_df).reindex(eval_idx).to_numpy()
             color = arch_colors[arch]
             ax.plot(steps, mean, label=arch_label(arch), color=color, linewidth=1.4)
-            ax.fill_between(steps, mean - sem, mean + sem, color=color, alpha=0.15)
+            ax.fill_between(steps, mean - ci, mean + ci, color=color, alpha=0.15)
         ax.set_title(METRIC_LABELS[metric], fontsize=9)
         ax.set_xlabel("Timesteps")
         ax.grid(True, alpha=0.3)
