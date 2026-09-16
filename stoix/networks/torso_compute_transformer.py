@@ -69,6 +69,16 @@ def _norm_cls(use_rmsnorm: bool):
     return nn.RMSNorm if use_rmsnorm else nn.LayerNorm
 
 
+def _resolve_qkv_dim(hidden_dim: int, qkv_dim: Optional[int]) -> int:
+    """`hidden_dim` if `qkv_dim` is unset (`None`, the default everywhere it
+    appears), else `qkv_dim` itself. Shared between `TransformerBlock` (whose
+    `head_dim = qkv_dim // num_heads`) and every caller that pre-allocates
+    `TransformerBlock.step`'s per-layer KV-cache, whose shape depends on that
+    same `head_dim` - both need the identical default-resolution so the
+    cache is sized to match what the block actually writes into it."""
+    return hidden_dim if qkv_dim is None else qkv_dim
+
+
 class TransformerBlock(nn.Module):
     """A single transformer block: self-attention + MLP, pre-norm by default.
 
@@ -114,6 +124,15 @@ class TransformerBlock(nn.Module):
     `nn.LayerNorm` to `nn.RMSNorm` - see `_norm_cls`. Independent of
     `use_sandwich_norm`: it only changes which norm module is used
     everywhere it's already placed, not where norms are placed.
+
+    `qkv_dim` (default `None`, meaning "same as `hidden_dim`") sets the total
+    Q/K/V projection width (`num_heads * head_dim`), decoupled from
+    `hidden_dim` - the residual-stream width that the block's input/output,
+    `out_proj`, and the MLP all still use. `out_proj` (a `DenseGeneral`
+    contracting over `(num_heads, head_dim)`) maps attention's output back to
+    `hidden_dim` regardless of how `qkv_dim` compares to it, so attention can
+    run narrower or wider than the residual stream without changing anything
+    else in the block.
     """
 
     hidden_dim: int
@@ -123,12 +142,14 @@ class TransformerBlock(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     def setup(self) -> None:
-        assert self.hidden_dim % self.num_heads == 0, (
-            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
+        assert qkv_dim % self.num_heads == 0, (
+            f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
         )
-        head_dim = self.hidden_dim // self.num_heads
+        head_dim = qkv_dim // self.num_heads
         dense = lambda name: nn.DenseGeneral(  # noqa: E731
             axis=-1, features=(self.num_heads, head_dim), kernel_init=self.kernel_init, name=name
         )
@@ -267,6 +288,7 @@ class _CoTStep(nn.Module):
     halting_hidden_dims: Tuple[int, ...] = ()
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     @nn.compact
     def __call__(
@@ -304,6 +326,7 @@ class _CoTStep(nn.Module):
                 self.kernel_init,
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
+                self.qkv_dim,
             )
             for _ in range(self.num_layers)
         ]
@@ -518,6 +541,13 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `use_rmsnorm` (default `False`) switches every norm in this torso -
     `use_input_layer_norm`'s norm on the initial token, and every norm inside
     the shared `TransformerBlock`s - from `nn.LayerNorm` to `nn.RMSNorm`.
+
+    `qkv_dim` (default `None`, meaning "same as `hidden_dim`") is forwarded
+    to every shared `TransformerBlock` - see that class's docstring. Setting
+    it lets the Q/K/V projections (and thus attention) run at a different
+    width than `hidden_dim`, which stays the width of the initial
+    observation-projection Dense layer, the residual stream, and everything
+    else (positional embedding, `out_proj`, MLP, halting head).
     """
 
     hidden_dim: int
@@ -535,6 +565,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     halting_hidden_dims: Tuple[int, ...] = ()
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     @nn.compact
     def __call__(
@@ -581,8 +612,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
                 f"min_steps must be between 1 and max_steps ({self.max_steps}), "
                 f"got min_steps={self.min_steps}."
             )
-        assert self.hidden_dim % self.num_heads == 0, (
-            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
+        assert qkv_dim % self.num_heads == 0, (
+            f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
         )
 
         # The first scratchpad token is the observation projected into the
@@ -595,7 +627,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         # `_CoTStep`/`TransformerBlock.step` are set incrementally, and
         # not-yet-written positions are masked out of attention (see
         # `TransformerBlock.step`), never read.
-        head_dim = self.hidden_dim // self.num_heads
+        head_dim = qkv_dim // self.num_heads
         cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
@@ -636,6 +668,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.halting_hidden_dims,
             self.use_sandwich_norm,
             self.use_rmsnorm,
+            self.qkv_dim,
         )
 
         initial_carry = (

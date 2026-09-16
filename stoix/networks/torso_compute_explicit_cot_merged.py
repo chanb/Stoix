@@ -58,7 +58,7 @@ import numpy as np
 from flax import linen as nn
 from flax.linen.initializers import Initializer, normal, orthogonal
 
-from stoix.networks.torso_compute_transformer import TransformerBlock, _norm_cls
+from stoix.networks.torso_compute_transformer import TransformerBlock, _norm_cls, _resolve_qkv_dim
 from stoix.networks.utils import parse_activation_fn
 
 _NEG_INF = jnp.finfo(jnp.float32).min
@@ -95,6 +95,7 @@ class _MergedActionCoTBackbone(nn.Module):
     use_latent_feedback: bool
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     def setup(self) -> None:
         self.pos_embedding = self.param(
@@ -121,6 +122,7 @@ class _MergedActionCoTBackbone(nn.Module):
                 self.kernel_init,
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
+                self.qkv_dim,
             )
             for _ in range(self.num_layers)
         ]
@@ -178,7 +180,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
     classes - see module docstring.
 
     `min_steps`/`max_steps`/`use_latent_feedback`/`use_sandwich_norm`/
-    `use_rmsnorm` all mean exactly what they mean on
+    `use_rmsnorm`/`qkv_dim` all mean exactly what they mean on
     `TransformerExplicitCoTTorso` - see that class's docstring.
     """
 
@@ -196,6 +198,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
     use_latent_feedback: bool = False
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     @nn.compact
     def __call__(
@@ -261,6 +264,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
             self.use_latent_feedback,
             self.use_sandwich_norm,
             self.use_rmsnorm,
+            self.qkv_dim,
         )
 
         # Per-step legality mask (shape `(max_steps, num_classes)`) - see
@@ -312,10 +316,11 @@ class TransformerMergedActionCoTTorso(nn.Module):
         # KV-cached step-by-step build, shared by rollout mode and (when
         # `use_latent_feedback=True`) replay mode - see
         # `torso_compute_explicit_cot.py`'s identical scanned path.
-        assert self.hidden_dim % self.num_heads == 0, (
-            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
+        assert qkv_dim % self.num_heads == 0, (
+            f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
         )
-        head_dim = self.hidden_dim // self.num_heads
+        head_dim = qkv_dim // self.num_heads
         cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]

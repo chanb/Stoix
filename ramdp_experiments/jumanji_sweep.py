@@ -33,7 +33,7 @@ system/architecture/PPO-knob/env-difficulty-knob descriptions):
     lr, critic_lr, delightful, delightful_eta, epochs, num_minibatches,
     clip_eps, clip_value_loss, gae_lambda, recompute_advantages, critic_before_actor,
     use_layer_norm, use_input_layer_norm,
-    num_layers, num_heads, mlp_dim, vocab_size, use_latent_feedback, qv_critic, seed: identical
+    num_layers, num_heads, mlp_dim, qkv_dim, vocab_size, use_latent_feedback, qv_critic, seed: identical
     semantics to jumanji_fixed_budget_sweep.py, including its five ff_ppo_explicit_*
     systems and its transformer_explicit_cot/cnn+transformer_explicit_cot
     architectures (see EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS). qv_critic
@@ -659,6 +659,7 @@ class Job:
     num_layers: int
     num_heads: int
     mlp_dim: int
+    qkv_dim: int
     vocab_size: int
     use_latent_feedback: bool
     use_sandwich_norm: bool
@@ -708,6 +709,8 @@ class Job:
         )
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             net += f"-nh{self.num_heads}-md{self.mlp_dim}"
+            if self.qkv_dim:
+                net += f"-qkv{self.qkv_dim}"
         # Only shown for the explicit-CoT arches - vocab_size doesn't exist on
         # any other architecture, see EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
@@ -861,6 +864,12 @@ class Job:
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
+            if self.qkv_dim:
+                # Decouples the Q/K/V projection width from hidden_dim - see
+                # stoix/networks/torso_compute_transformer.py's TransformerBlock
+                # docstring. 0 (unset) omits the override entirely so the torso
+                # falls back to its own qkv_dim == hidden_dim default.
+                cmd.append(f"++network.actor_network.pre_torso.qkv_dim={self.qkv_dim}")
             # Sandwich LayerNorm placement / RMSNorm instead of LayerNorm - every
             # TransformerBlock-based torso only, same applicability as num_heads/
             # mlp_dim above - see stoix/networks/torso_compute_transformer.py's
@@ -1072,6 +1081,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             is_transformer_arch = arch in TRANSFORMER_ARCHES or arch in EXPLICIT_COT_ARCHES
             num_heads_options = args.num_heads if is_transformer_arch else [args.num_heads[0]]
             mlp_dim_options = args.mlp_dim if is_transformer_arch else [args.mlp_dim[0]]
+            qkv_dim_options = args.qkv_dim if is_transformer_arch else [args.qkv_dim[0]]
             vocab_size_options = (
                 args.vocab_size if arch in EXPLICIT_COT_ARCHES else [args.vocab_size[0]]
             )
@@ -1110,35 +1120,37 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 for num_layers in num_layers_options:
                     for num_heads in num_heads_options:
                         for mlp_dim in mlp_dim_options:
-                            for (
-                                vocab_size,
-                                use_latent_feedback,
-                                stop_gradient_halting_input,
-                                use_sandwich_norm,
-                                use_rmsnorm,
-                            ) in itertools.product(
-                                vocab_size_options,
-                                use_latent_feedback_options,
-                                stop_gradient_halting_input_options,
-                                use_sandwich_norm_options,
-                                use_rmsnorm_options,
-                            ):
-                                system_arch_ln_combos.append(
-                                    (
-                                        system,
-                                        arch,
-                                        use_layer_norm,
-                                        use_input_layer_norm,
-                                        num_layers,
-                                        num_heads,
-                                        mlp_dim,
-                                        vocab_size,
-                                        use_latent_feedback,
-                                        stop_gradient_halting_input,
-                                        use_sandwich_norm,
-                                        use_rmsnorm,
+                            for qkv_dim in qkv_dim_options:
+                                for (
+                                    vocab_size,
+                                    use_latent_feedback,
+                                    stop_gradient_halting_input,
+                                    use_sandwich_norm,
+                                    use_rmsnorm,
+                                ) in itertools.product(
+                                    vocab_size_options,
+                                    use_latent_feedback_options,
+                                    stop_gradient_halting_input_options,
+                                    use_sandwich_norm_options,
+                                    use_rmsnorm_options,
+                                ):
+                                    system_arch_ln_combos.append(
+                                        (
+                                            system,
+                                            arch,
+                                            use_layer_norm,
+                                            use_input_layer_norm,
+                                            num_layers,
+                                            num_heads,
+                                            mlp_dim,
+                                            qkv_dim,
+                                            vocab_size,
+                                            use_latent_feedback,
+                                            stop_gradient_halting_input,
+                                            use_sandwich_norm,
+                                            use_rmsnorm,
+                                        )
                                     )
-                                )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
     if n_skipped_incompatible:
         print(
@@ -1177,6 +1189,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 num_layers,
                 num_heads,
                 mlp_dim,
+                qkv_dim,
                 vocab_size,
                 use_latent_feedback,
                 stop_gradient_halting_input,
@@ -1325,6 +1338,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     num_layers=num_layers,
                     num_heads=num_heads,
                     mlp_dim=mlp_dim,
+                    qkv_dim=qkv_dim,
                     vocab_size=vocab_size,
                     use_latent_feedback=use_latent_feedback,
                     use_sandwich_norm=use_sandwich_norm,
@@ -1673,6 +1687,17 @@ def main() -> None:
     parser.add_argument("--num-heads", default="4", help="Comma-separated ints (transformer archs only).")
     parser.add_argument("--mlp-dim", default="256", help="Comma-separated ints (transformer archs only).")
     parser.add_argument(
+        "--qkv-dim",
+        default="0",
+        help="Comma-separated ints - network.actor_network.pre_torso.qkv_dim: the total Q/K/V "
+        "projection width inside every TransformerBlock, decoupled from hidden_dim (the "
+        "residual-stream/input-projection width) - see "
+        "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. 0 (default) "
+        "means unset - the override is omitted and the torso falls back to qkv_dim == hidden_dim, "
+        "its original behavior. Only applies to TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES (same "
+        "applicability as --num-heads/--mlp-dim); ignored (forced to the first value) otherwise.",
+    )
+    parser.add_argument(
         "--vocab-size",
         default="32",
         help="Comma-separated ints - thought-token vocabulary size "
@@ -1829,6 +1854,7 @@ def main() -> None:
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
     args.num_heads = [int(x) for x in args.num_heads.split(",")]
     args.mlp_dim = [int(x) for x in args.mlp_dim.split(",")]
+    args.qkv_dim = [int(x) for x in args.qkv_dim.split(",")]
     args.vocab_size = [int(x) for x in args.vocab_size.split(",")]
     args.use_latent_feedback = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_latent_feedback.split(",")

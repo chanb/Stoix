@@ -739,3 +739,16 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_cond_fac --max-steps 
 
 python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 1 --runs-per-gpu 1 --architectures cnn+iru --hidden-dim 64 --num-layers 2 --total-timesteps 2e9 --clip-value-loss false --lr 3e-4 --critic-lr 3e-4 --envs sokoban --sokoban-generator unfiltered-train --gpus 2 --rollout-length 20 --total-num-envs 128 --epochs 2 --num-minibatches 4 --ent-coef 0.01 --gamma 0.99 --actor-weight-decay 0.005 --critic-before-actor false --wandb true --wandb-project sokoban-sep9 --yes --no-skip-existing --standardize-advantages true --use-input-layer-norm true --gae-lambda 0.95
 ```
+
+```
+project_name=final_merged_space-qkv
+vocab_size=1,2,4,8,16
+
+python ramdp_experiments/lightsout_sweep.py --systems ff_ppo_explicit_merged_reinforce --max-steps 5 --seeds 5 --vocab-size=${vocab_size} --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 256 --qkv-dim 128 --num-layers 2 --num-heads 8 --total-timesteps 3e8 --grid-sizes 6x5 --episode-length 30 --difficulty-threshold 0.5 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --use-rmsnorm true --ent-coef 0.01 --clip-eps 0.2 --gamma 0.999 --actor-weight-decay 0.02 --gae-lambda 0.95 --standardize-advantages true --wandb true --wandb-project lightsout-ecot-${project_name} --output-dir /home/bryanpu1/scratch/logs/ramdp/lightsout-ecot-${project_name} --runs-per-gpu 2 --gpus 0,1 --no-skip-existing --yes --use-expectile-value-loss true --max-grad-norm 0.5 &
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_merged_reinforce --budget 1,2,3 --seeds 5 --vocab-size=${vocab_size} --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 256 --qkv-dim 128 --num-layers 2 --num-heads 8 --total-timesteps 3e8 --grid-sizes 6x5 --episode-length 30 --difficulty-threshold 0.5 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --use-rmsnorm true --ent-coef 0.01 --clip-eps 0.2 --gamma 0.999 --actor-weight-decay 0.02 --gae-lambda 0.95 --standardize-advantages true --wandb true --wandb-project lightsout-ecot-${project_name} --output-dir /home/bryanpu1/scratch/logs/ramdp/lightsout-ecot-${project_name} --runs-per-gpu 2 --gpus 2,3,4 --no-skip-existing --yes --use-expectile-value-loss true --max-grad-norm 0.5 &
+
+python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_merged_reinforce --budget 4,5 --seeds 5 --vocab-size=${vocab_size} --architectures transformer_explicit_cot --hidden-dim 32 --mlp-dim 256 --qkv-dim 128 --num-layers 2 --num-heads 8 --total-timesteps 3e8 --grid-sizes 6x5 --episode-length 30 --difficulty-threshold 0.5 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --use-rmsnorm true --ent-coef 0.01 --clip-eps 0.2 --gamma 0.999 --actor-weight-decay 0.02 --gae-lambda 0.95 --standardize-advantages true --wandb true --wandb-project lightsout-ecot-${project_name} --output-dir /home/bryanpu1/scratch/logs/ramdp/lightsout-ecot-${project_name} --runs-per-gpu 2 --gpus 5,6,7 --no-skip-existing --yes --use-expectile-value-loss true --max-grad-norm 0.5 &
+
+wait
+```

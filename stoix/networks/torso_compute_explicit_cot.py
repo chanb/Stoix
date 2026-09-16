@@ -105,7 +105,7 @@ import numpy as np
 from flax import linen as nn
 from flax.linen.initializers import Initializer, normal, orthogonal
 
-from stoix.networks.torso_compute_transformer import TransformerBlock, _norm_cls
+from stoix.networks.torso_compute_transformer import TransformerBlock, _norm_cls, _resolve_qkv_dim
 from stoix.networks.utils import parse_activation_fn
 
 _NEG_INF = jnp.finfo(jnp.float32).min
@@ -161,6 +161,7 @@ class _ExplicitCoTBackbone(nn.Module):
     use_latent_feedback: bool
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     def setup(self) -> None:
         self.pos_embedding = self.param(
@@ -187,6 +188,7 @@ class _ExplicitCoTBackbone(nn.Module):
                 self.kernel_init,
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
+                self.qkv_dim,
             )
             for _ in range(self.num_layers)
         ]
@@ -278,6 +280,14 @@ class TransformerExplicitCoTTorso(nn.Module):
     `use_rmsnorm` switches every norm in this torso - `use_input_layer_norm`'s
     norm on the initial token, and every norm inside the shared
     `TransformerBlock`s - from `nn.LayerNorm` to `nn.RMSNorm`.
+
+    `qkv_dim` (default `None`, meaning "same as `hidden_dim`") is forwarded
+    to every shared `TransformerBlock` - see
+    `stoix.networks.torso_compute_transformer.TransformerBlock`'s docstring.
+    Setting it lets the Q/K/V projections run at a different width than
+    `hidden_dim`, which stays the width of the initial observation-projection
+    Dense layer, the token embedding table, the residual stream, and
+    everything else.
     """
 
     hidden_dim: int
@@ -293,6 +303,7 @@ class TransformerExplicitCoTTorso(nn.Module):
     use_latent_feedback: bool = False
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    qkv_dim: Optional[int] = None
 
     @nn.compact
     def __call__(
@@ -360,6 +371,7 @@ class TransformerExplicitCoTTorso(nn.Module):
             self.use_latent_feedback,
             self.use_sandwich_norm,
             self.use_rmsnorm,
+            self.qkv_dim,
         )
 
         # Per-step "act now" legality, precomputed once as a constant boolean
@@ -463,10 +475,11 @@ class TransformerExplicitCoTTorso(nn.Module):
         # `target_tokens`) and what they accumulate (compute_time/emitted
         # tokens vs. log_prob) - everything else, including the cache update,
         # is identical.
-        assert self.hidden_dim % self.num_heads == 0, (
-            f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+        qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
+        assert qkv_dim % self.num_heads == 0, (
+            f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
         )
-        head_dim = self.hidden_dim // self.num_heads
+        head_dim = qkv_dim // self.num_heads
         cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
