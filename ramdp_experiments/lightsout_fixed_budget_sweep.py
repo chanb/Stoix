@@ -710,7 +710,7 @@ class Job:
             f"env.scenario.name={self.env}",
             f"env.scenario.task_name=lightsout_{self.grid_size}",
             f"env.kwargs.episode_length={self.episode_length}",
-            f"env.kwargs.eval_episode_length={self.eval_episode_length}",
+            f"++env.kwargs.eval_episode_length={self.eval_episode_length}",
             f"env.kwargs.difficulty_threshold={self.difficulty_threshold:g}",
             f"network={network}",
             f"system.gamma={self.gamma:g}",
