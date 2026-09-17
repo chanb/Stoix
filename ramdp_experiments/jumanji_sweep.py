@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Adaptive-computation-budget sweep for RAMDP systems on Jumanji environments
 (env=jumanji/<env>): sokoban, slidingtile (SlidingTilePuzzle), knapsack
-(Knapsack), maze (Maze) - see ramdp_experiments/experiments.md.
+(Knapsack), maze (Maze), pacman (PacMan) - see ramdp_experiments/experiments.md.
 
 Companion to jumanji_fixed_budget_sweep.py: that script pins `min_steps ==
 max_steps == budget`, forbidding halting before `budget` steps and forcing a
@@ -24,7 +24,10 @@ question.
 See jumanji_fixed_budget_sweep.py's module docstring for the per-env
 observation/action/difficulty-knob details (sokoban, slidingtile, knapsack,
 maze) - identical here, only the compute-budget axis differs (min_steps/
-max_steps instead of budget).
+max_steps instead of budget). pacman has no such entry there (added here
+first) - see stoix/configs/env/jumanji/pacman.yaml: it ships a single fixed
+maze with no generator params, so it has no difficulty knob at all (see
+_pacman_difficulty_axis).
 
 Grid axes (identical to jumanji_fixed_budget_sweep.py except min_steps/
 max_steps replacing budget - see that script's docstring for the full
@@ -56,8 +59,10 @@ system/architecture/PPO-knob/env-difficulty-knob descriptions):
                  `1 <= min_steps <= max_steps`) and are skipped, not errored.
 
 gamma defaults to 0.99 (system.gamma, applied to every job, not swept) -
-same reasoning as jumanji_fixed_budget_sweep.py (all 4 envs have short
-episode horizons). total_timesteps defaults to 2e7.
+same reasoning as jumanji_fixed_budget_sweep.py (sokoban/slidingtile/
+knapsack/maze all have short episode horizons; pacman's is longer, up to
+PacMan.time_limit=1000 steps, but 0.99 is left as the shared default rather
+than special-cased per env). total_timesteps defaults to 2e7.
 
 Jobs are scheduled across GPUs with a fixed number of concurrent runs per
 GPU (a GPU "slot" queue + thread pool), each run pinned via
@@ -67,7 +72,7 @@ identical mechanism to jumanji_fixed_budget_sweep.py/lightsout_sweep.py.
 Usage:
   python ramdp_experiments/jumanji_sweep.py --dry-run                # preview the grid
   python ramdp_experiments/jumanji_sweep.py --limit 6 --dry-run       # preview a slice
-  python ramdp_experiments/jumanji_sweep.py                          # run the full sweep (all 4 envs)
+  python ramdp_experiments/jumanji_sweep.py                          # run the full sweep (all 5 envs)
   python ramdp_experiments/jumanji_sweep.py --envs sokoban,maze       # only these envs
   python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --architectures mlp \\
       --envs sokoban --sokoban-generator toy --min-steps 1 --max-steps 8 --hidden-dim 16 \\
@@ -78,10 +83,11 @@ Usage:
   python ramdp_experiments/jumanji_sweep.py --envs slidingtile \\
       --slidingtile-grid-size 3,4 --slidingtile-num-random-moves 5,20,100       # scramble-depth sweep
   python ramdp_experiments/jumanji_sweep.py --envs knapsack \\
-      --knapsack-num-items 5,10,20,50 --knapsack-total-budget 2.5,12.5          # problem-size sweep
+      --knapsack-num-items 5,10,20,50 --knapsack-max-budget 10,50              # problem-size sweep
   python ramdp_experiments/jumanji_sweep.py --envs maze --maze-size 5,10,15  # maze-size sweep
+  python ramdp_experiments/jumanji_sweep.py --envs pacman  # pacman has no difficulty knob (fixed maze)
   python ramdp_experiments/jumanji_sweep.py --architectures cnn+mlp,cnn+transformer \\
-      --envs sokoban,slidingtile,maze  # CNN-input sweep (sokoban/slidingtile/maze, via jumanji/*_grid)
+      --envs sokoban,slidingtile,maze,pacman  # CNN-input sweep (via jumanji/*_grid)
   python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
   python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_fac \\
@@ -296,7 +302,7 @@ HALTING_TEMPERATURE_ARCHES = (
 # and applied in Job.command().
 HALTING_HIDDEN_DIMS_ARCHES = TRANSFORMER_ARCHES
 
-JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
+JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze", "pacman")
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
 # doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
@@ -400,32 +406,45 @@ ENV_SCENARIOS = {
     "slidingtile": ("jumanji/slidingtile", "jumanji/slidingtile_grid"),
     "knapsack": ("jumanji/knapsack", None),
     "maze": ("jumanji/maze", "jumanji/maze_grid"),
+    "pacman": ("jumanji/pacman", "jumanji/pacman_grid"),
 }
 ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.items()}
-# knapsack/maze already set env.wrapper in their yaml (ConcatObservationWrapper,
-# since their observation is several equally-necessary fields with no single
-# attribute to extract - see those yamls) - unlike sokoban/slidingtile (whose
-# native observation is already one array), so non-CNN jobs for those two
-# must NOT also append the +env.wrapper._target_=stoa.FlattenObservationWrapper
-# override lightsout/minatar-style jobs use, which would conflict.
-ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": True, "maze": True}
+# knapsack/maze/pacman already set env.wrapper in their yaml
+# (ConcatObservationWrapper, since their observation is several
+# equally-necessary fields with no single attribute to extract - see those
+# yamls) - unlike sokoban/slidingtile (whose native observation is already
+# one array), so non-CNN jobs for those three must NOT also append the
+# +env.wrapper._target_=stoa.FlattenObservationWrapper override
+# lightsout/minatar-style jobs use, which would conflict.
+ENV_HAS_BUILTIN_WRAPPER = {
+    "sokoban": False,
+    "slidingtile": False,
+    "knapsack": True,
+    "maze": True,
+    "pacman": True,
+}
 
 # Per-env CNN architecture - env-specific rather than one shared CNN, since
-# the three CNN-capable envs (see ENV_SUPPORTS_CNN) differ substantially in
+# the four CNN-capable envs (see ENV_SUPPORTS_CNN) differ substantially in
 # per-cell channel semantics:
 #   - sokoban:     fixed 10x10 grid, 2 channels bundling walls/boxes/targets/
 #                  player (see stoix/configs/env/jumanji/sokoban_grid.yaml) -
-#                  the richest per-cell semantics of the three, so gets the
-#                  deepest conv stack and widest MLPs (matches
+#                  gets a deep conv stack and wide MLPs (matches
 #                  cnn_mlp_compute.yaml's own defaults throughout).
 #   - slidingtile: small grid (--slidingtile-grid-size, typically 3-5), a
 #                  single channel (tile id, see slidingtile_grid.yaml) - the
-#                  smallest stack/MLPs of the three is enough.
+#                  smallest stack/MLPs here is enough.
 #   - maze:        --maze-size grid, 3 channels (walls plus one-hot
 #                  agent/target positions, see stoix/wrappers/maze_grid.py) -
 #                  a 2-layer conv stack gives the larger receptive field
 #                  useful for reasoning about paths around walls, with MLPs
 #                  between sokoban's and slidingtile's.
+#   - pacman:      fixed, much larger 31x28 grid, 6 channels (walls, pellets,
+#                  power-ups, player, ghosts, scared-timer - see
+#                  stoix/wrappers/pacman_grid.py) - the richest per-cell
+#                  semantics and largest grid of the four, so gets a stride-2
+#                  first conv layer (like sokoban's) to shrink the spatial
+#                  size before the post-conv MLP.
 # nn.Conv uses SAME padding (see stoix/networks/torso.py CNNTorso), so
 # stacking multiple stride-1 layers never shrinks the grid below the kernel
 # size - safe even for slidingtile/maze's smallest configured grid sizes.
@@ -485,6 +504,14 @@ ENV_CNN_ARCH = {
         "kernel_sizes": (3,),
         "strides": (1,),
         "hidden_sizes": (64,),
+        "critic_hidden_sizes": (128,),
+        "critic_layer_sizes": (128, 128),
+    },
+    "pacman": {
+        "channel_sizes": (64,),
+        "kernel_sizes": (3,),
+        "strides": (2,),
+        "hidden_sizes": (128,),
         "critic_hidden_sizes": (128,),
         "critic_layer_sizes": (128, 128),
     },
@@ -574,26 +601,41 @@ def _slidingtile_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty
 
 
 def _knapsack_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
-    # Item weights are drawn in [0, 1], so total weight is at most num_items -
-    # if num_items < total_budget, the budget can never bind (every item
-    # always fits), making the task trivial. Skip those combos.
+    # Item weights are integers in {1, ..., max_weight} (see
+    # stoix.envs.knapsack.generator.IntegerRandomGenerator), so the maximum
+    # possible total weight is num_items * max_weight - if max_budget is at
+    # least that, the top of the per-episode budget draw (Uniform{1, ...,
+    # max_budget}) can always fit every item, making the hardest episodes in
+    # that combo trivial. Skip those combos, same spirit as the old
+    # continuous-weight num_items < total_budget check.
     combos = [
         EnvDifficulty(
-            tag=f"ni{ni}-tb{tb:g}",
+            tag=f"ni{ni}-mw{mw}-mv{mv}-mb{mb}",
             overrides=(
                 f"env.kwargs.generator.num_items={ni}",
-                f"env.kwargs.generator.total_budget={tb:g}",
+                f"env.kwargs.generator.max_weight={mw}",
+                f"env.kwargs.generator.max_value={mv}",
+                f"env.kwargs.generator.max_budget={mb}",
             ),
         )
         for ni in args.knapsack_num_items
-        for tb in args.knapsack_total_budget
-        if ni >= tb
+        for mw in args.knapsack_max_weight
+        for mv in args.knapsack_max_value
+        for mb in args.knapsack_max_budget
+        if mb < ni * mw
     ]
-    n_skipped = len(args.knapsack_num_items) * len(args.knapsack_total_budget) - len(combos)
+    n_total = (
+        len(args.knapsack_num_items)
+        * len(args.knapsack_max_weight)
+        * len(args.knapsack_max_value)
+        * len(args.knapsack_max_budget)
+    )
+    n_skipped = n_total - len(combos)
     if n_skipped:
         print(
-            f"Skipping {n_skipped} knapsack (num_items, total_budget) combo(s) where "
-            "num_items < total_budget (item weights are in [0, 1], so the budget can never bind)."
+            f"Skipping {n_skipped} knapsack (num_items, max_weight, max_value, max_budget) "
+            "combo(s) where max_budget >= num_items * max_weight (the budget could always fit "
+            "every item)."
         )
     return combos
 
@@ -611,11 +653,20 @@ def _maze_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
     ]
 
 
+def _pacman_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
+    # PacMan ships a single fixed maze (AsciiGenerator(DEFAULT_MAZE), see
+    # jumanji.environments.routing.pac_man.env.PacMan.__init__) with no
+    # generator params to sweep, unlike sokoban/slidingtile/knapsack/maze -
+    # one difficulty point, no overrides.
+    return [EnvDifficulty(tag="default")]
+
+
 ENV_DIFFICULTY_AXES = {
     "sokoban": _sokoban_difficulty_axis,
     "slidingtile": _slidingtile_difficulty_axis,
     "knapsack": _knapsack_difficulty_axis,
     "maze": _maze_difficulty_axis,
+    "pacman": _pacman_difficulty_axis,
 }
 
 
@@ -1461,8 +1512,8 @@ def main() -> None:
         default="mlp,transformer",
         help=f"Comma-separated subset of {{{','.join(VALID_ARCHITECTURES)}}}. CNN architectures "
         "(including cnn+transformer_explicit_cot) are only valid for env in "
-        "{sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requested for knapsack, they're "
-        "skipped, not errored. transformer_explicit_cot/cnn+transformer_explicit_cot "
+        "{sokoban, slidingtile, maze, pacman} (see ENV_SUPPORTS_CNN) - requested for knapsack, "
+        "they're skipped, not errored. transformer_explicit_cot/cnn+transformer_explicit_cot "
         f"(TransformerExplicitCoTTorso) are only implemented for system in {EXPLICIT_COT_SYSTEMS} "
         "- other (system, architecture) combos requesting them are skipped too.",
     )
@@ -1759,8 +1810,21 @@ def main() -> None:
         help="Comma-separated ints - env.kwargs.generator.num_items, ignored for other envs.",
     )
     parser.add_argument(
-        "--knapsack-total-budget", default="2.5",
-        help="Comma-separated floats - env.kwargs.generator.total_budget, ignored for other envs.",
+        "--knapsack-max-weight", default="10",
+        help="Comma-separated ints - env.kwargs.generator.max_weight: item weights are drawn "
+        "from {1, ..., max_weight} (stoix.envs.knapsack.generator.IntegerRandomGenerator, the "
+        "classic 0-1 knapsack formulation), ignored for other envs.",
+    )
+    parser.add_argument(
+        "--knapsack-max-value", default="10",
+        help="Comma-separated ints - env.kwargs.generator.max_value: item values are drawn from "
+        "{1, ..., max_value}, ignored for other envs.",
+    )
+    parser.add_argument(
+        "--knapsack-max-budget", default="20",
+        help="Comma-separated ints - env.kwargs.generator.max_budget: the bag's capacity is "
+        "redrawn every episode from Uniform{1, ..., max_budget} (not a fixed constant), ignored "
+        "for other envs.",
     )
     parser.add_argument(
         "--maze-size", default="5,10,15",
@@ -1770,8 +1834,10 @@ def main() -> None:
 
     parser.add_argument(
         "--gamma", type=float, default=0.99,
-        help="system.gamma, applied to every job (not swept). All 4 envs here have short "
-        "(<=a few hundred step) episodes, unlike MinAtar's gamma=0.9999 default.",
+        help="system.gamma, applied to every job (not swept). sokoban/slidingtile/knapsack/maze "
+        "have short (<=a few hundred step) episodes; pacman's run up to 1000 steps - 0.99 is "
+        "still used as the shared default rather than special-cased per env, unlike MinAtar's "
+        "gamma=0.9999 default.",
     )
     parser.add_argument("--wandb", type=lambda x: x.strip().lower() in ("1", "true", "yes"), default=False)
     parser.add_argument("--wandb-project", default="jumanji_sweep")
@@ -1869,7 +1935,9 @@ def main() -> None:
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]
     args.knapsack_num_items = [int(x) for x in args.knapsack_num_items.split(",")]
-    args.knapsack_total_budget = [float(x) for x in args.knapsack_total_budget.split(",")]
+    args.knapsack_max_weight = [int(x) for x in args.knapsack_max_weight.split(",")]
+    args.knapsack_max_value = [int(x) for x in args.knapsack_max_value.split(",")]
+    args.knapsack_max_budget = [int(x) for x in args.knapsack_max_budget.split(",")]
     args.maze_size = [int(x) for x in args.maze_size.split(",")]
 
     for e in args.envs:
@@ -1960,7 +2028,10 @@ def main() -> None:
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
-    print(f"  knapsack_num_items={args.knapsack_num_items} knapsack_total_budget={args.knapsack_total_budget}")
+    print(
+        f"  knapsack_num_items={args.knapsack_num_items} knapsack_max_weight={args.knapsack_max_weight} "
+        f"knapsack_max_value={args.knapsack_max_value} knapsack_max_budget={args.knapsack_max_budget}"
+    )
     print(f"  maze_size={args.maze_size}")
     print(f"  gamma={args.gamma}")
     print(

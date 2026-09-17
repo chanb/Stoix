@@ -66,20 +66,28 @@ spec):
                  Supports CNN architectures (env=jumanji/slidingtile_grid,
                  via GridObservationWrapper adding a channel axis to `puzzle`
                  - see stoix/wrappers/grid_observation.py).
-  - knapsack:    Knapsack-v1. Pick items (one per step) to pack into a
-                 fixed-budget bag, maximizing packed value. Dense reward
-                 (value of the item just packed). Observation: Knapsack's
-                 weights/values/packed_items/action_mask fields all matter
-                 together, so unlike sokoban/slidingtile there's no single
-                 attribute to extract - stoix/configs/env/jumanji/knapsack.yaml
-                 omits observation_attribute and instead uses
+  - knapsack:    Knapsack-v1. Pick items (one per step) to pack into the bag,
+                 maximizing packed value without exceeding its capacity -
+                 each item packed at most once (0-1 knapsack). Weights/values
+                 are integers (stoix.envs.knapsack.generator.
+                 IntegerRandomGenerator, the classic textbook formulation,
+                 not jumanji's own continuous-[0,1]-weight RandomGenerator),
+                 and the bag's capacity is redrawn every episode from
+                 Uniform{1, ..., max_budget} rather than being one fixed
+                 constant - see stoix/configs/env/jumanji/knapsack.yaml.
+                 Dense reward (value of the item just packed). Observation:
+                 Knapsack's weights/values/packed_items/action_mask fields
+                 all matter together, so unlike sokoban/slidingtile there's
+                 no single attribute to extract - knapsack.yaml omits
+                 observation_attribute and instead uses
                  stoix.wrappers.concat_observation.ConcatObservationWrapper
                  to flatten every field into one vector (see
                  stoix/utils/make_env.py). Action: DiscreteArray(num_items)
                  (which item to pack next - so, unlike sokoban/slidingtile,
                  the action count scales with difficulty). Difficulty knobs:
-                 --knapsack-num-items and --knapsack-total-budget. No CNN
-                 variant (no spatial structure).
+                 --knapsack-num-items, --knapsack-max-weight,
+                 --knapsack-max-value, --knapsack-max-budget. No CNN variant
+                 (no spatial structure).
   - maze:        Maze-v0. Navigate from a start cell to a target cell.
                  Sparse reward (1.0 on reaching the target, 0.0 otherwise).
                  Observation: agent_position/target_position/walls/
@@ -168,7 +176,7 @@ Usage:
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs slidingtile \\
       --slidingtile-grid-size 3,4 --slidingtile-num-random-moves 5,20,100       # scramble-depth sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs knapsack \\
-      --knapsack-num-items 5,10,20,50 --knapsack-total-budget 2.5,12.5          # problem-size sweep
+      --knapsack-num-items 5,10,20,50 --knapsack-max-budget 10,50              # problem-size sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs maze --maze-size 5,10,15  # maze-size sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --architectures cnn+mlp,cnn+transformer \\
       --envs sokoban,slidingtile,maze  # CNN-input sweep (sokoban/slidingtile/maze, via jumanji/*_grid)
@@ -615,26 +623,41 @@ def _slidingtile_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty
 
 
 def _knapsack_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
-    # Item weights are drawn in [0, 1], so total weight is at most num_items -
-    # if num_items < total_budget, the budget can never bind (every item
-    # always fits), making the task trivial. Skip those combos.
+    # Item weights are integers in {1, ..., max_weight} (see
+    # stoix.envs.knapsack.generator.IntegerRandomGenerator), so the maximum
+    # possible total weight is num_items * max_weight - if max_budget is at
+    # least that, the top of the per-episode budget draw (Uniform{1, ...,
+    # max_budget}) can always fit every item, making the hardest episodes in
+    # that combo trivial. Skip those combos, same spirit as the old
+    # continuous-weight num_items < total_budget check.
     combos = [
         EnvDifficulty(
-            tag=f"ni{ni}-tb{tb:g}",
+            tag=f"ni{ni}-mw{mw}-mv{mv}-mb{mb}",
             overrides=(
                 f"env.kwargs.generator.num_items={ni}",
-                f"env.kwargs.generator.total_budget={tb:g}",
+                f"env.kwargs.generator.max_weight={mw}",
+                f"env.kwargs.generator.max_value={mv}",
+                f"env.kwargs.generator.max_budget={mb}",
             ),
         )
         for ni in args.knapsack_num_items
-        for tb in args.knapsack_total_budget
-        if ni >= tb
+        for mw in args.knapsack_max_weight
+        for mv in args.knapsack_max_value
+        for mb in args.knapsack_max_budget
+        if mb < ni * mw
     ]
-    n_skipped = len(args.knapsack_num_items) * len(args.knapsack_total_budget) - len(combos)
+    n_total = (
+        len(args.knapsack_num_items)
+        * len(args.knapsack_max_weight)
+        * len(args.knapsack_max_value)
+        * len(args.knapsack_max_budget)
+    )
+    n_skipped = n_total - len(combos)
     if n_skipped:
         print(
-            f"Skipping {n_skipped} knapsack (num_items, total_budget) combo(s) where "
-            "num_items < total_budget (item weights are in [0, 1], so the budget can never bind)."
+            f"Skipping {n_skipped} knapsack (num_items, max_weight, max_value, max_budget) "
+            "combo(s) where max_budget >= num_items * max_weight (the budget could always fit "
+            "every item)."
         )
     return combos
 
@@ -1629,8 +1652,21 @@ def main() -> None:
         help="Comma-separated ints - env.kwargs.generator.num_items, ignored for other envs.",
     )
     parser.add_argument(
-        "--knapsack-total-budget", default="2.5",
-        help="Comma-separated floats - env.kwargs.generator.total_budget, ignored for other envs.",
+        "--knapsack-max-weight", default="10",
+        help="Comma-separated ints - env.kwargs.generator.max_weight: item weights are drawn "
+        "from {1, ..., max_weight} (stoix.envs.knapsack.generator.IntegerRandomGenerator, the "
+        "classic 0-1 knapsack formulation), ignored for other envs.",
+    )
+    parser.add_argument(
+        "--knapsack-max-value", default="10",
+        help="Comma-separated ints - env.kwargs.generator.max_value: item values are drawn from "
+        "{1, ..., max_value}, ignored for other envs.",
+    )
+    parser.add_argument(
+        "--knapsack-max-budget", default="20",
+        help="Comma-separated ints - env.kwargs.generator.max_budget: the bag's capacity is "
+        "redrawn every episode from Uniform{1, ..., max_budget} (not a fixed constant), ignored "
+        "for other envs.",
     )
     parser.add_argument(
         "--maze-size", default="5,10,15",
@@ -1728,7 +1764,9 @@ def main() -> None:
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]
     args.knapsack_num_items = [int(x) for x in args.knapsack_num_items.split(",")]
-    args.knapsack_total_budget = [float(x) for x in args.knapsack_total_budget.split(",")]
+    args.knapsack_max_weight = [int(x) for x in args.knapsack_max_weight.split(",")]
+    args.knapsack_max_value = [int(x) for x in args.knapsack_max_value.split(",")]
+    args.knapsack_max_budget = [int(x) for x in args.knapsack_max_budget.split(",")]
     args.maze_size = [int(x) for x in args.maze_size.split(",")]
 
     for e in args.envs:
@@ -1805,7 +1843,10 @@ def main() -> None:
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
-    print(f"  knapsack_num_items={args.knapsack_num_items} knapsack_total_budget={args.knapsack_total_budget}")
+    print(
+        f"  knapsack_num_items={args.knapsack_num_items} knapsack_max_weight={args.knapsack_max_weight} "
+        f"knapsack_max_value={args.knapsack_max_value} knapsack_max_budget={args.knapsack_max_budget}"
+    )
     print(f"  maze_size={args.maze_size}")
     print(f"  gamma={args.gamma}")
     print(
