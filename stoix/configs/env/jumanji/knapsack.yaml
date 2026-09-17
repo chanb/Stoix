@@ -29,9 +29,13 @@
 # that alone determines the right decision - `weights`, `values`,
 # `packed_items`, and `action_mask` are all needed together (e.g. `values`
 # without `weights` makes packing unsolvable) - so `observation_attribute` is
-# intentionally omitted here and ConcatObservationWrapper flattens every
-# field into one vector instead (see stoix/utils/make_env.py and
-# stoix/wrappers/concat_observation.py).
+# intentionally omitted here. jumanji's own Observation also never exposes
+# the bag's remaining capacity (state.remaining_budget) at all, even though
+# it's what action_mask/reward/termination all depend on - so instead of
+# ConcatObservationWrapper (which would silently drop it),
+# KnapsackConcatWithBudgetWrapper flattens every Observation field into one
+# vector *and* appends remaining_budget as one extra scalar (see
+# stoix/wrappers/knapsack_budget.py).
 env_name: jumanji
 multi_agent: False
 
@@ -52,4 +56,4 @@ kwargs:
 eval_metric: episode_return
 
 wrapper:
-  _target_: stoix.wrappers.concat_observation.ConcatObservationWrapper
+  _target_: stoix.wrappers.knapsack_budget.KnapsackConcatWithBudgetWrapper
