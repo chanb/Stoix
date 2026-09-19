@@ -87,6 +87,7 @@ METRICS = [
     "actor/episode_return/mean",
     "actor/episode_discounted_return/mean",
     "actor/compute_time/mean",
+    "actor/episode_length/mean",
     # Evaluator metrics: same quantities but from held-out eval rollouts
     # (deterministic-ish, not the training batch) rather than the actor's
     # own training-time episodes - logged at the same eval_step/wandb step
@@ -95,6 +96,7 @@ METRICS = [
     "evaluator/episode_return/mean",
     "evaluator/episode_discounted_return/mean",
     "evaluator/compute_time/mean",
+    "evaluator/episode_length/mean",
     # compute_time/{min,max} are deliberately NOT here - Run.history(keys=...)
     # requires every requested key to be present on a row, and these were
     # never sent via wandb.log (see module docstring), so including them
@@ -119,6 +121,7 @@ ABSOLUTE_METRICS = [
     "absolute/episode_return/mean",
     "absolute/episode_discounted_return/mean",
     "absolute/compute_time/mean",
+    "absolute/episode_length/mean",
 ]
 
 # How many of the most recent console log lines to pull per run when looking
