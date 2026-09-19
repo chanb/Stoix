@@ -494,7 +494,7 @@ ENV_CNN_ARCH = {
     "slidingtile": {
         "channel_sizes": (16,),
         "kernel_sizes": (3,),
-        "strides": (2,),
+        "strides": (1,),
         "hidden_sizes": (128,),
         "critic_hidden_sizes": (128,),
         "critic_layer_sizes": (128, 128),
@@ -525,6 +525,19 @@ SOKOBAN_GENERATOR_CHOICES = (
     "medium-train",
     "hard",
 )
+# --sokoban-eval-generator: 'same' keeps eval on the train generator; otherwise
+# any non-default generator above, or a held-out Boxoban split.
+SOKOBAN_EVAL_GENERATOR_CHOICES = (
+    "same",
+    "toy",
+    "simple",
+    "unfiltered-train",
+    "unfiltered-valid",
+    "unfiltered-test",
+    "medium-train",
+    "medium-valid",
+    "hard",
+)
 # Shortened dataset_name -> group_tag suffix for the longer Boxoban tiers (the
 # override still passes the full HuggingFace dataset_name, only the tag shrinks).
 SOKOBAN_TAG_SHORT = {"unfiltered-train": "unfilt-train", "medium-train": "med-train"}
@@ -544,45 +557,42 @@ class EnvDifficulty:
     overrides: Tuple[str, ...] = ()
 
 
+def _sokoban_generator_overrides(choice: str, prefix: str) -> Tuple[str, ...]:
+    """Hydra overrides selecting sokoban generator `choice` under `prefix`:
+    `env.kwargs` (train + eval) or `env.eval_kwargs` (eval env only, see
+    stoix/utils/make_env.py's make_jumanji_env)."""
+    if choice == "default":
+        return ()
+    if choice == "toy":
+        return (
+            f"+{prefix}.generator._target_="
+            "jumanji.environments.routing.sokoban.generator.ToyGenerator",
+        )
+    if choice == "simple":
+        return (
+            f"+{prefix}.generator._target_="
+            "jumanji.environments.routing.sokoban.generator.SimpleSolveGenerator",
+        )
+    # Boxoban dataset splits (train/valid/test/hard), downloaded from
+    # HuggingFace Hub on first use.
+    return (
+        f"+{prefix}.generator._target_="
+        "jumanji.environments.routing.sokoban.generator.HuggingFaceDeepMindGenerator",
+        f"+{prefix}.generator.dataset_name={choice}",
+        f"+{prefix}.generator.proportion_of_files=1.0",
+    )
+
+
 def _sokoban_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
     combos = []
+    eval_choice = args.sokoban_eval_generator
     for choice in args.sokoban_generator:
-        if choice == "default":
-            combos.append(EnvDifficulty(tag="default"))
-        elif choice == "toy":
-            combos.append(
-                EnvDifficulty(
-                    tag="toy",
-                    overrides=(
-                        "+env.kwargs.generator._target_="
-                        "jumanji.environments.routing.sokoban.generator.ToyGenerator",
-                    ),
-                )
-            )
-        elif choice == "simple":
-            combos.append(
-                EnvDifficulty(
-                    tag="simple",
-                    overrides=(
-                        "+env.kwargs.generator._target_="
-                        "jumanji.environments.routing.sokoban.generator.SimpleSolveGenerator",
-                    ),
-                )
-            )
-        else:
-            # unfiltered-train | medium-train | hard: Boxoban difficulty tiers,
-            # downloaded from HuggingFace Hub on first use.
-            combos.append(
-                EnvDifficulty(
-                    tag=SOKOBAN_TAG_SHORT.get(choice, choice),
-                    overrides=(
-                        "+env.kwargs.generator._target_="
-                        "jumanji.environments.routing.sokoban.generator.HuggingFaceDeepMindGenerator",
-                        f"+env.kwargs.generator.dataset_name={choice}",
-                        "+env.kwargs.generator.proportion_of_files=1.0",
-                    ),
-                )
-            )
+        tag = "default" if choice == "default" else SOKOBAN_TAG_SHORT.get(choice, choice)
+        overrides = _sokoban_generator_overrides(choice, "env.kwargs")
+        if eval_choice != "same":
+            tag += f"-eval-{SOKOBAN_TAG_SHORT.get(eval_choice, eval_choice)}"
+            overrides += _sokoban_generator_overrides(eval_choice, "env.eval_kwargs")
+        combos.append(EnvDifficulty(tag=tag, overrides=overrides))
     return combos
 
 
@@ -1797,6 +1807,16 @@ def main() -> None:
         "on first use (needs network access).",
     )
     parser.add_argument(
+        "--sokoban-eval-generator",
+        default="same",
+        choices=SOKOBAN_EVAL_GENERATOR_CHOICES,
+        help="env.eval_kwargs.generator for sokoban jobs: the generator the *eval* environment "
+        "draws levels from, while training keeps using --sokoban-generator. Single value (not "
+        "swept). 'same' (default) evaluates on the train generator. E.g. train on "
+        "'unfiltered-train' and evaluate on the held-out 'unfiltered-test'. Adds an "
+        "'-eval-<name>' suffix to the group_tag/run_name.",
+    )
+    parser.add_argument(
         "--slidingtile-grid-size", default="3",
         help="Comma-separated ints - NxN puzzle size (env.kwargs.generator.grid_size), ignored for other envs.",
     )
@@ -2026,7 +2046,7 @@ def main() -> None:
         f"(HALTING_HIDDEN_DIMS_ARCHES only: {HALTING_HIDDEN_DIMS_ARCHES})"
     )
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
-    print(f"  sokoban_generator={args.sokoban_generator}")
+    print(f"  sokoban_generator={args.sokoban_generator} sokoban_eval_generator={args.sokoban_eval_generator}")
     print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
     print(
         f"  knapsack_num_items={args.knapsack_num_items} knapsack_max_weight={args.knapsack_max_weight} "

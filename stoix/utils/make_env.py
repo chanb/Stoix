@@ -96,8 +96,20 @@ def make_jumanji_env(scenario_name: str, config: DictConfig) -> Tuple[Environmen
     # stoix/envs/sokoban/reward.py.
     env_kwargs = dict(hydra.utils.instantiate(copy.deepcopy(config.env.kwargs)))
 
+    # `config.env.eval_kwargs`, if given, is overlaid (key-by-key, so a nested
+    # `generator` node is replaced wholesale) on `env.kwargs` for the eval
+    # environment only - e.g. train on Boxoban `unfiltered-train` and evaluate
+    # on the held-out `unfiltered-test` via
+    # `+env.eval_kwargs.generator._target_=...HuggingFaceDeepMindGenerator
+    #  +env.eval_kwargs.generator.dataset_name=unfiltered-test`. Omit it to keep
+    # train/eval symmetric (the default).
+    eval_env_kwargs = dict(env_kwargs)
+    eval_kwargs_override = config.env.get("eval_kwargs", None)
+    if eval_kwargs_override is not None:
+        eval_env_kwargs.update(hydra.utils.instantiate(copy.deepcopy(eval_kwargs_override)))
+
     env = jumanji.make(scenario_name, **env_kwargs)
-    eval_env = jumanji.make(scenario_name, **env_kwargs)
+    eval_env = jumanji.make(scenario_name, **eval_env_kwargs)
 
     if config.env.multi_agent:
         env = jumanji_wrappers.MultiToSingleWrapper(env)
