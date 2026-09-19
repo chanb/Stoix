@@ -204,6 +204,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         "config.env.scenario.name": "lightsout-5x4",
         "config.network.actor_network.pre_torso.mlp_dim": "256",
         "config.system.actor_weight_decay": "0.1",
+        "config.system.ent_coef": "0.01",
     })
     out = []
     for r in runs:

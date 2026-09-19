@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import fetch_wandb_lightsout_hd64 as fetch
+import Stoix.ramdp_experiments.fetch_wandb_lightsout as fetch
 import plot_wandb_lightsout_hd64 as base
 
 ARCH_ORDER = base.ARCH_ORDER
