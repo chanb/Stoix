@@ -1,0 +1,39 @@
+# ---Environment Configs---
+# PacMan: navigate a fixed 31x28 maze, eating pellets/power-ups and avoiding
+# 4 heuristic ghosts. Unlike Sokoban/SlidingTilePuzzle/Knapsack/Maze, PacMan
+# ships a single fixed maze (jumanji.environments.routing.pac_man.generator.
+# AsciiGenerator(DEFAULT_MAZE)) with no generator params - so there is no
+# difficulty knob to sweep here (see jumanji_sweep.py's
+# _pacman_difficulty_axis).
+#
+# Reward is dense: 10 per pellet, 50 per power-up, 200 per ghost eaten (see
+# jumanji.environments.routing.pac_man.env.PacMan._update_state) - much
+# larger-magnitude than the other 4 envs' rewards.
+#
+# Episodes run up to 1000 steps (PacMan.time_limit) - substantially longer
+# than Sokoban/SlidingTilePuzzle/Knapsack/Maze's short horizons.
+#
+# Like Knapsack/Maze, PacMan's Observation has no single field that alone
+# determines the right decision - `grid` is only the walls, and
+# `player_locations`/`ghost_locations`/`pellet_locations`/
+# `power_up_locations`/`frightened_state_time` are all separately necessary -
+# so `observation_attribute` is intentionally omitted and
+# ConcatObservationWrapper flattens every field into one vector instead (see
+# stoix/utils/make_env.py and stoix/wrappers/concat_observation.py). For a
+# CNN-based network, use env=jumanji/pacman_grid instead (see
+# stoix/wrappers/pacman_grid.py).
+env_name: jumanji
+multi_agent: False
+
+scenario:
+  name: PacMan-v1
+  task_name: pacman
+
+kwargs: {}
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
+
+wrapper:
+  _target_: stoix.wrappers.concat_observation.ConcatObservationWrapper

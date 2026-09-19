@@ -1,12 +1,25 @@
 # ---Environment Configs---
-# Knapsack: pick items (one per step) to pack into a fixed-budget bag,
-# maximizing total value without exceeding the weight budget - a classic
+# Knapsack: pick items (one per step) to pack into the bag, maximizing total
+# value without exceeding its weight capacity - each item is packed at most
+# once (0-1 knapsack: Knapsack.step masks out already-packed items via
+# `packed_items`, not fractional/unbounded picking) - a classic
 # combinatorial-construction task with a *continuous* difficulty knob
 # (num_items), unlike Lights Out's threshold-hack difficulty.
 #
+# Unlike jumanji's own `RandomGenerator` (continuous weights/values on [0, 1]
+# and one fixed `total_budget` shared by every episode),
+# `IntegerRandomGenerator` (see stoix/envs/knapsack/generator.py) samples
+# integer weights/values - the classic textbook 0-1 knapsack formulation -
+# and draws a *fresh* integer capacity from Uniform{1, ..., max_budget} on
+# every reset, so the bag's capacity varies per episode instead of being one
+# constant.
+#
 # Difficulty knobs (env.kwargs.generator):
-#   - num_items:    number of items to choose from.
-#   - total_budget: bag weight capacity.
+#   - num_items:  number of items to choose from.
+#   - max_weight: items' weights are drawn from {1, ..., max_weight}.
+#   - max_value:  items' values are drawn from {1, ..., max_value}.
+#   - max_budget: the bag's capacity is redrawn every episode from
+#                 {1, ..., max_budget} (not a fixed constant).
 #
 # Reward is dense by default (DenseReward: the value of the item packed at
 # the current timestep - see
@@ -16,9 +29,13 @@
 # that alone determines the right decision - `weights`, `values`,
 # `packed_items`, and `action_mask` are all needed together (e.g. `values`
 # without `weights` makes packing unsolvable) - so `observation_attribute` is
-# intentionally omitted here and ConcatObservationWrapper flattens every
-# field into one vector instead (see stoix/utils/make_env.py and
-# stoix/wrappers/concat_observation.py).
+# intentionally omitted here. jumanji's own Observation also never exposes
+# the bag's remaining capacity (state.remaining_budget) at all, even though
+# it's what action_mask/reward/termination all depend on - so instead of
+# ConcatObservationWrapper (which would silently drop it),
+# KnapsackConcatWithBudgetWrapper flattens every Observation field into one
+# vector *and* appends remaining_budget as one extra scalar (see
+# stoix/wrappers/knapsack_budget.py).
 env_name: jumanji
 multi_agent: False
 
@@ -28,13 +45,15 @@ scenario:
 
 kwargs:
   generator:
-    _target_: jumanji.environments.packing.knapsack.generator.RandomGenerator
+    _target_: stoix.envs.knapsack.generator.IntegerRandomGenerator
     num_items: 10
-    total_budget: 2.5
+    max_weight: 10
+    max_value: 10
+    max_budget: 20
 
 # Defines the metric that will be used to evaluate the performance of the agent.
 # This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
 eval_metric: episode_return
 
 wrapper:
-  _target_: stoix.wrappers.concat_observation.ConcatObservationWrapper
+  _target_: stoix.wrappers.knapsack_budget.KnapsackConcatWithBudgetWrapper

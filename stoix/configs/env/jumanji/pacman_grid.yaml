@@ -1,0 +1,28 @@
+# ---Environment Configs---
+# Same as jumanji/pacman.yaml but instead of ConcatObservationWrapper, this
+# uses PacManGridObservationWrapper to keep the (x_size, y_size) spatial
+# structure: walls, remaining pellets, remaining power-ups, a one-hot player
+# position, a one-hot(-ish) ghosts position, and a constant scared-timer
+# channel, stacked as six channels - (31, 28, 6) for the default maze - so a
+# CNN-based network (network=cnn_mlp_compute / cnn_mlp_compute_qac /
+# cnn_transformer_compute / cnn_transformer_compute_qac) can operate on the
+# real maze layout, mirroring jumanji's own reference preprocessing
+# (jumanji.training.networks.pac_man.actor_critic.process_image) but as
+# one-hot semantic channels rather than a packed 3-channel RGB image (see
+# stoix/wrappers/pacman_grid.py). Plain MLP-based networks (mlp_compute etc.)
+# should keep using env=jumanji/pacman.
+env_name: jumanji
+multi_agent: False
+
+scenario:
+  name: PacMan-v1
+  task_name: pacman
+
+kwargs: {}
+
+# Defines the metric that will be used to evaluate the performance of the agent.
+# This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
+eval_metric: episode_return
+
+wrapper:
+  _target_: stoix.wrappers.pacman_grid.PacManGridObservationWrapper
