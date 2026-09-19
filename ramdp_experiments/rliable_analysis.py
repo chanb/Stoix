@@ -81,7 +81,7 @@ pd = base.pd
 plt = base.plt
 sns = base.sns
 compute_final_values = base.compute_final_values
-expand_vocab_agnostic_budget1 = base.expand_vocab_agnostic_budget1
+resolve_ent_coef = base.resolve_ent_coef
 variant_row_label = base.variant_row_label
 budget_label = base.budget_label
 step_axis = base.step_axis
@@ -105,16 +105,19 @@ AlgoSpec = Tuple[str, str, int, int, int]  # (arch, qac_variant, vocab_size, min
 DPI = 600
 
 
-def load_dataset(csv_path: Path) -> pd.DataFrame:
+def load_dataset(csv_path: Path, ent_coef: "float | None" = None) -> pd.DataFrame:
     """Same filters as plot_wandb_lightsout_hd64.py's main(): finished runs
     only, no stop-gradient-halting variants, IRU-ACT's main 3e8-timestep
-    sweep only, and eCoT's vocab-agnostic budget=1 shared across vocab
-    sizes."""
+    sweep only, and (see resolve_ent_coef) either `ent_coef` if given or
+    else the best-performing system.ent_coef picked automatically per
+    (arch, qac_variant, vocab_size, budget) group - needed for a CSV fetched
+    from a project that sweeps ent_coef (e.g. the eCoT sweep), otherwise
+    every algorithm silently averages across every ent_coef swept."""
     df = pd.read_csv(csv_path)
     df = df[df["state"] == "finished"]
     df = df[~df["sgh"]]
     df = df[(df["arch"] != "IRU-ACT") | (df["total_timesteps"] == 300_000_000)]
-    df = expand_vocab_agnostic_budget1(df)
+    df = resolve_ent_coef(df, ent_coef)
     return df
 
 
@@ -367,6 +370,15 @@ def main() -> None:
         "--metric", choices=list(METRIC_SPECS.keys()), action="append", help="Restrict to one metric (repeatable). Default: all."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("ramdp_experiments/rliable_plots"))
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=None,
+        help="Keep only rows at this system.ent_coef, for a CSV fetched from a project that sweeps "
+        "it (e.g. the eCoT sweep). Default: no fixed value - the best-performing ent_coef is picked "
+        "automatically per (arch, qac_variant, vocab_size, budget) group (see select_best_ent_coef "
+        "in the main script).",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -376,7 +388,7 @@ def main() -> None:
         m = re.search(r"-([^-.]+)$", csv_path.stem)
         dataset_label = m.group(1) if m else csv_path.stem
         print(f"=== {dataset_label} ({csv_path}) ===")
-        df = load_dataset(csv_path)
+        df = load_dataset(csv_path, args.ent_coef)
 
         for arch in ARCH_ORDER:
             sub_arch = df[df["arch"] == arch]

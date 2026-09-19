@@ -11,8 +11,8 @@ Produces, per architecture:
      instead of cross-referencing separate figures. For
      Transformer-ExplicitCoT, which has a vocab_size axis, this is one file
      per vocab_size instead (lightsout_hd64_transformer-explicitcot_vocab
-     <N>_pareto.pdf) - the vocab_size=1/budget=1 point is shared across all
-     of them (see expand_vocab_agnostic_budget1 in the main script).
+     <N>_pareto.pdf), including vocab_size=1 - each vocab_size now has its
+     own budget=1 run, so there's no shared/borrowed point to fold in.
   2. lightsout_hd64_<arch>_seed_variance.pdf - per-seed strip plot + mean/CI
      point, budget on x, instead of collapsing straight to mean with a 95% CI;
      shows whether spread is genuine or one outlier seed.
@@ -26,15 +26,15 @@ Produces, per architecture:
      instead of a mean with a 95% CI band, to see whether halting behavior is
      consistent across seeds or not.
   6. lightsout_hd64_pareto_{actor,evaluator}_{episode,discounted}_return.pdf
-     - four combined 1x5 figures (paper-sized fonts), one per actor/evaluator
+     - four combined 1x7 figures (paper-sized fonts), one per actor/evaluator
      x episode/discounted-return metric, each with one column per the same
      (architecture, vocab_size) grouping as the per-file pareto plots above
-     (IRU-ACT, Transformer-CoT, Transformer-ExplicitCoT x vocab={2,4,8}).
+     (IRU-ACT, Transformer-CoT, Transformer-ExplicitCoT x vocab={1,2,4,8,16}).
      The actor figures share a fixed y-axis of [0.5, 1.0] so performance is
      directly comparable across architectures; all four share fixed x-ticks
      at [1, 2, 3, 4, 5].
   7. lightsout_hd64_learning_curve_{actor,evaluator}_{episode,discounted}
-     _return.pdf - four more combined 1x5 figures, same 5-column (arch,
+     _return.pdf - four more combined 1x7 figures, same 7-column (arch,
      vocab_size) grouping, but plotting the full training curve (metric vs.
      timesteps) instead of a single final-performance point: every fixed
      budget (grayscale) and every adaptive-budget qac_variant (colored) is
@@ -73,10 +73,10 @@ place_legend_and_title = base.place_legend_and_title
 budget_label = base.budget_label
 variant_row_label = base.variant_row_label
 compute_final_values = base.compute_final_values
+resolve_ent_coef = base.resolve_ent_coef
 mean_ci_curve = base.mean_ci_curve
 step_axis = base.step_axis
 CI95_Z = base.CI95_Z
-expand_vocab_agnostic_budget1 = base.expand_vocab_agnostic_budget1
 METRICS = base.METRICS
 METRIC_LABELS = base.METRIC_LABELS
 ARCH_ORDER = base.ARCH_ORDER
@@ -108,11 +108,8 @@ def all_variant_vocab_palette(df: pd.DataFrame) -> dict:
 
 def build_labeled_final_df(sub_arch: pd.DataFrame, metric: str, row_keys) -> pd.DataFrame:
     """compute_final_values, called separately per (qac_variant, vocab_size)
-    row and concatenated. Calling it on the whole architecture at once would
-    be wrong for Transformer-ExplicitCoT: expand_vocab_agnostic_budget1
-    duplicates the same run_id under multiple vocab_size labels, and
-    compute_final_values groups by run_id alone, so it would silently
-    collapse those duplicates back down to one arbitrary vocab_size."""
+    row and concatenated, so each row gets its own variant_label/budget_label
+    columns attached directly rather than re-derived after the fact."""
     frames = []
     for qac_variant, vocab_size in row_keys:
         row_sub = sub_arch[(sub_arch["qac_variant"] == qac_variant) & (sub_arch["vocab_size"] == vocab_size)]
@@ -170,16 +167,19 @@ def plot_pareto(
     per qac_variant) are separate markers.
 
     `vocab_size`, when given, restricts to that vocab_size (the caller loops
-    over every vocab_size present and makes one file each, since
-    expand_vocab_agnostic_budget1 already folded the shared vocab_size=1
-    budget=1 point into every vocab_size group upstream). When omitted
-    (non-eCoT architectures, which have no vocab_size axis), falls back to
-    the "primary" vocab_size (the sentinel, a no-op for those archs).
+    over every vocab_size present, including vocab_size=1, and makes one
+    file each - every vocab_size now has its own real budget=1 run). When
+    omitted (non-eCoT architectures, which have no vocab_size axis), falls
+    back to the "primary" vocab_size (the sentinel, a no-op for those archs).
 
     `trim` drops the `trim` highest- and lowest-performing seeds from each
-    budget/qac_variant group before averaging (see _trim_by_performance)."""
-    return_metrics = METRICS[:2]
-    compute_metric = METRICS[2]
+    budget/qac_variant group before averaging (see _trim_by_performance).
+
+    One panel per PARETO_ROWS entry (actor episode/discounted return, then
+    evaluator episode/discounted return), each against its own prefix's
+    compute metric (actor panels vs. actor/compute_time/mean, evaluator
+    panels vs. evaluator/compute_time/mean)."""
+    panels = PARETO_ROWS
     qac_markers = {"reinforce": "D", "cond_fac": "s", "cond_naive": "^"}
     qac_colors = dict(zip(["reinforce", "cond_fac", "cond_naive"], sns.color_palette("colorblind", n_colors=3)))
     fixed_color = "0.25"
@@ -192,12 +192,14 @@ def plot_pareto(
     if os.path.abspath(out_dir).startswith("/Users"):
         plt.rcParams.update(pgf_with_latex)
 
-    figsize = set_size(doc_width_pt, fraction=1.8, subplots=(1, len(return_metrics)), use_golden_ratio=True)
-    fig, axes = plt.subplots(1, len(return_metrics), figsize=figsize, squeeze=False)
+    figsize = set_size(doc_width_pt, fraction=0.9 * len(panels), subplots=(1, len(panels)), use_golden_ratio=True)
+    fig, axes = plt.subplots(1, len(panels), figsize=figsize, squeeze=False)
     axes = axes[0]
 
-    for col, metric in enumerate(return_metrics):
+    for col, spec in enumerate(panels):
         ax = axes[col]
+        metric = spec["metric"]
+        compute_metric = f"{spec['prefix']}/compute_time/mean"
         perf = compute_final_values(arch_sub, metric)
         comp = compute_final_values(arch_sub, compute_metric)
         merged = perf.merge(comp[["run_id", "value"]], on="run_id", suffixes=("_perf", "_compute"))
@@ -236,7 +238,7 @@ def plot_pareto(
 
         ax.grid(True, alpha=0.3)
         ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
-        ax.set_title(METRIC_LABELS[metric], fontsize=9)
+        ax.set_title(f"{spec['prefix'].capitalize()}: {spec['label']}", fontsize=9)
         if col == 0:
             ax.set_ylabel("Final performance\n(mean of last {} evals, 95% CI)".format(last_k_eval), fontsize=8)
 
@@ -334,6 +336,7 @@ def plot_pareto_row(
     figsize = set_size(doc_width_pt, fraction=2.6, subplots=(1, n_cols), use_golden_ratio=False)
     fig, axes = plt.subplots(1, n_cols, figsize=figsize, squeeze=False)
     axes = axes[0]
+    all_y: list = []
 
     for col, (arch, vocab_size, col_title) in enumerate(columns):
         ax = axes[col]
@@ -346,6 +349,7 @@ def plot_pareto_row(
         if not fixed.empty:
             for i, (mn, g) in enumerate(sorted(fixed.groupby("min_steps"))):
                 perf_mean, perf_ci, comp_mean, comp_ci, n = _group_stats(g, trim)
+                all_y += [perf_mean - perf_ci, perf_mean + perf_ci]
                 ax.errorbar(
                     [comp_mean],
                     [perf_mean],
@@ -362,6 +366,7 @@ def plot_pareto_row(
         adaptive = merged[merged["min_steps"] != merged["max_steps"]]
         for qac_variant, g in adaptive.groupby("qac_variant"):
             perf_mean, perf_ci, comp_mean, comp_ci, n = _group_stats(g, trim)
+            all_y += [perf_mean - perf_ci, perf_mean + perf_ci]
             ax.errorbar(
                 [comp_mean],
                 [perf_mean],
@@ -379,13 +384,25 @@ def plot_pareto_row(
         ax.set_xticks(PARETO_GRID_XTICKS)
         ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
         ax.tick_params(labelsize=fs["tick"])
-        # if ylim is not None:
-        #     ax.set_ylim(*ylim)
         ax.set_title(col_title, fontsize=fs["col_title"])
         if col == 0:
             ax.set_ylabel(row_label, fontsize=fs["row_label"])
-        # if col > 0:
-        #     ax.set_yticks([])
+
+    # Same y-range on every column: `ylim` if the caller fixed one (e.g. the
+    # actor rows' [0.5, 1.0]), otherwise the min/max of every point plotted
+    # above (with 5% padding) so columns stay comparable even when no fixed
+    # range was given (e.g. the evaluator rows).
+    if ylim is not None:
+        y_lo, y_hi = ylim
+    elif all_y:
+        y_lo, y_hi = min(all_y), max(all_y)
+        pad = 0.05 * (y_hi - y_lo) if y_hi > y_lo else 0.05
+        y_lo, y_hi = y_lo - pad, y_hi + pad
+    else:
+        y_lo = y_hi = None
+    if y_lo is not None:
+        for ax in axes:
+            ax.set_ylim(y_lo, y_hi)
 
     fig.subplots_adjust(bottom=0.55 / figsize[1])
     max_title_lines = max(col_title.count("\n") + 1 for _, _, col_title in columns)
@@ -451,12 +468,14 @@ def plot_learning_curves(
     title: str,
 ) -> None:
     """Single combined figure, one row: one subplot per (architecture,
-    vocab_size) - the same 5-column grouping as plot_pareto_row - with every
+    vocab_size) - the same 7-column grouping as plot_pareto_row - with every
     fixed-budget curve (grayscale) and every adaptive-budget qac_variant
     curve (PPO/Factorized/Separated, each its own colorblind color)
     overlaid in the same panel, mean with a 95% CI across seeds. Unlike the main
     script's plot_arch (one row per qac_variant), this puts the full
-    compute/algorithm sweep for one architecture in a single panel."""
+    compute/algorithm sweep for one architecture in a single panel. Every
+    column shares the same y-range (min/max mean+-CI seen across all
+    columns, with 5% padding) so performance is comparable panel-to-panel."""
     columns = pareto_columns(df)
     n_cols = len(columns)
     fixed_colors, qac_colors = learning_curve_palette(df)
@@ -468,6 +487,7 @@ def plot_learning_curves(
     figsize = set_size(doc_width_pt, fraction=2.6, subplots=(1, n_cols), use_golden_ratio=False)
     fig, axes = plt.subplots(1, n_cols, figsize=figsize, squeeze=False)
     axes = axes[0]
+    all_y: list = []
 
     for col, (arch, vocab_size, col_title) in enumerate(columns):
         ax = axes[col]
@@ -484,6 +504,7 @@ def plot_learning_curves(
             color = fixed_colors[mn]
             ax.plot(steps, mean, color=color, linewidth=1.3, label=f"Uniform budget={mn}")
             ax.fill_between(steps, mean - ci, mean + ci, color=color, alpha=0.15)
+            all_y += [float(np.min(mean - ci)), float(np.max(mean + ci))]
 
         adaptive_df = col_df[col_df["min_steps"] != col_df["max_steps"]]
         for qac_variant in QAC_VARIANT_ORDER:
@@ -499,6 +520,7 @@ def plot_learning_curves(
                 label=f"Adaptive {variant_row_label(qac_variant, False)}",
             )
             ax.fill_between(steps, mean - ci, mean + ci, color=color, alpha=0.15)
+            all_y += [float(np.min(mean - ci)), float(np.max(mean + ci))]
 
         ax.grid(True, alpha=0.3)
         ax.tick_params(labelsize=fs["tick"])
@@ -506,6 +528,12 @@ def plot_learning_curves(
         ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
         if col == 0:
             ax.set_ylabel(row_label, fontsize=fs["row_label"])
+
+    if all_y:
+        y_lo, y_hi = min(all_y), max(all_y)
+        pad = 0.05 * (y_hi - y_lo) if y_hi > y_lo else 0.05
+        for ax in axes:
+            ax.set_ylim(y_lo - pad, y_hi + pad)
 
     fig.subplots_adjust(bottom=0.55 / figsize[1])
     max_title_lines = max(col_title.count("\n") + 1 for _, _, col_title in columns)
@@ -624,13 +652,14 @@ def plot_seed_variance(
 
 def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) -> None:
     """(qac_variant x budget) -> final performance heatmap, one subplot per
-    return metric (columns) and, for architectures with a vocab_size axis
+    return metric (columns - actor and evaluator episode/discounted return,
+    per PARETO_ROWS) and, for architectures with a vocab_size axis
     (Transformer-ExplicitCoT), one subplot row per vocab_size too - a
     compact grid alternative to the many row/line panels in the main
     script's figures, without folding vocab_size into the row labels of a
     single heatmap."""
     sub_arch = df[df["arch"] == arch]
-    return_metrics = METRICS[:2]
+    panels = PARETO_ROWS
     row_keys = variant_rows_for_arch(sub_arch)
     vocab_values = sorted({vs for _, vs in row_keys}, key=lambda v: (v != VOCAB_SIZE_NA, v))
     qac_by_vocab = {
@@ -650,7 +679,7 @@ def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) 
     # set_size's subplot-grid formula, which assumes stacked subplot rows
     # and badly stretches a wide-and-short annotated heatmap.
     n_vocab_rows = max(len(vocab_values), 1)
-    n_cols = len(return_metrics)
+    n_cols = len(panels)
     max_qac_rows = max((len(v) for v in qac_by_vocab.values()), default=1)
     n_col_labels = max(len(col_labels), 1)
     cell_size = 0.5
@@ -663,7 +692,9 @@ def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) 
     for row, vocab_size in enumerate(vocab_values):
         row_labels = [variant_row_label(qv, False) for qv in qac_by_vocab[vocab_size]]
         row_row_keys = [(qv, vocab_size) for qv in qac_by_vocab[vocab_size]]
-        for col, metric in enumerate(return_metrics):
+        for col, spec in enumerate(panels):
+            metric = spec["metric"]
+            col_title = f"{spec['prefix'].capitalize()}: {spec['label']}"
             ax = axes[row, col]
             labeled = build_labeled_final_df(sub_arch, metric, row_row_keys)
             # Row labels here are per-qac_variant only (vocab_size is fixed
@@ -684,13 +715,13 @@ def plot_heatmap(df: pd.DataFrame, arch: str, output_path: Path, out_dir: Path) 
                 fmt=".2f",
                 cmap="viridis",
                 ax=ax,
-                cbar_kws={"label": METRIC_LABELS[metric]},
+                cbar_kws={"label": col_title},
                 linewidths=0.5,
                 linecolor="white",
                 annot_kws={"fontsize": 7},
             )
             if row == 0:
-                ax.set_title(METRIC_LABELS[metric], fontsize=9)
+                ax.set_title(col_title, fontsize=9)
             if row == n_vocab_rows - 1:
                 ax.set_xlabel("Budget")
             else:
@@ -873,19 +904,26 @@ def main() -> None:
         "lowest-performing seeds from each budget/qac_variant group before averaging (trimmed "
         "mean/CI). 0 (default) keeps the plain mean/CI over all seeds.",
     )
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=None,
+        help="Keep only rows at this system.ent_coef, for CSVs fetched from a project that sweeps "
+        "it (e.g. the eCoT sweep). Default: no fixed value - the best-performing ent_coef is picked "
+        "automatically per (arch, qac_variant, vocab_size, budget) group (see select_best_ent_coef "
+        "in the main script).",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
     # Same filters as plot_wandb_lightsout_hd64.py's main(): finished runs
     # only (config identity dedup keeps a still-running run only when no
-    # finished run with that exact config exists yet), IRU-ACT has a
-    # secondary 1e8-timestep sweep alongside the main 3e8 one, and eCoT's
-    # vocab_size=1 budget=1 runs are valid for every other vocab_size too
-    # (no CoT tokens are ever emitted at budget=1).
+    # finished run with that exact config exists yet), and IRU-ACT has a
+    # secondary 1e8-timestep sweep alongside the main 3e8 one.
     df = df[df["state"] == "finished"]
     df = df[~df["sgh"]]
     df = df[(df["arch"] != "IRU-ACT") | (df["total_timesteps"] == 300_000_000)]
-    df = expand_vocab_agnostic_budget1(df)
+    df = resolve_ent_coef(df, args.ent_coef)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_trim{args.trim}" if args.trim > 0 else ""
 

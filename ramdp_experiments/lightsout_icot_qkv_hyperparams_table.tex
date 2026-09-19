@@ -1,0 +1,96 @@
+% Hyperparameters for wandb project
+% bpychan-university-of-alberta/lightsout-icot-icot_sweep-qkv, filtered by
+%   config.env.scenario.name                            = lightsout-5x4
+%   config.network.actor_network.pre_torso.mlp_dim       = 256
+%   config.system.actor_weight_decay                     = 0.1
+% 60 finished runs matched this filter: 6 compute-budget conditions x 10 seeds
+% (seeds 0-9). All other config fields below were constant across all 60 runs.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{llr}
+\toprule
+Category & Hyperparameter & Value \\
+\midrule
+Environment
+  & Task & LightsOut ($5\times4$) \\
+  & Episode length (train) & 10 \\
+  & Episode length (eval) & 20 \\
+  & Difficulty threshold & 0.5 \\
+  & Evaluation metric & episode return \\
+\midrule
+Actor torso (implicit CoT Transformer)
+  & Hidden dim & 128 \\
+  & MLP dim & 256 \\
+  & QKV dim & 256 \\
+  & Num.\ heads & 8 \\
+  & Num.\ layers & 2 \\
+  & Activation & GELU \\
+  & Input layer norm & True \\
+  & RMSNorm & True \\
+  & Sandwich norm & False \\
+  & Action head & Categorical \\
+\midrule
+Critic torso
+  & Architecture & MLP \\
+  & Layer sizes & [256, 256] \\
+  & Activation & ReLU \\
+  & Layer norm & False \\
+  & Critic head & Scalar \\
+\midrule
+Optimization (PPO)
+  & Actor learning rate & $3\times10^{-4}$ \\
+  & Critic learning rate & $3\times10^{-4}$ \\
+  & Actor weight decay & 0.1 \\
+  & Critic weight decay & 0 \\
+  & Epochs per update & 4 \\
+  & Num.\ minibatches & 8 \\
+  & Rollout length & 32 \\
+  & Discount $\gamma$ & 0.999 \\
+  & GAE $\lambda$ & 0.95 \\
+  & PPO clip $\epsilon$ & 0.2 \\
+  & Clip value loss & False \\
+  & Entropy coefficient & 0.01 \\
+  & Value loss coefficient & 0.5 \\
+  & Max.\ grad.\ norm & 0.5 \\
+  & Standardize advantages & True \\
+  & LR decay & False \\
+\midrule
+Training budget
+  & Total env.\ steps & $3\times10^{8}$ \\
+  & Parallel envs & 1024 \\
+  & Num.\ updates & 9155 \\
+  & Updates per eval & 183 \\
+  & Eval.\ checkpoints & 50 \\
+  & Eval.\ episodes / checkpoint & 10 \\
+  & Greedy evaluation & False \\
+\bottomrule
+\end{tabular}
+\caption{Fixed hyperparameters shared by all 60 runs of the iCoT (implicit
+chain-of-thought Transformer) QKV sweep on LightsOut $5\times4$
+(\texttt{lightsout-icot-icot\_sweep-qkv}), filtered to
+\texttt{mlp\_dim=256}, \texttt{actor\_weight\_decay=0.1}.}
+\label{tab:lightsout_icot_qkv_fixed_hyperparams}
+\end{table}
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lccccr}
+\toprule
+Condition & Min.\ steps & Max.\ steps & Halting temp. & Halting entropy coef. & Seeds \\
+\midrule
+Fixed depth 1 & 1 & 1 & 1.0 & 0.0 & 0--9 \\
+Fixed depth 2 & 2 & 2 & 1.0 & 0.0 & 0--9 \\
+Fixed depth 3 & 3 & 3 & 1.0 & 0.0 & 0--9 \\
+Fixed depth 4 & 4 & 4 & 1.0 & 0.0 & 0--9 \\
+Fixed depth 5 & 5 & 5 & 1.0 & 0.0 & 0--9 \\
+Adaptive (ACT), depth 1--5 & 1 & 5 & 5.0 & 0.01 & 0--9 \\
+\bottomrule
+\end{tabular}
+\caption{Swept conditions within the same filter (60 runs total = 6
+conditions $\times$ 10 seeds). The five fixed-depth conditions run exactly
+$k$ compute steps; the adaptive condition enables halting (Adaptive
+Computation Time) over 1--5 steps, with no stop-gradient on the halting
+input and no halting MLP (\texttt{halting\_hidden\_dims=[]}).}
+\label{tab:lightsout_icot_qkv_swept_hyperparams}
+\end{table}

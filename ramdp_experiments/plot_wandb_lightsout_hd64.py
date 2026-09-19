@@ -165,26 +165,59 @@ def step_axis(sub: pd.DataFrame):
     return sub.groupby("eval_idx")["_step"].mean()
 
 
-def expand_vocab_agnostic_budget1(df: pd.DataFrame) -> pd.DataFrame:
-    """For Transformer-ExplicitCoT, budget=1 (min_steps == max_steps == 1)
-    never emits any CoT tokens - only one step is ever taken - so
-    vocab_size doesn't affect it. The vocab_size=1 budget=1 runs are
-    therefore valid data for every other vocab_size too; duplicate them
-    (relabeled to each other vocab_size present) and drop the now-redundant
-    standalone vocab_size=1 grouping, since it would otherwise just repeat
-    what's now folded into every other vocab_size row."""
-    is_ecot = df["arch"] == "Transformer-ExplicitCoT"
-    vocab1_budget1 = df[is_ecot & (df["vocab_size"] == 1) & (df["min_steps"] == 1) & (df["max_steps"] == 1)]
-    if vocab1_budget1.empty:
+def select_best_ent_coef(df: pd.DataFrame, metric: str = "actor/episode_return/mean") -> pd.DataFrame:
+    """Some wandb projects (e.g. the eCoT `..._sweep-qkv-vulcan` one) sweep
+    `system.ent_coef` within what would otherwise be a single (arch,
+    qac_variant, vocab_size, budget) group - correctly not deduped away by
+    fetch_wandb_lightsout_hd64.py (they're genuinely different configs), but
+    not distinguished by any of the other exported columns either, so
+    grouping only by those and averaging over seed silently averages across
+    every ent_coef swept too - including worse ones - instead of reporting
+    the best hyperparameter's performance.
+
+    Rather than pick one ent_coef globally (which would be wrong wherever
+    the best value differs by group), this scores every ent_coef seen
+    within each (arch, qac_variant, vocab_size, budget) group by its mean
+    final `metric` (see compute_final_values) across that ent_coef's seeds,
+    and keeps only the winning ent_coef's runs for that group. Groups with a
+    single ent_coef (or none recorded - older CSVs, or architectures where
+    it was never swept) are left as-is."""
+    if "ent_coef" not in df.columns or df["ent_coef"].notna().sum() == 0:
         return df
-    other_vocabs = sorted(v for v in df.loc[is_ecot, "vocab_size"].unique() if v not in (1, VOCAB_SIZE_NA))
-    dup_frames = []
-    for vocab_size in other_vocabs:
-        dup = vocab1_budget1.copy()
-        dup["vocab_size"] = vocab_size
-        dup_frames.append(dup)
-    df = df[~(is_ecot & (df["vocab_size"] == 1))]
-    return pd.concat([df] + dup_frames, ignore_index=True) if dup_frames else df
+    group_cols = ["arch", "qac_variant", "vocab_size", "min_steps", "max_steps"]
+    final = compute_final_values(df, metric)
+    final["ent_coef"] = final["run_id"].map(df.groupby("run_id")["ent_coef"].first())
+
+    keep_run_ids = set()
+    for _, g in final.groupby(group_cols, dropna=False):
+        scored = g[g["ent_coef"].notna()]
+        if scored["ent_coef"].nunique() <= 1:
+            keep_run_ids.update(g["run_id"])
+            continue
+        best_ent_coef = scored.groupby("ent_coef")["value"].mean().idxmax()
+        keep_run_ids.update(g.loc[g["ent_coef"].isna() | (g["ent_coef"] == best_ent_coef), "run_id"])
+    return df[df["run_id"].isin(keep_run_ids)]
+
+
+def filter_ent_coef(df: pd.DataFrame, ent_coef: float) -> pd.DataFrame:
+    """Keep only rows at this system.ent_coef (see select_best_ent_coef for
+    why a CSV can have more than one). Rows with no recorded ent_coef
+    (older CSVs, or architectures where it was never swept) pass through
+    either way."""
+    if "ent_coef" not in df.columns:
+        return df
+    keep = df["ent_coef"].isna() | np.isclose(df["ent_coef"], ent_coef)
+    return df[keep]
+
+
+def resolve_ent_coef(df: pd.DataFrame, ent_coef: "float | None") -> pd.DataFrame:
+    """Dispatch for the `--ent-coef` CLI flag: an explicit value keeps only
+    that ent_coef everywhere (filter_ent_coef); omitted, the best-performing
+    ent_coef is picked automatically per (arch, qac_variant, vocab_size,
+    budget) group (select_best_ent_coef)."""
+    if ent_coef is not None:
+        return filter_ent_coef(df, ent_coef)
+    return select_best_ent_coef(df)
 
 
 def all_budgets_palette(df: pd.DataFrame):
@@ -428,6 +461,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", type=Path, help="CSV produced by fetch_wandb_lightsout_hd64.py")
     parser.add_argument("--output-dir", type=Path, default=Path("ramdp_experiments/wandb_plots"))
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=None,
+        help="Keep only rows at this system.ent_coef, for CSVs fetched from a project that sweeps "
+        "it (e.g. the eCoT sweep). Default: no fixed value - the best-performing ent_coef is picked "
+        "automatically per (arch, qac_variant, vocab_size, budget) group (see select_best_ent_coef).",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -442,7 +483,7 @@ def main() -> None:
     # main 3e8 sweep for the same (qac_variant, budget) config; keep only
     # the 3e8 ones so curves aren't mixing runs of different lengths.
     df = df[(df["arch"] != "IRU-ACT") | (df["total_timesteps"] == 300_000_000)]
-    df = expand_vocab_agnostic_budget1(df)
+    df = resolve_ent_coef(df, args.ent_coef)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     budget_colors = all_budgets_palette(df)

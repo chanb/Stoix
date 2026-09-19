@@ -46,6 +46,25 @@ and some configs were relaunched and so have duplicate rows). This script:
     to. Keying off the actual config sidesteps the whole class of bug: any
     config difference, known or not-yet-discovered, makes two runs distinct.
 
+    `ent_coef` (`system.ent_coef`) is exported as its own column for exactly
+    this reason: some projects (e.g. the eCoT `..._sweep-qkv-vulcan` one)
+    sweep it, so a given (arch, qac_variant, vocab_size, budget) group can
+    silently contain runs at more than one ent_coef, each with a full set of
+    seeds - correctly NOT deduped away (they're genuinely different
+    configs), but also not distinguished by any of the other exported
+    columns, so grouping only by those and averaging over "seed" quietly
+    averages over ent_coef too. Downstream scripts that hit this should
+    select a single ent_coef explicitly rather than average across it.
+
+    `gamma` (`system.gamma`) is exported as its own column for the same
+    reason, to support a gamma sensitivity analysis: historically each gamma
+    value was fetched into a separate CSV via a separate `--project`/filter
+    run (e.g. `lightsout-icot-final-gamma_0.99` vs. `-gamma_0.999`), so gamma
+    was implicit in which file you loaded rather than a queryable column.
+    With it exported directly, a single fetch that spans multiple gamma
+    values (or multiple already-fetched CSVs concatenated) can be grouped/
+    compared by gamma explicitly, the same way `ent_coef` is.
+
 Usage:
   python ramdp_experiments/fetch_wandb_lightsout_hd64.py --out wandb_cache_hd64.parquet
 """
@@ -83,6 +102,25 @@ METRICS = [
     # from the console log instead - see fetch_compute_time_extrema.
 ]
 
+# The "absolute metric" (see stoix/evaluator.py's get_ff_evaluator_fn docstring):
+# logged exactly once per run, at the very end of training, by re-evaluating
+# the best-performing checkpoint for 10x as many episodes as a single
+# actor/evaluator eval step - a much less noisy final-performance estimate
+# than evaluator/* (which is itself still a fine per-checkpoint curve, just
+# noisier at any single eval_idx). Deliberately NOT in METRICS above and
+# fetched separately, same reasoning as compute_time/{min,max}: it's logged
+# at a different `_step` than the per-eval actor/evaluator rows, so
+# Run.history(keys=...) requiring every key on the same row would collapse
+# the whole query to that one final row. Unlike compute_time min/max, this
+# IS in wandb's structured history (not console-log-only), so it's fetched
+# via its own `run.history(keys=...)` call instead of console-log parsing -
+# see fetch_absolute_metrics.
+ABSOLUTE_METRICS = [
+    "absolute/episode_return/mean",
+    "absolute/episode_discounted_return/mean",
+    "absolute/compute_time/mean",
+]
+
 # How many of the most recent console log lines to pull per run when looking
 # for the tail few eval checkpoints' compute_time min/max (see
 # fetch_compute_time_extrema). Each eval_step contributes only a handful of
@@ -98,6 +136,7 @@ ARCH_SHORT = {
     "stoix.networks.torso_compute.IRUAdaptiveComputationTimeTorso": "IRU-ACT",
     "stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso": "Transformer-ExplicitCoT",
     "stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso": "Transformer-CoT",
+    "stoix.networks.torso_compute_explicit_cot_merged.TransformerMergedActionCoTTorso": "Transformer-ExplicitCoT",
 }
 
 
@@ -137,6 +176,8 @@ class RunMeta:
     vocab_size: int
     total_timesteps: int
     seed: int
+    ent_coef: float
+    gamma: float
     config_key: str
     created_at: str
     state: str
@@ -150,13 +191,15 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         # "config.system.gamma": "0.99",
 
         # lightsout-5x4, iCoT
-        "config.system.use_expectile_value_loss": "True",
-        "config.env.scenario.name": "lightsout-6x4",
-        "config.network.actor_network.pre_torso.use_rmsnorm": "True",
-        "config.network.actor_network.pre_torso.use_input_layer_norm": "True",
-        "config.system.clip_value_loss": "False",
-        "config.network.actor_network.pre_torso.use_sandwich_norm": "False",
-        "config.system.gamma": "0.995",
+        # lightsout-icot-icot_sweep-qkv
+        # "config.env.scenario.name": "lightsout-5x4",
+        # "config.network.actor_network.pre_torso.mlp_dim": "256",
+        # "config.system.actor_weight_decay": "0.1",
+
+        # lightsout-5x4, eCoT
+        # lightsout-ecot-ecot_sweep-qkv-vulcan
+        "config.env.scenario.name": "lightsout-5x4",
+        "config.network.actor_network.pre_torso.mlp_dim": "256",
         "config.system.actor_weight_decay": "0.1",
     })
     out = []
@@ -180,6 +223,8 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         seed = cfg_get(c, "arch.seed")
         if seed is None:
             continue
+        ent_coef_raw = cfg_get(c, "system.ent_coef")
+        gamma_raw = cfg_get(c, "system.gamma")
         out.append(
             (
                 r,
@@ -193,6 +238,8 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
                     vocab_size=vocab_size,
                     total_timesteps=int(float(total_timesteps_raw)),
                     seed=int(seed),
+                    ent_coef=float(ent_coef_raw) if ent_coef_raw is not None else float("nan"),
+                    gamma=float(gamma_raw) if gamma_raw is not None else float("nan"),
                     config_key=config_identity_key(c),
                     created_at=str(r.created_at),
                     state=r.state,
@@ -282,6 +329,20 @@ def fetch_compute_time_extrema(
     return result
 
 
+def fetch_absolute_metrics(run: "wandb.apis.public.Run") -> Dict[str, float]:
+    """{"absolute/episode_return/mean": ..., ...} - the single post-training
+    absolute-metric row (see ABSOLUTE_METRICS), fetched with its own
+    `run.history` call so it doesn't collapse the main per-eval METRICS
+    query (see ABSOLUTE_METRICS docstring). Empty dict if the run has no
+    absolute-metric row (e.g. `arch.absolute_metric: false`, or the run
+    didn't reach the end of training)."""
+    hist = run.history(keys=ABSOLUTE_METRICS, pandas=True)
+    if hist.empty:
+        return {}
+    row = hist.iloc[-1]
+    return {col: float(row[col]) for col in ABSOLUTE_METRICS if col in row and pd.notna(row[col])}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default=PROJECT)
@@ -304,6 +365,8 @@ def main() -> None:
         hist["eval_idx"] = hist.index
         for col, value in fetch_compute_time_extrema(run).items():
             hist[col] = value
+        for col, value in fetch_absolute_metrics(run).items():
+            hist[col] = value
         hist["arch"] = meta.arch
         hist["qac_variant"] = meta.qac_variant
         hist["min_steps"] = meta.min_steps
@@ -312,6 +375,8 @@ def main() -> None:
         hist["vocab_size"] = meta.vocab_size
         hist["total_timesteps"] = meta.total_timesteps
         hist["seed"] = meta.seed
+        hist["ent_coef"] = meta.ent_coef
+        hist["gamma"] = meta.gamma
         hist["run_id"] = meta.run_id
         hist["state"] = meta.state
         frames.append(hist)
