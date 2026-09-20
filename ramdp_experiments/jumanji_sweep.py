@@ -492,8 +492,8 @@ ENV_CNN_ARCH = {
         "critic_layer_sizes": (128, 128),
     },
     "slidingtile": {
-        "channel_sizes": (16,),
-        "kernel_sizes": (3,),
+        "channel_sizes": (32, 32),
+        "kernel_sizes": (2, 1),
         "strides": (1,),
         "hidden_sizes": (128,),
         "critic_hidden_sizes": (128,),
