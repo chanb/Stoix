@@ -250,6 +250,7 @@ from stoix.systems.ramdp_vpg.ff_reinforce import get_distribution_act_fn_with_co
 from stoix.systems.ramdp_vpg.ppo_types import PPOTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
+    solved_episode_info,
     update_discounted_return,
 )
 from stoix.utils import make_env as environments
@@ -427,6 +428,7 @@ def get_learner_fn(
             info = {
                 **timestep.extras["episode_metrics"],
                 "episode_discounted_return": episode_discounted_return,
+                **solved_episode_info(config, timestep.reward, done),
                 "compute_time": compute_time,
             }
 

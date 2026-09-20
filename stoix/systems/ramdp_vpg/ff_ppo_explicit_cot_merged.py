@@ -90,6 +90,7 @@ from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup
 from stoix.systems.ramdp_vpg.explicit_cot_types import PPOMergedActionCoTTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
+    solved_episode_info,
     update_discounted_return,
 )
 from stoix.utils import make_env as environments
@@ -277,6 +278,7 @@ def get_learner_fn(
             info = {
                 **timestep.extras["episode_metrics"],
                 "episode_discounted_return": episode_discounted_return,
+                **solved_episode_info(config, timestep.reward, done),
                 "compute_time": compute_time,
             }
 

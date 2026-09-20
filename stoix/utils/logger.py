@@ -332,8 +332,9 @@ class JsonLogger(BaseLogger):
     # discounted by gamma per pondering step), and first_convergence_step/mean and
     # num_close_steps/mean are the torso's latent-convergence diagnostics (see
     # stoix.networks.torso_compute.AdaptiveComputationTimeTorso), meaned the same way
-    # as compute_time. All are absent for other systems' metrics, so this is a no-op
-    # there.
+    # as compute_time, and solved_episode/mean is the fraction of evaluation episodes
+    # solved (only for envs that configure a solved threshold). All are absent for other
+    # systems' metrics, so this is a no-op there.
     _METRICS_TO_LOG: ClassVar[List[str]] = [
         "episode_return/mean",
         "solve_rate",
@@ -342,6 +343,7 @@ class JsonLogger(BaseLogger):
         "episode_discounted_return/mean",
         "first_convergence_step/mean",
         "num_close_steps/mean",
+        "solved_episode/mean",
     ]
 
     def __init__(

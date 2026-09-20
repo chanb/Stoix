@@ -2,6 +2,7 @@ from typing import Dict, Tuple
 
 import chex
 import jax.numpy as jnp
+from omegaconf import DictConfig
 from stoa import TimeStep, WrapperState
 from typing_extensions import NamedTuple
 
@@ -84,3 +85,25 @@ def update_discounted_return(
         new_running_discounted_return * not_done,
         episode_discounted_return_info,
     )
+
+
+def solved_episode_info(
+    config: DictConfig, reward: chex.Array, done: chex.Array
+) -> Dict[str, chex.Array]:
+    """Per-step `solved_episode` entry for the actor's `episode_metrics` info
+    dict, or `{}` if `config.env.solved_final_reward_threshold` isn't set.
+
+    An episode counts as solved if its *final* step's reward is at least that
+    threshold - for envs whose solve is signalled by a one-off completion bonus
+    on the terminating step (Sokoban's `LEVEL_COMPLETE_BONUS`), regardless of
+    any per-step penalty in the rest of the reward, which is what makes the
+    episode return unusable as a solved indicator (see
+    `stoix/configs/env/jumanji/sokoban_grid.yaml`). Like
+    `episode_discounted_return`, it's only ever read at the terminal step (see
+    `get_final_step_metrics`), so `actor/solved_episode/mean` is the fraction
+    of episodes completed in that rollout which were solved."""
+    threshold = config.env.get("solved_final_reward_threshold", None)
+    if threshold is None:
+        return {}
+    solved = (reward.reshape(done.shape) >= threshold) & done.astype(bool)
+    return {"solved_episode": solved.astype(jnp.float32)}

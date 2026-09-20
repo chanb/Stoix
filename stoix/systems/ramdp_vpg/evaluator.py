@@ -160,6 +160,14 @@ def get_ff_evaluator_fn_with_compute_time(
             eval_metrics["solved_episode"] = jnp.all(
                 final_state.episode_return >= config.env.solved_return_threshold
             ).astype(int)
+        # Alternatively, for envs whose solve is signalled by a one-off bonus on
+        # the terminating step rather than by the total return (see
+        # `ramdp_vpg_types.solved_episode_info`), overriding the above.
+        final_reward_threshold = config.env.get("solved_final_reward_threshold", None)
+        if final_reward_threshold is not None:
+            eval_metrics["solved_episode"] = jnp.all(
+                final_state.timestep.reward >= final_reward_threshold
+            ).astype(int)
 
         return eval_metrics
 

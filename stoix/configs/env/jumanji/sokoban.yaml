@@ -16,6 +16,17 @@ kwargs:
   reward_fn:
     _target_: stoix.envs.sokoban.reward.DenseRewardNoStepPenalty
 
+# An episode counts as solved if its final step's reward is at least this - the
+# one-off +10 LEVEL_COMPLETE_BONUS (jumanji.environments.routing.sokoban.
+# constants) lands on the terminating step, whereas nothing else in the reward
+# exceeds SINGLE_BOX_BONUS = 1. Unlike a return threshold, this holds with or
+# without the -0.1 per-step penalty from jumanji's default reward_fn, under
+# which a solve at step 120 returns about the same as an unsolved 3-box episode.
+# Logged as actor/solved_episode/mean (training) and evaluator/solved_episode/mean
+# (evaluation) - see stoix.systems.ramdp_vpg.ramdp_vpg_types.solved_episode_info
+# and stoix.systems.ramdp_vpg.evaluator.
+solved_final_reward_threshold: 5.0
+
 # Defines the metric that will be used to evaluate the performance of the agent.
 # This metric is returned at the end of an experiment and can be used for hyperparameter tuning.
 eval_metric: episode_return
