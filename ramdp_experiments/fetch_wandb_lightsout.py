@@ -203,8 +203,8 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         # lightsout-3x3, IRU
         # lightsout-iru_unshared-iru_unshared_sweep-qkv
         "config.env.scenario.name": "lightsout-3x3",
-        "config.system.actor_weight_decay": "0.001",
-        "config.system.use_expectile_value_loss": "True",
+        "config.system.actor_weight_decay": "0.0001",
+        "config.system.use_expectile_value_loss": "False",
 
         # lightsout-5x4, iCoT
         # lightsout-icot-icot_sweep-qkv
