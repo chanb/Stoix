@@ -80,6 +80,7 @@ Usage:
   python ramdp_experiments/jumanji_sweep.py --min-steps 1,4 --max-steps 4,8,16 \\
       # sweeps min_steps x max_steps (min_steps > max_steps combos skipped)
   python ramdp_experiments/jumanji_sweep.py --min-steps 8 --max-steps 8  # min_steps == max_steps, the fixed-budget special case
+  python ramdp_experiments/jumanji_sweep.py --seeds 5 --base-seed 5    # seeds 5..9 (extend an earlier seeds 0..4 sweep)
   python ramdp_experiments/jumanji_sweep.py --envs slidingtile \\
       --slidingtile-grid-size 3,4 --slidingtile-num-random-moves 5,20,100       # scramble-depth sweep
   python ramdp_experiments/jumanji_sweep.py --envs knapsack \\
@@ -1304,7 +1305,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             dpo_combos,
             expectile_combos,
             args.qv_critic,
-            range(args.seeds),
+            range(args.base_seed, args.base_seed + args.seeds),
         ):
             if arch in CNN_ARCHES and not ENV_SUPPORTS_CNN[env]:
                 n_skipped_cnn += 1
@@ -1861,7 +1862,19 @@ def main() -> None:
     )
     parser.add_argument("--wandb", type=lambda x: x.strip().lower() in ("1", "true", "yes"), default=False)
     parser.add_argument("--wandb-project", default="jumanji_sweep")
-    parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=5,
+        help="Number of seeds per config, seeded base_seed..base_seed+seeds-1.",
+    )
+    parser.add_argument(
+        "--base-seed",
+        type=int,
+        default=0,
+        help="First seed (default 0); e.g. --base-seed 5 --seeds 5 runs seeds 5..9, "
+        "extending an earlier --seeds 5 sweep with new seeds.",
+    )
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
     parser.add_argument("--total-num-envs", type=int, default=1024, help="arch.total_num_envs, applied to every job.")
     parser.add_argument("--rollout-length", type=int, default=32, help="system.rollout_length, applied to every job.")
@@ -2017,7 +2030,7 @@ def main() -> None:
     print(f"  systems={args.systems} architectures={args.architectures}")
     print(
         f"  min_steps={args.min_steps} max_steps={args.max_steps} hidden_dim={args.hidden_dim} "
-        f"seeds=0..{args.seeds - 1}"
+        f"seeds={args.base_seed}..{args.base_seed + args.seeds - 1}"
     )
     print(
         f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef} "

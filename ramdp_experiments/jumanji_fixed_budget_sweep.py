@@ -170,6 +170,7 @@ Usage:
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --limit 6 --dry-run       # preview a slice
   python ramdp_experiments/jumanji_fixed_budget_sweep.py                          # run the full sweep (all 4 envs)
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs sokoban,maze       # only these envs
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --seeds 5 --base-seed 5   # seeds 5..9 (extend an earlier seeds 0..4 sweep)
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --architectures mlp \\
       --envs sokoban --sokoban-generator toy --budget 1,8 --hidden-dim 16 --lr 3e-4 \\
       --seeds 1 --total-timesteps 2e5 --limit 2  # small pilot / debug run
@@ -1258,7 +1259,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             dpo_combos,
             expectile_combos,
             args.qv_critic,
-            range(args.seeds),
+            range(args.base_seed, args.base_seed + args.seeds),
         ):
             if arch in CNN_ARCHES and not ENV_SUPPORTS_CNN[env]:
                 n_skipped_cnn += 1
@@ -1725,7 +1726,19 @@ def main() -> None:
     )
     parser.add_argument("--wandb", type=lambda x: x.strip().lower() in ("1", "true", "yes"), default=False)
     parser.add_argument("--wandb-project", default="jumanji_fixed_budget_sweep")
-    parser.add_argument("--seeds", type=int, default=5, help="Number of seeds per config, seeded 0..seeds-1.")
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=5,
+        help="Number of seeds per config, seeded base_seed..base_seed+seeds-1.",
+    )
+    parser.add_argument(
+        "--base-seed",
+        type=int,
+        default=0,
+        help="First seed (default 0); e.g. --base-seed 5 --seeds 5 runs seeds 5..9, "
+        "extending an earlier --seeds 5 sweep with new seeds.",
+    )
     parser.add_argument("--total-timesteps", type=float, default=2e7, help="arch.total_timesteps per run.")
     parser.add_argument("--total-num-envs", type=int, default=1024, help="arch.total_num_envs, applied to every job.")
     parser.add_argument("--rollout-length", type=int, default=32, help="system.rollout_length, applied to every job.")
@@ -1866,7 +1879,7 @@ def main() -> None:
     print(f"Grid: {len(jobs)} jobs to run" + (f" ({n_skipped} skipped as already-existing)" if n_skipped else ""))
     print(f"  envs={args.envs}")
     print(f"  systems={args.systems} architectures={args.architectures}")
-    print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds=0..{args.seeds - 1}")
+    print(f"  budget (min_steps=max_steps)={args.budget} hidden_dim={args.hidden_dim} seeds={args.base_seed}..{args.base_seed + args.seeds - 1}")
     print(
         f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef} "
         f"max_grad_norm={args.max_grad_norm}"
