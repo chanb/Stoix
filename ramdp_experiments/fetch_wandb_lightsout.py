@@ -65,6 +65,14 @@ and some configs were relaunched and so have duplicate rows). This script:
     values (or multiple already-fetched CSVs concatenated) can be grouped/
     compared by gamma explicitly, the same way `ent_coef` is.
 
+    `halting_temperature` (`network.actor_network.pre_torso.halting_temperature`)
+    and `halting_ent_coef` (`system.halting_ent_coef`) are exported as their
+    own columns for the same reason, so a notebook can select one setting of
+    each before plotting instead of averaging across them. Runs whose config
+    predates a knob (key absent) are exported at its no-op value: 1.0 for
+    halting_temperature (logit unscaled), 0.0 for halting_ent_coef (no
+    halting-entropy bonus).
+
 Usage:
   python ramdp_experiments/fetch_wandb_lightsout_hd64.py --out wandb_cache_hd64.parquet
 """
@@ -137,6 +145,7 @@ _CONSOLE_EVENT_PREFIX = {"ACTOR": "actor", "EVALUATOR": "evaluator"}
 
 ARCH_SHORT = {
     "stoix.networks.torso_compute.IRUAdaptiveComputationTimeTorso": "IRU-ACT",
+    "stoix.networks.torso_compute.UnsharedIRUAdaptiveComputationTimeTorso": "IRU-ACT",
     "stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso": "Transformer-ExplicitCoT",
     "stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso": "Transformer-CoT",
     "stoix.networks.torso_compute_explicit_cot_merged.TransformerMergedActionCoTTorso": "Transformer-ExplicitCoT",
@@ -181,6 +190,8 @@ class RunMeta:
     seed: int
     ent_coef: float
     gamma: float
+    halting_temperature: float
+    halting_ent_coef: float
     config_key: str
     created_at: str
     state: str
@@ -189,9 +200,11 @@ class RunMeta:
 def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta]]:
     api = wandb.Api()
     runs = api.runs(project, filters={
-        # sandbox
-        # "config.network.actor_network.pre_torso.hidden_dim": "64",
-        # "config.system.gamma": "0.99",
+        # lightsout-3x3, IRU
+        # lightsout-iru_unshared-iru_unshared_sweep-qkv
+        "config.env.scenario.name": "lightsout-3x3",
+        "config.system.actor_weight_decay": "0.001",
+        "config.system.use_expectile_value_loss": "True",
 
         # lightsout-5x4, iCoT
         # lightsout-icot-icot_sweep-qkv
@@ -201,10 +214,10 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
 
         # lightsout-5x4, eCoT
         # lightsout-ecot-ecot_sweep-qkv-vulcan
-        "config.env.scenario.name": "lightsout-5x4",
-        "config.network.actor_network.pre_torso.mlp_dim": "256",
-        "config.system.actor_weight_decay": "0.1",
-        "config.system.ent_coef": "0.01",
+        # "config.env.scenario.name": "lightsout-5x4",
+        # "config.network.actor_network.pre_torso.mlp_dim": "256",
+        # "config.system.actor_weight_decay": "0.1",
+        # "config.system.ent_coef": "0.01",
     })
     out = []
     for r in runs:
@@ -229,6 +242,8 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
             continue
         ent_coef_raw = cfg_get(c, "system.ent_coef")
         gamma_raw = cfg_get(c, "system.gamma")
+        halting_temperature_raw = cfg_get(c, "network.actor_network.pre_torso.halting_temperature")
+        halting_ent_coef_raw = cfg_get(c, "system.halting_ent_coef")
         out.append(
             (
                 r,
@@ -244,6 +259,12 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
                     seed=int(seed),
                     ent_coef=float(ent_coef_raw) if ent_coef_raw is not None else float("nan"),
                     gamma=float(gamma_raw) if gamma_raw is not None else float("nan"),
+                    halting_temperature=(
+                        float(halting_temperature_raw) if halting_temperature_raw is not None else 1.0
+                    ),
+                    halting_ent_coef=(
+                        float(halting_ent_coef_raw) if halting_ent_coef_raw is not None else 0.0
+                    ),
                     config_key=config_identity_key(c),
                     created_at=str(r.created_at),
                     state=r.state,
@@ -381,6 +402,8 @@ def main() -> None:
         hist["seed"] = meta.seed
         hist["ent_coef"] = meta.ent_coef
         hist["gamma"] = meta.gamma
+        hist["halting_temperature"] = meta.halting_temperature
+        hist["halting_ent_coef"] = meta.halting_ent_coef
         hist["run_id"] = meta.run_id
         hist["state"] = meta.state
         frames.append(hist)
