@@ -35,6 +35,14 @@ kwargs:
   # Max steps per episode before a truncation. Jumanji's own default is 500.
   time_limit: 40
 
+# Overrides env.kwargs above for the eval env only (key-by-key, so e.g.
+# overriding just time_limit here still keeps kwargs.generator - see
+# stoix/utils/make_env.py's make_jumanji_env). Omit to keep train/eval
+# symmetric (the default) - e.g. to give eval a longer time_limit than
+# training:
+# eval_kwargs:
+#   time_limit: 80
+
 solved_final_reward_threshold: 1.0
 
 # Defines the metric that will be used to evaluate the performance of the agent.

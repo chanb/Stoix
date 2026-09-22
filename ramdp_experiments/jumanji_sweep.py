@@ -598,13 +598,26 @@ def _sokoban_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
 
 
 def _slidingtile_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
+    # --slidingtile-eval-time-limit: 'same' (default) leaves env.eval_kwargs
+    # untouched, so the eval env's episode length matches the train env's
+    # (env.kwargs.time_limit, see jumanji/slidingtile.yaml/slidingtile_grid.
+    # yaml) - any other value overrides just the eval env's time_limit, the
+    # same env.eval_kwargs mechanism _sokoban_generator_overrides uses (see
+    # stoix/utils/make_env.py's make_jumanji_env).
+    eval_time_limit = args.slidingtile_eval_time_limit
+    eval_overrides = ()
+    eval_tag = ""
+    if eval_time_limit != "same":
+        eval_overrides = (f"+env.eval_kwargs.time_limit={eval_time_limit}",)
+        eval_tag = f"-evaltl{eval_time_limit}"
     return [
         EnvDifficulty(
-            tag=f"gs{gs}-nrm{nrm}",
+            tag=f"gs{gs}-nrm{nrm}{eval_tag}",
             overrides=(
                 f"env.kwargs.generator.grid_size={gs}",
                 f"env.kwargs.generator.num_random_moves={nrm}",
-            ),
+            )
+            + eval_overrides,
         )
         for gs in args.slidingtile_grid_size
         for nrm in args.slidingtile_num_random_moves
@@ -1855,6 +1868,15 @@ def main() -> None:
         "(env.kwargs.generator.num_random_moves), ignored for other envs.",
     )
     parser.add_argument(
+        "--slidingtile-eval-time-limit",
+        default="same",
+        help="env.eval_kwargs.time_limit for slidingtile jobs: the eval environment's max steps "
+        "per episode before truncation, while training keeps using the time_limit set in "
+        "jumanji/slidingtile.yaml/slidingtile_grid.yaml (default 40). Single value (not swept), "
+        "ignored for other envs. 'same' (default) evaluates with the train time_limit. Adds an "
+        "'-evaltl<N>' suffix to the group_tag/run_name.",
+    )
+    parser.add_argument(
         "--knapsack-num-items", default="10,20,50",
         help="Comma-separated ints - env.kwargs.generator.num_items, ignored for other envs.",
     )
@@ -1998,6 +2020,8 @@ def main() -> None:
     args.sokoban_generator = args.sokoban_generator.split(",")
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]
+    if args.slidingtile_eval_time_limit != "same":
+        int(args.slidingtile_eval_time_limit)  # validate - kept as str, embedded directly below
     args.knapsack_num_items = [int(x) for x in args.knapsack_num_items.split(",")]
     args.knapsack_max_weight = [int(x) for x in args.knapsack_max_weight.split(",")]
     args.knapsack_max_value = [int(x) for x in args.knapsack_max_value.split(",")]
@@ -2096,7 +2120,11 @@ def main() -> None:
     )
     print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator} sokoban_eval_generator={args.sokoban_eval_generator}")
-    print(f"  slidingtile_grid_size={args.slidingtile_grid_size} slidingtile_num_random_moves={args.slidingtile_num_random_moves}")
+    print(
+        f"  slidingtile_grid_size={args.slidingtile_grid_size} "
+        f"slidingtile_num_random_moves={args.slidingtile_num_random_moves} "
+        f"slidingtile_eval_time_limit={args.slidingtile_eval_time_limit}"
+    )
     print(
         f"  knapsack_num_items={args.knapsack_num_items} knapsack_max_weight={args.knapsack_max_weight} "
         f"knapsack_max_value={args.knapsack_max_value} knapsack_max_budget={args.knapsack_max_budget}"
