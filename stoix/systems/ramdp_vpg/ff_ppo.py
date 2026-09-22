@@ -1295,6 +1295,35 @@ def get_learner_fn(
     return learner_fn
 
 
+def _label_actor_params_by_halting_head(params: Any) -> Any:
+    """Labels every actor param leaf "no_clip" if it sits inside a submodule
+    named `HaltingHead*` (currently only `stoix.networks.torso_compute_
+    transformer.HaltingHead`, used by `TransformerChainOfThoughtTorso`), or
+    "default" otherwise - for `optax.multi_transform` to exempt just the
+    halting head's own weights from actor gradient clipping (see
+    `config.system.clip_halting_head` in `learner_setup`). Raises if no
+    "no_clip" leaf is found, since that means the actor's torso has no
+    separately-named halting head to exempt in the first place - silently
+    clipping everything as before would defeat the point of setting
+    `clip_halting_head=False`."""
+
+    def _label(path: Tuple[Any, ...], _leaf: Any) -> str:
+        keys = (getattr(entry, "key", None) for entry in path)
+        if any(isinstance(key, str) and key.startswith("HaltingHead") for key in keys):
+            return "no_clip"
+        return "default"
+
+    labels = jax.tree_util.tree_map_with_path(_label, params)
+    if not any(label == "no_clip" for label in jax.tree_util.tree_leaves(labels)):
+        raise ValueError(
+            "config.system.clip_halting_head=False but no HaltingHead parameters were found "
+            "in the actor - this architecture's torso doesn't expose a separately-named "
+            "halting head to exempt from clipping (only the transformer implicit-CoT torso, "
+            "TransformerChainOfThoughtTorso, currently does)."
+        )
+    return labels
+
+
 def learner_setup(
     env: Environment, keys: chex.Array, config: DictConfig
 ) -> Tuple[LearnerFn[RamdpOnPolicyLearnerState], Actor, RamdpOnPolicyLearnerState]:
@@ -1391,10 +1420,29 @@ def learner_setup(
         config.system.critic_lr, config, config.system.epochs, config.system.num_minibatches
     )
 
-    actor_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adamw(actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay),
-    )
+    if config.system.clip_halting_head:
+        actor_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.adamw(actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay),
+        )
+    else:
+        # Halting head exempt from clip_by_global_norm - everything else
+        # (including its own AdamW weight decay/lr) is unchanged. See
+        # _label_actor_params_by_halting_head.
+        actor_optim = optax.multi_transform(
+            {
+                "default": optax.chain(
+                    optax.clip_by_global_norm(config.system.max_grad_norm),
+                    optax.adamw(
+                        actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay
+                    ),
+                ),
+                "no_clip": optax.adamw(
+                    actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay
+                ),
+            },
+            _label_actor_params_by_halting_head,
+        )
     critic_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
         optax.adamw(critic_lr, eps=1e-5, weight_decay=config.system.critic_weight_decay),

@@ -704,6 +704,7 @@ class Job:
     clip_value_loss: bool
     gae_lambda: float
     latent_kl_coef: float
+    clip_halting_head: bool
     halting_ent_coef: float
     halting_temperature: float
     halting_hidden_dims: Tuple[int, ...]
@@ -806,6 +807,8 @@ class Job:
             extra.append(f"deta{self.delightful_eta:g}")
         if self.latent_kl_coef:
             extra.append(f"lkl{self.latent_kl_coef:g}")
+        if not self.clip_halting_head:
+            extra.append("nch")
         if self.halting_ent_coef:
             extra.append(f"hec{self.halting_ent_coef:g}")
         if self.halting_temperature != 1.0:
@@ -901,6 +904,13 @@ class Job:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
                 cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
+            if self.system in LATENT_KL_PPO_SYSTEMS and self.arch in TRANSFORMER_ARCHES:
+                # Whether the halting head's own params are exempt from actor
+                # gradient clipping - only meaningful for the transformer
+                # implicit-CoT torso's separately-named HaltingHead submodule
+                # (see ff_ppo.py's _label_actor_params_by_halting_head), so
+                # gated the same as latent_kl_coef above plus TRANSFORMER_ARCHES.
+                cmd.append(f"system.clip_halting_head={self.clip_halting_head}")
             # Halting-decision entropy bonus - both ff_ppo.py's own systems
             # and ff_ppo_explicit_* (unlike latent_kl_coef above, which only
             # exists on ff_ppo.py's continuous "thought" states) - see
@@ -1278,6 +1288,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_before_actor,
             ),
             latent_kl_coef,
+            clip_halting_head,
             halting_ent_coef,
             halting_temperature,
             halting_hidden_dims,
@@ -1299,6 +1310,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
+            args.clip_halting_head,
             args.halting_ent_coef,
             args.halting_temperature,
             args.halting_hidden_dims,
@@ -1328,6 +1340,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for every other system (including explicit-CoT PPO systems).
             if system not in LATENT_KL_PPO_SYSTEMS:
                 latent_kl_coef = args.latent_kl_coef[0]
+            # clip_halting_head only exists on ff_ppo.py's own systems and
+            # only has an actual halting head to exempt on TRANSFORMER_ARCHES
+            # (see _label_actor_params_by_halting_head in ff_ppo.py) - forced
+            # to the first requested value for every other (system, arch).
+            if system not in LATENT_KL_PPO_SYSTEMS or arch not in TRANSFORMER_ARCHES:
+                clip_halting_head = args.clip_halting_head[0]
             # halting_ent_coef exists on every PPO_SYSTEMS system (unlike
             # latent_kl_coef above) - forced to the first requested value
             # for ff_reinforce/ff_qac_*, which have no such config knob.
@@ -1383,6 +1401,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     clip_value_loss=clip_value_loss,
                     gae_lambda=gae_lambda,
                     latent_kl_coef=latent_kl_coef,
+                    clip_halting_head=clip_halting_head,
                     halting_ent_coef=halting_ent_coef,
                     halting_temperature=halting_temperature,
                     halting_hidden_dims=halting_hidden_dims,
@@ -1619,6 +1638,15 @@ def main() -> None:
         "how far the actor torso's per-step latent 'thought' states may drift across a PPO "
         "update (0.0 disables it, see ff_ppo.py's module docstring). ff_ppo.py's own systems "
         "only (LATENT_KL_PPO_SYSTEMS), not ff_ppo_explicit_*.",
+    )
+    parser.add_argument(
+        "--clip-halting-head",
+        default="true",
+        help="Comma-separated bools (true/false) - system.clip_halting_head: whether the "
+        "halting head's own params are subject to the actor's max_grad_norm clipping like "
+        "every other actor param (true, the default) or updated with plain unclipped AdamW "
+        "instead (false). ff_ppo.py's own systems only (LATENT_KL_PPO_SYSTEMS), and only has "
+        "an actual halting head to exempt on TRANSFORMER_ARCHES - forced to true otherwise.",
     )
     parser.add_argument(
         "--halting-ent-coef",
@@ -1928,6 +1956,9 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
+    args.clip_halting_head = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.clip_halting_head.split(",")
+    ]
     args.halting_ent_coef = [float(x) for x in args.halting_ent_coef.split(",")]
     args.use_dpo_loss = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_dpo_loss.split(",")
@@ -2040,6 +2071,11 @@ def main() -> None:
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
+    )
+    print(
+        f"  clip_halting_head={args.clip_halting_head} "
+        f"(ff_ppo.py's own systems x TRANSFORMER_ARCHES only: "
+        f"{LATENT_KL_PPO_SYSTEMS}, {TRANSFORMER_ARCHES})"
     )
     print(f"  halting_ent_coef={args.halting_ent_coef} (PPO systems only: {PPO_SYSTEMS})")
     print(

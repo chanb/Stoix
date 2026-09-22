@@ -104,4 +104,13 @@ critic_before_actor: False # Whether to replace the joint per-minibatch actor+cr
   # updating both networks together in every minibatch. See ff_ppo.py's module
   # docstring. Roughly doubles the per-rollout update compute when enabled.
 max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+clip_halting_head: True # Whether the halting head's own parameters (the `HaltingHead`
+  # submodule inside a compute-aware actor torso, e.g. `TransformerChainOfThoughtTorso` -
+  # see stoix/networks/torso_compute_transformer.py) are subject to the actor's
+  # max_grad_norm clipping like every other actor parameter (True, the default, recovers
+  # the original behaviour exactly), or updated with plain unclipped AdamW instead (False)
+  # - weight decay/learning rate are unaffected either way, only the clipping is skipped.
+  # Only meaningful for architectures whose actor torso exposes a separately-named halting
+  # head (currently just the transformer implicit-CoT torso) - raises if set False for one
+  # that doesn't. See ff_ppo.py's _label_actor_params_by_halting_head.
 decay_learning_rates: False # Whether learning rates should be linearly decayed during training.
