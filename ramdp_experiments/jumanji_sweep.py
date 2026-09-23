@@ -718,6 +718,8 @@ class Job:
     gae_lambda: float
     latent_kl_coef: float
     clip_halting_head: bool
+    halting_lr: float
+    halting_weight_decay: float
     halting_ent_coef: float
     halting_temperature: float
     halting_hidden_dims: Tuple[int, ...]
@@ -822,6 +824,10 @@ class Job:
             extra.append(f"lkl{self.latent_kl_coef:g}")
         if not self.clip_halting_head:
             extra.append("nch")
+        if self.halting_lr != self.lr:
+            extra.append(f"hlr{self.halting_lr:g}")
+        if self.halting_weight_decay != self.actor_weight_decay:
+            extra.append(f"hwd{self.halting_weight_decay:g}")
         if self.halting_ent_coef:
             extra.append(f"hec{self.halting_ent_coef:g}")
         if self.halting_temperature != 1.0:
@@ -924,6 +930,15 @@ class Job:
                 # (see ff_ppo.py's _label_actor_params_by_halting_head), so
                 # gated the same as latent_kl_coef above plus TRANSFORMER_ARCHES.
                 cmd.append(f"system.clip_halting_head={self.clip_halting_head}")
+                # Per-parameter-group learning rate/weight decay for the
+                # halting head's own params, overriding actor_lr/
+                # actor_weight_decay for just that submodule - same
+                # applicability as clip_halting_head above (only the
+                # transformer implicit-CoT torso's separately-named
+                # HaltingHead submodule, see ff_ppo.py's
+                # _label_actor_params_by_halting_head).
+                cmd.append(f"system.halting_lr={self.halting_lr:g}")
+                cmd.append(f"system.halting_weight_decay={self.halting_weight_decay:g}")
             # Halting-decision entropy bonus - both ff_ppo.py's own systems
             # and ff_ppo_explicit_* (unlike latent_kl_coef above, which only
             # exists on ff_ppo.py's continuous "thought" states) - see
@@ -1302,6 +1317,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ),
             latent_kl_coef,
             clip_halting_head,
+            halting_lr,
+            halting_weight_decay,
             halting_ent_coef,
             halting_temperature,
             halting_hidden_dims,
@@ -1324,6 +1341,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             ppo_combos,
             args.latent_kl_coef,
             args.clip_halting_head,
+            args.halting_lr,
+            args.halting_weight_decay,
             args.halting_ent_coef,
             args.halting_temperature,
             args.halting_hidden_dims,
@@ -1353,12 +1372,15 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for every other system (including explicit-CoT PPO systems).
             if system not in LATENT_KL_PPO_SYSTEMS:
                 latent_kl_coef = args.latent_kl_coef[0]
-            # clip_halting_head only exists on ff_ppo.py's own systems and
-            # only has an actual halting head to exempt on TRANSFORMER_ARCHES
-            # (see _label_actor_params_by_halting_head in ff_ppo.py) - forced
-            # to the first requested value for every other (system, arch).
+            # clip_halting_head/halting_lr/halting_weight_decay only exist on
+            # ff_ppo.py's own systems and only have an actual halting head to
+            # single out on TRANSFORMER_ARCHES (see
+            # _label_actor_params_by_halting_head in ff_ppo.py) - forced to
+            # the first requested value for every other (system, arch).
             if system not in LATENT_KL_PPO_SYSTEMS or arch not in TRANSFORMER_ARCHES:
                 clip_halting_head = args.clip_halting_head[0]
+                halting_lr = args.halting_lr[0]
+                halting_weight_decay = args.halting_weight_decay[0]
             # halting_ent_coef exists on every PPO_SYSTEMS system (unlike
             # latent_kl_coef above) - forced to the first requested value
             # for ff_reinforce/ff_qac_*, which have no such config knob.
@@ -1415,6 +1437,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     gae_lambda=gae_lambda,
                     latent_kl_coef=latent_kl_coef,
                     clip_halting_head=clip_halting_head,
+                    halting_lr=halting_lr,
+                    halting_weight_decay=halting_weight_decay,
                     halting_ent_coef=halting_ent_coef,
                     halting_temperature=halting_temperature,
                     halting_hidden_dims=halting_hidden_dims,
@@ -1660,6 +1684,23 @@ def main() -> None:
         "every other actor param (true, the default) or updated with plain unclipped AdamW "
         "instead (false). ff_ppo.py's own systems only (LATENT_KL_PPO_SYSTEMS), and only has "
         "an actual halting head to exempt on TRANSFORMER_ARCHES - forced to true otherwise.",
+    )
+    parser.add_argument(
+        "--halting-lr",
+        default="3e-4",
+        help="Comma-separated system.halting_lr values - learning rate for the halting head's "
+        "own params, overriding --lr for just that submodule (matching --lr, the same value, "
+        "recovers the original shared-learning-rate behaviour exactly). Swept independently of "
+        "--lr. ff_ppo.py's own systems only (LATENT_KL_PPO_SYSTEMS), and only has an actual "
+        "halting head to single out on TRANSFORMER_ARCHES - forced to the first requested "
+        "value otherwise.",
+    )
+    parser.add_argument(
+        "--halting-weight-decay",
+        default="0.0",
+        help="Comma-separated system.halting_weight_decay values - AdamW weight decay for the "
+        "halting head's own params, overriding --actor-weight-decay for just that submodule. "
+        "Swept independently of --actor-weight-decay. Same applicability as --halting-lr above.",
     )
     parser.add_argument(
         "--halting-ent-coef",
@@ -1981,6 +2022,8 @@ def main() -> None:
     args.clip_halting_head = [
         x.strip().lower() in ("1", "true", "yes") for x in args.clip_halting_head.split(",")
     ]
+    args.halting_lr = [float(x) for x in args.halting_lr.split(",")]
+    args.halting_weight_decay = [float(x) for x in args.halting_weight_decay.split(",")]
     args.halting_ent_coef = [float(x) for x in args.halting_ent_coef.split(",")]
     args.use_dpo_loss = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_dpo_loss.split(",")
@@ -2098,6 +2141,11 @@ def main() -> None:
     )
     print(
         f"  clip_halting_head={args.clip_halting_head} "
+        f"(ff_ppo.py's own systems x TRANSFORMER_ARCHES only: "
+        f"{LATENT_KL_PPO_SYSTEMS}, {TRANSFORMER_ARCHES})"
+    )
+    print(
+        f"  halting_lr={args.halting_lr} halting_weight_decay={args.halting_weight_decay} "
         f"(ff_ppo.py's own systems x TRANSFORMER_ARCHES only: "
         f"{LATENT_KL_PPO_SYSTEMS}, {TRANSFORMER_ARCHES})"
     )

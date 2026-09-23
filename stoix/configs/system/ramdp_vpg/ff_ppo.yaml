@@ -25,6 +25,15 @@ actor_lr: 3e-4 # Learning rate for actor network
 critic_lr: 3e-4 # Learning rate for critic network
 actor_weight_decay: 0.0 # AdamW weight decay coefficient for the actor. 0.0 recovers plain Adam.
 critic_weight_decay: 0.0 # AdamW weight decay coefficient for the critic. 0.0 recovers plain Adam.
+halting_lr: null # Learning rate for the halting head's own parameters (the `HaltingHead`
+  # submodule inside a compute-aware actor torso - see clip_halting_head below), overriding
+  # actor_lr for just that submodule. null (the default) falls back to actor_lr exactly, i.e.
+  # a single shared actor learning rate as before. Only meaningful for architectures whose
+  # actor torso exposes a separately-named halting head - raises if set for one that doesn't.
+  # See ff_ppo.py's _label_actor_params_by_halting_head.
+halting_weight_decay: null # AdamW weight decay coefficient for the halting head's own
+  # parameters, overriding actor_weight_decay for just that submodule. null (the default)
+  # falls back to actor_weight_decay exactly. Same applicability caveat as halting_lr above.
 rollout_length: 32 # Number of environment steps per vectorised environment.
 epochs: 4 # Number of PPO epochs per training data batch.
 num_minibatches: 16 # Number of minibatches per PPO epoch.
@@ -109,8 +118,11 @@ clip_halting_head: True # Whether the halting head's own parameters (the `Haltin
   # see stoix/networks/torso_compute_transformer.py) are subject to the actor's
   # max_grad_norm clipping like every other actor parameter (True, the default, recovers
   # the original behaviour exactly), or updated with plain unclipped AdamW instead (False)
-  # - weight decay/learning rate are unaffected either way, only the clipping is skipped.
-  # Only meaningful for architectures whose actor torso exposes a separately-named halting
-  # head (currently just the transformer implicit-CoT torso) - raises if set False for one
-  # that doesn't. See ff_ppo.py's _label_actor_params_by_halting_head.
+  # - weight decay/learning rate are unaffected by this flag either way (see halting_lr/
+  # halting_weight_decay above for those), only the clipping is skipped. When this is False
+  # and/or halting_lr/halting_weight_decay above are set, the halting head's clip_by_global_norm
+  # (when present) is computed only over its own gradients, separately from the rest of the
+  # actor's. Only meaningful for architectures whose actor torso exposes a separately-named
+  # halting head (currently just the transformer implicit-CoT torso) - raises if set False
+  # for one that doesn't. See ff_ppo.py's _label_actor_params_by_halting_head.
 decay_learning_rates: False # Whether learning rates should be linearly decayed during training.

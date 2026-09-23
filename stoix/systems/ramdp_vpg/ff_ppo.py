@@ -1296,29 +1296,31 @@ def get_learner_fn(
 
 
 def _label_actor_params_by_halting_head(params: Any) -> Any:
-    """Labels every actor param leaf "no_clip" if it sits inside a submodule
-    named `HaltingHead*` (currently only `stoix.networks.torso_compute_
-    transformer.HaltingHead`, used by `TransformerChainOfThoughtTorso`), or
-    "default" otherwise - for `optax.multi_transform` to exempt just the
-    halting head's own weights from actor gradient clipping (see
-    `config.system.clip_halting_head` in `learner_setup`). Raises if no
-    "no_clip" leaf is found, since that means the actor's torso has no
-    separately-named halting head to exempt in the first place - silently
-    clipping everything as before would defeat the point of setting
-    `clip_halting_head=False`."""
+    """Labels every actor param leaf "halting_head" if it sits inside a
+    submodule named `HaltingHead*` (currently only `stoix.networks.torso_
+    compute_transformer.HaltingHead`, used by `TransformerChainOfThoughtTorso`),
+    or "default" otherwise - for `optax.multi_transform` to give the halting
+    head's own weights a different gradient-clipping and/or learning-rate/
+    weight-decay treatment than the rest of the actor (see
+    `config.system.clip_halting_head`/`halting_lr`/`halting_weight_decay` in
+    `learner_setup`). Raises if no "halting_head" leaf is found, since that
+    means the actor's torso has no separately-named halting head to single
+    out in the first place - silently treating everything as "default" would
+    defeat the point of setting any of those config options."""
 
     def _label(path: Tuple[Any, ...], _leaf: Any) -> str:
         keys = (getattr(entry, "key", None) for entry in path)
         if any(isinstance(key, str) and key.startswith("HaltingHead") for key in keys):
-            return "no_clip"
+            return "halting_head"
         return "default"
 
     labels = jax.tree_util.tree_map_with_path(_label, params)
-    if not any(label == "no_clip" for label in jax.tree_util.tree_leaves(labels)):
+    if not any(label == "halting_head" for label in jax.tree_util.tree_leaves(labels)):
         raise ValueError(
-            "config.system.clip_halting_head=False but no HaltingHead parameters were found "
-            "in the actor - this architecture's torso doesn't expose a separately-named "
-            "halting head to exempt from clipping (only the transformer implicit-CoT torso, "
+            "config.system.clip_halting_head=False (and/or halting_lr/halting_weight_decay "
+            "were set) but no HaltingHead parameters were found in the actor - this "
+            "architecture's torso doesn't expose a separately-named halting head to single "
+            "out in the first place (only the transformer implicit-CoT torso, "
             "TransformerChainOfThoughtTorso, currently does)."
         )
     return labels
@@ -1420,15 +1422,45 @@ def learner_setup(
         config.system.critic_lr, config, config.system.epochs, config.system.num_minibatches
     )
 
-    if config.system.clip_halting_head:
+    # `halting_lr`/`halting_weight_decay` (both None by default) let the halting
+    # head train with its own learning rate/weight decay instead of inheriting
+    # the rest of the actor's - None falls back to actor_lr/actor_weight_decay
+    # exactly, recovering the original behaviour.
+    halting_lr_cfg = config.system.get("halting_lr", None)
+    halting_weight_decay_cfg = config.system.get("halting_weight_decay", None)
+    needs_halting_split = (
+        not config.system.clip_halting_head
+        or halting_lr_cfg is not None
+        or halting_weight_decay_cfg is not None
+    )
+
+    if not needs_halting_split:
         actor_optim = optax.chain(
             optax.clip_by_global_norm(config.system.max_grad_norm),
             optax.adamw(actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay),
         )
     else:
-        # Halting head exempt from clip_by_global_norm - everything else
-        # (including its own AdamW weight decay/lr) is unchanged. See
+        halting_lr = (
+            actor_lr
+            if halting_lr_cfg is None
+            else make_learning_rate(
+                halting_lr_cfg, config, config.system.epochs, config.system.num_minibatches
+            )
+        )
+        halting_weight_decay = (
+            config.system.actor_weight_decay
+            if halting_weight_decay_cfg is None
+            else halting_weight_decay_cfg
+        )
+        # Each branch's clip_by_global_norm (when present) is computed only over
+        # that branch's own leaves, not jointly over the whole actor - see
         # _label_actor_params_by_halting_head.
+        halting_components = []
+        if config.system.clip_halting_head:
+            halting_components.append(optax.clip_by_global_norm(config.system.max_grad_norm))
+        halting_components.append(
+            optax.adamw(halting_lr, eps=1e-5, weight_decay=halting_weight_decay)
+        )
         actor_optim = optax.multi_transform(
             {
                 "default": optax.chain(
@@ -1437,9 +1469,7 @@ def learner_setup(
                         actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay
                     ),
                 ),
-                "no_clip": optax.adamw(
-                    actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay
-                ),
+                "halting_head": optax.chain(*halting_components),
             },
             _label_actor_params_by_halting_head,
         )
