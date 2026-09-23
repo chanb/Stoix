@@ -48,6 +48,20 @@ ABSOLUTE_METRICS = [
     "absolute/episode_length/mean",
 ]
 
+# Metrics only some runs log - solved_episode exists only for envs that set
+# `solved_final_reward_threshold` (Sokoban, sliding tile; not Lights Out), see
+# stoix.systems.ramdp_vpg.ramdp_vpg_types.solved_episode_info. Each is fetched
+# with its own `run.history(keys=[...])` call, since putting a key a run never
+# logged into METRICS / ABSOLUTE_METRICS would empty that whole query. Runs
+# without it just get no column (NaN in the concatenated CSV).
+OPTIONAL_METRICS = [
+    "actor/solved_episode/mean",
+    "evaluator/solved_episode/mean",
+]
+OPTIONAL_ABSOLUTE_METRICS = [
+    "absolute/solved_episode/mean",
+]
+
 # How many of the most recent console log lines to pull per run when looking
 # for the tail few eval checkpoints' compute_time min/max (see
 # fetch_compute_time_extrema). Each eval_step contributes only a handful of
@@ -108,6 +122,8 @@ class RunMeta:
     gamma: float
     halting_temperature: float
     halting_ent_coef: float
+    actor_lr: float
+    clip_halting_head: bool
     config_key: str
     created_at: str
     state: str
@@ -145,7 +161,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         # "config.system.use_expectile_value_loss": "True",
         # "config.system.expectile": "0.2",
         # "config.system.max_grad_norm": "0.5",
-        # "config.env.eval_kwargs.time_limit": "Null",
+        # "config.env.eval_kwargs.time_limit": None,
 
         # slidingpuzzle-icot_sweep_2 -- current good run, w/ eval 80 timesteps
         "config.network.actor_network.pre_torso.mlp_dim": "256",
@@ -156,6 +172,24 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         "config.system.expectile": "0.2",
         "config.system.max_grad_norm": "0.5",
         "config.env.eval_kwargs.time_limit": "80",
+
+        # sokoban
+        # sokoban-shallow_cnn
+        # "$and": [
+        #     {"config.system.actor_weight_decay": "0.001"},
+        #     {"config.system.gamma": "0.999"},
+        #     {"config.system.actor_lr": "0.0003"},
+        #     {"config.system.use_expectile_value_loss": "True"},
+        #     {"config.system.expectile": "0.9"},
+        #     {"config.system.max_grad_norm": "5"},
+        #     {
+        #         "$or": [
+        #             {"config.network.actor_network.pre_torso.halting_hidden_dims": "[]"},
+        #             {"config.network.actor_network.pre_torso.halting_hidden_dims": None},
+        #         ]
+        #     },
+        # ],
+        
     })
     out = []
     for r in runs:
@@ -182,6 +216,9 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         gamma_raw = cfg_get(c, "system.gamma")
         halting_temperature_raw = cfg_get(c, "network.actor_network.pre_torso.halting_temperature")
         halting_ent_coef_raw = cfg_get(c, "system.halting_ent_coef")
+        actor_lr_raw = cfg_get(c, "system.actor_lr")
+        # Default True matches stoix/configs/system/ramdp_vpg/ff_ppo.yaml.
+        clip_halting_head = str(cfg_get(c, "system.clip_halting_head", True)) == "True"
         out.append(
             (
                 r,
@@ -203,6 +240,8 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
                     halting_ent_coef=(
                         float(halting_ent_coef_raw) if halting_ent_coef_raw is not None else 0.0
                     ),
+                    actor_lr=float(actor_lr_raw) if actor_lr_raw is not None else float("nan"),
+                    clip_halting_head=clip_halting_head,
                     config_key=config_identity_key(c),
                     created_at=str(r.created_at),
                     state=r.state,
@@ -303,7 +342,23 @@ def fetch_absolute_metrics(run: "wandb.apis.public.Run") -> Dict[str, float]:
     if hist.empty:
         return {}
     row = hist.iloc[-1]
-    return {col: float(row[col]) for col in ABSOLUTE_METRICS if col in row and pd.notna(row[col])}
+    result = {col: float(row[col]) for col in ABSOLUTE_METRICS if col in row and pd.notna(row[col])}
+    for col in OPTIONAL_ABSOLUTE_METRICS:
+        opt = run.history(keys=[col], pandas=True)
+        if not opt.empty and col in opt and pd.notna(opt[col].iloc[-1]):
+            result[col] = float(opt[col].iloc[-1])
+    return result
+
+
+def merge_optional_metrics(run: "wandb.apis.public.Run", hist: pd.DataFrame) -> pd.DataFrame:
+    """Left-join each OPTIONAL_METRICS series the run logged onto the per-eval
+    `hist` rows by `_step` (they're logged on the same row as METRICS)."""
+    for col in OPTIONAL_METRICS:
+        opt = run.history(keys=[col], pandas=True)
+        if opt.empty or col not in opt:
+            continue
+        hist = hist.merge(opt[["_step", col]], on="_step", how="left")
+    return hist
 
 
 def main() -> None:
@@ -324,7 +379,7 @@ def main() -> None:
         if hist.empty:
             print(f"  [{i+1}/{len(deduped)}] {run.id} ({meta.arch}, {meta.state}): no history, skipping")
             continue
-        hist = hist.reset_index(drop=True)
+        hist = merge_optional_metrics(run, hist.reset_index(drop=True))
         hist["eval_idx"] = hist.index
         for col, value in fetch_compute_time_extrema(run).items():
             hist[col] = value
@@ -342,6 +397,8 @@ def main() -> None:
         hist["gamma"] = meta.gamma
         hist["halting_temperature"] = meta.halting_temperature
         hist["halting_ent_coef"] = meta.halting_ent_coef
+        hist["actor_lr"] = meta.actor_lr
+        hist["clip_halting_head"] = meta.clip_halting_head
         hist["run_id"] = meta.run_id
         hist["state"] = meta.state
         frames.append(hist)
