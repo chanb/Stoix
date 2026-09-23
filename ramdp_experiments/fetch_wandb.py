@@ -1,80 +1,8 @@
 #!/usr/bin/env python
-"""Fetch actor/{episode_return,episode_discounted_return,compute_time} training
-curves, and the same three quantities from held-out evaluator rollouts
-(evaluator/{episode_return,episode_discounted_return,compute_time}), from the
-wandb project `bpychan-university-of-alberta/lightsout-sep7`, restricted to
-`network.actor_network.pre_torso.hidden_dim == 64`, and cache them to a local
-parquet file for plotting (see plot_wandb_lightsout_hd64.py) and rliable
-analysis (see rliable_analysis.py).
-
-Also fetches compute_time/{min,max} for both actor and evaluator, so
-downstream analysis can check how much an adaptive-budget agent's
-per-episode compute usage actually varies rather than only seeing the mean.
-These two are NOT in `wandb.log`'s structured history - `WandBLogger.log_stat`
-(stoix/utils/logger.py) drops every non-mean stat unless a run's config sets
-`logger.loggers.wandb.detailed_logging: true` (default False, see
-stoix/configs/logger/logger.yaml), and none of these runs did. But
-`ConsoleLogger.log_stat` has no such gate, so mean/std/min/max for every
-metric were all printed to stdout regardless - e.g. "EVALUATOR - ... |
-Compute time mean: 3.480 | Compute time std: 0.596 | Compute time min: 2.200
-| Compute time max: 4.500 | ..." - and wandb captures stdout as the run's
-console log (the "Logs" tab) independently of what got `wandb.log`'d. So
-`fetch_compute_time_extrema` reads back the tail of that console log via
-`run.console_logs(last=...)` and regex-parses out the last few ACTOR/
-EVALUATOR blocks' min/max, averaged the same way `compute_final_values`
-(plot_wandb_lightsout_hd64.py) averages the last 3 eval points - it's a
-single scalar per run, broadcast onto every row of that run's history so
-the existing per-eval-point machinery doesn't need to change.
-
-The project mixes runs logged under a couple of config schema versions (e.g.
-`stop_gradient_halting_input` / `halting_ent_coef` only exist on newer runs,
-and some configs were relaunched and so have duplicate rows). This script:
-  - normalizes `stop_gradient_halting_input` (absent == False)
-  - dedupes by the run's full config (everything except the `logger`
-    subtree, which is pure logging plumbing - exp path, wandb run id, tags -
-    not experiment identity), keeping the most-recently-created run per
-    identical config, preferring `finished` over other states.
-
-    Deliberately NOT deduped by a hand-picked tuple of fields (arch,
-    qac_variant, budget, ...): earlier versions of this script did that and
-    it kept silently mixing distinct runs together every time a new
-    hyperparameter axis turned out to vary (stop_gradient_halting_input,
-    vocab_size, total_timesteps each caused this in turn) but wasn't yet in
-    the tuple. The run's naming convention (`logger.base_exp_path` /
-    `group_tag`) has the exact same blind spot - it's built from a fixed set
-    of tag components that new hyperparameters aren't automatically added
-    to. Keying off the actual config sidesteps the whole class of bug: any
-    config difference, known or not-yet-discovered, makes two runs distinct.
-
-    `ent_coef` (`system.ent_coef`) is exported as its own column for exactly
-    this reason: some projects (e.g. the eCoT `..._sweep-qkv-vulcan` one)
-    sweep it, so a given (arch, qac_variant, vocab_size, budget) group can
-    silently contain runs at more than one ent_coef, each with a full set of
-    seeds - correctly NOT deduped away (they're genuinely different
-    configs), but also not distinguished by any of the other exported
-    columns, so grouping only by those and averaging over "seed" quietly
-    averages over ent_coef too. Downstream scripts that hit this should
-    select a single ent_coef explicitly rather than average across it.
-
-    `gamma` (`system.gamma`) is exported as its own column for the same
-    reason, to support a gamma sensitivity analysis: historically each gamma
-    value was fetched into a separate CSV via a separate `--project`/filter
-    run (e.g. `lightsout-icot-final-gamma_0.99` vs. `-gamma_0.999`), so gamma
-    was implicit in which file you loaded rather than a queryable column.
-    With it exported directly, a single fetch that spans multiple gamma
-    values (or multiple already-fetched CSVs concatenated) can be grouped/
-    compared by gamma explicitly, the same way `ent_coef` is.
-
-    `halting_temperature` (`network.actor_network.pre_torso.halting_temperature`)
-    and `halting_ent_coef` (`system.halting_ent_coef`) are exported as their
-    own columns for the same reason, so a notebook can select one setting of
-    each before plotting instead of averaging across them. Runs whose config
-    predates a knob (key absent) are exported at its no-op value: 1.0 for
-    halting_temperature (logit unscaled), 0.0 for halting_ent_coef (no
-    halting-entropy bonus).
+"""Fetch wandb data based on filters
 
 Usage:
-  python ramdp_experiments/fetch_wandb_lightsout_hd64.py --out wandb_cache_hd64.parquet
+  python ramdp_experiments/fetch_wandb.py --out data.csv
 """
 
 from __future__ import annotations
@@ -89,27 +17,15 @@ import numpy as np
 import pandas as pd
 import wandb
 
-PROJECT = "bpychan-university-of-alberta/lightsout-sep7"
-
 METRICS = [
     "actor/episode_return/mean",
     "actor/episode_discounted_return/mean",
     "actor/compute_time/mean",
     "actor/episode_length/mean",
-    # Evaluator metrics: same quantities but from held-out eval rollouts
-    # (deterministic-ish, not the training batch) rather than the actor's
-    # own training-time episodes - logged at the same eval_step/wandb step
-    # as the actor/* metrics above (see ff_reinforce.py's eval loop), so
-    # they line up 1:1 with the actor rows already fetched here.
     "evaluator/episode_return/mean",
     "evaluator/episode_discounted_return/mean",
     "evaluator/compute_time/mean",
     "evaluator/episode_length/mean",
-    # compute_time/{min,max} are deliberately NOT here - Run.history(keys=...)
-    # requires every requested key to be present on a row, and these were
-    # never sent via wandb.log (see module docstring), so including them
-    # would make every run's history query return empty. Fetched separately
-    # from the console log instead - see fetch_compute_time_extrema.
 ]
 
 # The "absolute metric" (see stoix/evaluator.py's get_ff_evaluator_fn docstring):
@@ -202,9 +118,9 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
     runs = api.runs(project, filters={
         # lightsout-3x3, IRU
         # lightsout-iru_unshared-iru_unshared_sweep-qkv
-        "config.env.scenario.name": "lightsout-3x3",
-        "config.system.actor_weight_decay": "0.0001",
-        "config.system.use_expectile_value_loss": "False",
+        # "config.env.scenario.name": "lightsout-3x3",
+        # "config.system.actor_weight_decay": "0.0001",
+        # "config.system.use_expectile_value_loss": "False",
 
         # lightsout-5x4, iCoT
         # lightsout-icot-icot_sweep-qkv
@@ -218,6 +134,28 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         # "config.network.actor_network.pre_torso.mlp_dim": "256",
         # "config.system.actor_weight_decay": "0.1",
         # "config.system.ent_coef": "0.01",
+
+
+        # sliding puzzle tile, iCoT
+        # slidingpuzzle-icot_sweep_2 -- current good run, w/ eval 40 timesteps
+        # "config.network.actor_network.pre_torso.mlp_dim": "256",
+        # "config.system.actor_weight_decay": "0.01",
+        # "config.system.gamma": "0.999",
+        # "config.arch.total_num_envs": "256",
+        # "config.system.use_expectile_value_loss": "True",
+        # "config.system.expectile": "0.2",
+        # "config.system.max_grad_norm": "0.5",
+        # "config.env.eval_kwargs.time_limit": "Null",
+
+        # slidingpuzzle-icot_sweep_2 -- current good run, w/ eval 80 timesteps
+        "config.network.actor_network.pre_torso.mlp_dim": "256",
+        "config.system.actor_weight_decay": "0.02",
+        "config.system.gamma": "0.999",
+        "config.arch.total_num_envs": "256",
+        "config.system.use_expectile_value_loss": "True",
+        "config.system.expectile": "0.2",
+        "config.system.max_grad_norm": "0.5",
+        "config.env.eval_kwargs.time_limit": "80",
     })
     out = []
     for r in runs:
@@ -370,8 +308,8 @@ def fetch_absolute_metrics(run: "wandb.apis.public.Run") -> Dict[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", default=PROJECT)
-    parser.add_argument("--out", default="ramdp_experiments/wandb_cache_hd64.csv")
+    parser.add_argument("--project", required=True, type=str)
+    parser.add_argument("--out", required=True, type=str)
     args = parser.parse_args()
 
     print(f"Fetching run list from {args.project} (hidden_dim=64) ...")
