@@ -24,9 +24,9 @@ scenario:
 # See jumanji/sokoban.yaml: overrides jumanji's default reward_fn (DenseReward,
 # which adds a constant -0.1 per-step penalty) to drop that per-step term -
 # see stoix/envs/sokoban/reward.py.
-# kwargs:
-#   reward_fn:
-#     _target_: stoix.envs.sokoban.reward.DenseRewardNoStepPenalty
+kwargs:
+  reward_fn:
+    _target_: stoix.envs.sokoban.reward.DenseRewardNoStepPenalty
 
 # An episode counts as solved if its final step's reward is at least this - the
 # one-off +10 LEVEL_COMPLETE_BONUS (jumanji.environments.routing.sokoban.
