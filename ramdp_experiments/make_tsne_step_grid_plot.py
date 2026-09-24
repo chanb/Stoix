@@ -16,6 +16,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import tqdm
 from sklearn.manifold import TSNE
 
 import analysis_utils as base
@@ -26,6 +27,11 @@ doc_width_pt = base.doc_width_pt
 plt.rcParams.update(pgf_with_latex)
 
 HERE = Path(__file__).resolve().parent
+
+ENV_LABELS = {
+    "lightsout-5x4": "Lightsout",
+    "slidingtile-3x3": "Sliding puzzle",
+}
 
 
 def load_plot_data(name):
@@ -46,48 +52,83 @@ def main():
         "MAX_STEPS (both are 5 as of writing) - the grid has one column per step."
     )
 
-    compute_times = np.concatenate([env["tsne_sample_compute_time"] for env in envs])
-    vmin, vmax = compute_times.min(), compute_times.max()
+    # One discrete colour per integer compute time (1..max_steps), shared
+    # across every panel so a colour means the same compute time everywhere.
+    step_colours = {
+        k: plt.get_cmap("tab10")(i) for i, k in enumerate(range(1, max_steps + 1))
+    }
 
     fig, axes = plt.subplots(
         2,
         max_steps,
         figsize=set_size(
-            doc_width_pt, fraction=1.3, subplots=(2, max_steps), use_golden_ratio=False
+            doc_width_pt, fraction=0.95, subplots=(2, max_steps), use_golden_ratio=False
         ),
         subplot_kw={"projection": "3d"},
     )
 
-    scatter = None
     for row, env in enumerate(envs):
         step_latents = env["step_latents"]  # (n, max_steps, hidden_dim)
         compute_time = env["tsne_sample_compute_time"]
-        perplexity = perplexity_for(step_latents.shape[0])
-        for col in range(max_steps):
-            latents = step_latents[:, col, :]
+        # states_history keeps recomputing a "thought" for every example at
+        # every CoT step regardless of when it actually halted (see
+        # TransformerChainOfThoughtTorso's docstring) - those post-halt steps
+        # are a counterfactual continuation the real policy never acts on.
+        # Clamp each example's step index to its own compute_time instead, so
+        # column i shows the state after min(i, compute_time) real steps -
+        # frozen at whatever it was when that example actually halted, for
+        # every later column (column max_steps is then exactly final_state
+        # for every example, since compute_time <= max_steps always).
+        compute_time_int = np.rint(compute_time).astype(int)
+        n = step_latents.shape[0]
+        perplexity = perplexity_for(n)
+        for col in tqdm.tqdm(range(max_steps)):
+            step_count = col + 1
+            step_idx = np.minimum(step_count, compute_time_int) - 1
+            latents = step_latents[np.arange(n), step_idx, :]
             embedding = TSNE(
                 n_components=3, perplexity=perplexity, random_state=0, init="pca"
             ).fit_transform(latents)
             ax = axes[row, col]
-            scatter = ax.scatter(
-                embedding[:, 0],
-                embedding[:, 1],
-                embedding[:, 2],
-                c=compute_time,
-                cmap="viridis",
-                vmin=vmin,
-                vmax=vmax,
-                s=4,
-                alpha=0.7,
-            )
+            for k, colour in step_colours.items():
+                mask = compute_time_int == k
+                if not mask.any():
+                    continue
+                ax.scatter(
+                    embedding[mask, 0],
+                    embedding[mask, 1],
+                    embedding[mask, 2],
+                    color=colour,
+                    s=4,
+                    alpha=0.9,
+                )
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_zticks([])
             if row == 0:
-                ax.set_title(f"step {col + 1}", fontsize=8, y=1.0)
+                ax.set_title(f"Step {col + 1}", fontsize=8, y=1.0)
 
-    fig.colorbar(
-        scatter, ax=axes, label="First-step compute time", shrink=0.6, pad=0.05, aspect=30
+    # Reserve a right margin for the figure legend (unlike fig.colorbar, a
+    # figure legend doesn't shrink the axes to make room for itself). 0.88 was
+    # not enough room for the "First-step compute time" legend title, which
+    # ended up overlapping the last column's 3D panel - a 3D axes' actual
+    # drawn extent (the perspective cube) also overflows its own get_position()
+    # bbox, so this needs a bigger margin than a 2D legend would.
+    fig.subplots_adjust(right=0.8)
+    legend_handles = [
+        plt.Line2D(
+            [], [], marker="o", linestyle="", markersize=4, color=colour, label=str(k)
+        )
+        for k, colour in step_colours.items()
+    ]
+    fig.legend(
+        handles=legend_handles,
+        title="Compute time",
+        loc="center right",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize=7,
+        title_fontsize=8,
+        frameon=False,
     )
 
     # Row labels via fig.text at each row's leftmost axis position, not
@@ -95,13 +136,13 @@ def main():
     # the 3D box along its own y-axis (oriented by the current view angle),
     # not a conventional row label on the left margin like it would for a 2D
     # axes - it comes out diagonal and clipped against the next axes. Read
-    # positions after the colorbar call, which shrinks/repositions `axes`.
+    # positions after layout is final.
     for row, env in enumerate(envs):
         pos = axes[row, 0].get_position()
         fig.text(
             pos.x0 - 0.02,
             (pos.y0 + pos.y1) / 2,
-            env["env_label"],
+            ENV_LABELS[env["env_label"]],
             fontsize=9,
             rotation=90,
             ha="right",
@@ -113,7 +154,7 @@ def main():
     # "tight" mis-crops 3D axes' irregular bounding box - so it's omitted
     # below (see the notebooks' own single-panel 3D t-SNE cells for the same
     # two issues and fixes).
-    fig.suptitle("t-SNE of CoT step latent states, coloured by compute time", y=0.98)
+    fig.suptitle("t-SNE of CoT step latent states, coloured by compute step", y=0.98)
     out_path = HERE / "analysis-tsne_step_grid.pdf"
     fig.savefig(out_path, dpi=600, format="pdf")
     print(f"Saved {out_path}")

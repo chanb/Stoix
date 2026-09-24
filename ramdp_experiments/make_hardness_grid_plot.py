@@ -110,7 +110,8 @@ def plot_hardness_panel(ax, hardness, values, ylabel, title, diagonal=False):
 
     # Pearson r as an in-axis annotation (not the title): a 4-up figure has no
     # room for a title long enough to spell out both the env label and the
-    # correlation without adjacent panels' titles colliding.
+    # correlation without adjacent panels' titles colliding. fontsize=8
+    # matches analysis-unshared_iru.ipynb's analogous delta annotation.
     ax.text(
         0.95,
         0.05,
@@ -118,12 +119,12 @@ def plot_hardness_panel(ax, hardness, values, ylabel, title, diagonal=False):
         transform=ax.transAxes,
         ha="right",
         va="bottom",
-        fontsize=7,
+        fontsize=8,
         bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.0),
     )
     # ax.set_xlabel("Shortest path length")
-    ax.set_ylabel(ylabel)
-    # ax.set_title(title, fontsize=9)
+    # ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(True, alpha=0.3)
     return handles
 
@@ -148,40 +149,52 @@ def main():
         axes[0],
         lightsout["hardness"],
         lightsout["first_step_compute_time"],
-        ylabel="$c$",
-        title=env_map[lightsout["env_label"]],
+        ylabel="Compute steps",
+        title="Compute steps",
+        # title=env_map[lightsout["env_label"]],
     )
     handles = plot_hardness_panel(
         axes[1],
         lightsout["hardness"],
         lightsout["episode_length"],
         ylabel="Ep. length",
-        title=env_map[lightsout["env_label"]],
+        title="Ep. length",
+        # title=env_map[lightsout["env_label"]],
         diagonal=True,
     )
     plot_hardness_panel(
         axes[2],
         slidingpuzzle["hardness"],
         slidingpuzzle["first_step_compute_time"],
-        ylabel="$c$",
-        title=env_map[slidingpuzzle["env_label"]],
+        ylabel="Compute steps",
+        title="Compute steps",
+        # title=env_map[slidingpuzzle["env_label"]],
     )
     plot_hardness_panel(
         axes[3],
         slidingpuzzle["hardness"],
         slidingpuzzle["episode_length"],
         ylabel="Ep. length",
-        title=env_map[slidingpuzzle["env_label"]],
+        title="Ep. length",
+        # title=env_map[slidingpuzzle["env_label"]],
         diagonal=True,
     )
 
-    fig.tight_layout(pad=0.0, w_pad=0.2)  # small outer pad: group titles/x label sit right outside
+    # Matches analysis-unshared_iru.ipynb's plot_pareto_row exactly: a single
+    # tight_layout call (before adding the group titles/legend/x label below),
+    # pad=0.2/w_pad=1.0 for a squarer per-panel look, then those three sit
+    # *outside* the resulting figure box (y > 1 or y < 0) - bbox_inches=
+    # "tight" at save time expands the saved page to include them. A second
+    # tight_layout call after placing them would move the axes again and
+    # invalidate the positions those placements were computed from, so unlike
+    # an earlier version of this script, there is only one here.
+    fig.tight_layout(pad=0.2, w_pad=1.0)
 
     XLABEL_OFFSET_IN = 0.19  # x label's bottom edge below the figure box
-    GROUP_TITLE_GAP_IN = 0.0  # group titles' bottom edge above the figure box
+    GROUP_TITLE_GAP_IN = 0.07  # group titles' bottom edge above the figure box
     GROUP_TITLE_HEIGHT_IN = 0.2  # room the legend leaves for the group titles
     fig_h = fig.get_figheight()
-    fig.supxlabel("Shortest path length", y=0.2)
+    fig.supxlabel("Shortest path length", y=-XLABEL_OFFSET_IN / fig_h)
     PANEL_GROUPS = [("Lightsout", [0, 1]), ("Sliding puzzle", [2, 3])]
     for title, cols in PANEL_GROUPS:
         x0 = min(axes[i].get_position().x0 for i in cols)
@@ -201,7 +214,6 @@ def main():
         borderaxespad=0.0,
         frameon=True,
     )
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
     out_path = HERE / "analysis-hardness_grid.pdf"
     fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
     print(f"Saved {out_path}")
