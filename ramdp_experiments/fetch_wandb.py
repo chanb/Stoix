@@ -124,9 +124,80 @@ class RunMeta:
     halting_ent_coef: float
     actor_lr: float
     clip_halting_head: bool
+    halting_lr: float
     config_key: str
     created_at: str
     state: str
+
+
+def lightsout_filter(c):
+    mn = cfg_get(c, "network.actor_network.pre_torso.min_steps")
+    mx = cfg_get(c, "network.actor_network.pre_torso.max_steps")
+    if int(mn) == int(mx):
+        return False
+    
+    halt_lr = cfg_get(c, "system.halting_lr")
+    halt_temp = cfg_get(c, "network.actor_network.pre_torso.halting_temperature")
+    stop_grad = cfg_get(c, "network.actor_network.pre_torso.stop_gradient_halting_input")
+    clip_halt = cfg_get(c, "system.clip_halting_head")
+    if (
+        (
+            halt_lr is None
+            and (halt_temp is not None and np.isclose(float(halt_temp), 5.0))
+            and (stop_grad is not None and stop_grad == "False")
+            and clip_halt is None
+        )
+        or (halt_lr is not None and np.isclose(float(halt_lr), 0.001))
+        or (halt_lr is not None and np.isclose(float(halt_lr), 0.0001))
+    ):
+        return False
+    return True
+
+def slidingpuzzle_filter(c):
+    return False
+    mn = cfg_get(c, "network.actor_network.pre_torso.min_steps")
+    mx = cfg_get(c, "network.actor_network.pre_torso.max_steps")
+    if int(mn) == int(mx):
+        return False
+
+    halt_lr = cfg_get(c, "system.halting_lr")
+    halt_ent_coef = cfg_get(c, "system.halting_ent_coef")
+    clip_halt = cfg_get(c, "system.clip_halting_head")
+    halt_temp = cfg_get(c, "network.actor_network.pre_torso.halting_temperature")
+
+    if (
+        halt_lr is not None
+        and halt_ent_coef is not None
+        and clip_halt is not None
+        and halt_temp is not None
+        and np.isclose(float(halt_lr), 0.0001)
+        and np.isclose(float(halt_ent_coef), 0.0)
+        and np.isclose(float(halt_temp), 1.0)
+        and clip_halt == "True"
+    ):
+        return False
+    return True
+
+def sokoban_filter(c):
+    mn = cfg_get(c, "network.actor_network.pre_torso.min_steps")
+    mx = cfg_get(c, "network.actor_network.pre_torso.max_steps")
+    if int(mn) == int(mx):
+        return False
+
+    halt_lr = cfg_get(c, "system.halting_lr")
+    halt_ent_coef = cfg_get(c, "system.halting_ent_coef")
+    clip_halt = cfg_get(c, "system.clip_halting_head")
+
+    if (
+        halt_lr is not None
+        and halt_ent_coef is not None
+        and clip_halt is not None
+        and np.isclose(float(halt_lr), 0.0001)
+        and np.isclose(float(halt_ent_coef), 0.0)
+        and clip_halt == "True"
+    ):
+        return False
+    return True
 
 
 def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta]]:
@@ -143,6 +214,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         # "config.env.scenario.name": "lightsout-5x4",
         # "config.network.actor_network.pre_torso.mlp_dim": "256",
         # "config.system.actor_weight_decay": "0.1",
+        # "config.system.max_grad_norm": "0.5",
 
         # lightsout-5x4, eCoT
         # lightsout-ecot-ecot_sweep-qkv-vulcan
@@ -173,6 +245,23 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         "config.system.max_grad_norm": "0.5",
         "config.env.eval_kwargs.time_limit": "80",
 
+        # actor wd = 0.001
+        # "$and": [
+        #     {"config.network.actor_network.pre_torso.mlp_dim": "256"},
+        #     {"config.system.actor_weight_decay": "0.001"},
+        #     {"config.system.gamma": "0.999"},
+        #     {"config.arch.total_num_envs": "256"},
+        #     {"config.system.use_expectile_value_loss": "True"},
+        #     {"config.system.expectile": "0.2"},
+        #     {"config.system.max_grad_norm": "0.5"},
+        #     {
+        #         "$or": [
+        #             {"config.env.eval_kwargs.time_limit": "40"},
+        #             {"config.env.eval_kwargs.time_limit": None},
+        #         ],
+        #     },
+        # ],
+
         # sokoban
         # sokoban-shallow_cnn
         # "$and": [
@@ -192,6 +281,15 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         
     })
     out = []
+
+    if project == "lightsout-icot-icot_sweep-qkv":
+        run_filter = lightsout_filter
+    elif project == "slidingpuzzle-icot_sweep_2":
+        run_filter = slidingpuzzle_filter
+    elif project == "sokoban-shallow_cnn":
+        run_filter = sokoban_filter
+    else:
+        run_filter = lambda c: True
     for r in runs:
         c = r.config
         arch_full = cfg_get(c, "network.actor_network.pre_torso._target_")
@@ -201,6 +299,8 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         mn = cfg_get(c, "network.actor_network.pre_torso.min_steps")
         mx = cfg_get(c, "network.actor_network.pre_torso.max_steps")
         if mn is None or mx is None:
+            continue
+        if run_filter(c):
             continue
         sgh_raw = cfg_get(c, "network.actor_network.pre_torso.stop_gradient_halting_input", False)
         sgh = str(sgh_raw) == "True"
@@ -217,6 +317,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         halting_temperature_raw = cfg_get(c, "network.actor_network.pre_torso.halting_temperature")
         halting_ent_coef_raw = cfg_get(c, "system.halting_ent_coef")
         actor_lr_raw = cfg_get(c, "system.actor_lr")
+        halting_lr_raw = cfg_get(c, "system.halting_lr")
         # Default True matches stoix/configs/system/ramdp_vpg/ff_ppo.yaml.
         clip_halting_head = str(cfg_get(c, "system.clip_halting_head", True)) == "True"
         out.append(
@@ -242,6 +343,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
                     ),
                     actor_lr=float(actor_lr_raw) if actor_lr_raw is not None else float("nan"),
                     clip_halting_head=clip_halting_head,
+                    halting_lr=float(halting_lr_raw) if halting_lr_raw is not None else float("nan"),
                     config_key=config_identity_key(c),
                     created_at=str(r.created_at),
                     state=r.state,
@@ -399,6 +501,7 @@ def main() -> None:
         hist["halting_ent_coef"] = meta.halting_ent_coef
         hist["actor_lr"] = meta.actor_lr
         hist["clip_halting_head"] = meta.clip_halting_head
+        hist["halting_lr"] = meta.halting_lr
         hist["run_id"] = meta.run_id
         hist["state"] = meta.state
         frames.append(hist)
