@@ -1,8 +1,18 @@
-"""Builds a 2x5 grid of 3D t-SNE plots - row 1 Lights Out, row 2 sliding
-puzzle, column i the latent state after the i'th Chain-of-Thought transformer
-step (i = 1..MAX_STEPS=5 for both environments) - showing how each actor's
-own representation of an instance evolves as it "thinks" for longer, coloured
-throughout by that instance's (first-step) compute time.
+"""Builds a 4x5 grid of 3D t-SNE plots - row pairs (1, 2) Lights Out, (3, 4)
+sliding puzzle, column i the latent state after the i'th Chain-of-Thought
+transformer step (i = 1..MAX_STEPS=5 for both environments) - showing how
+each actor's own representation of an instance evolves as it "thinks" for
+longer. Within each pair, the first row colours points by that instance's
+(first-step) compute time; the second row re-plots the *same* t-SNE embedding,
+coloured by the instance's shortest path length instead - so each column's
+two stacked panels are literally the same points, just recoloured, letting
+"how long the actor chose to think" be compared against "how hard the
+instance actually was" without re-running t-SNE twice per column. Every row
+is coloured with the same continuous viridis spectrum (compute time just has
+a fixed 1..MAX_STEPS colour range, since it's bounded) and gets its own
+colourbar - a discrete per-value legend for compute time doesn't reuse the
+colourbar machinery already needed for hardness, and ends up harder to fit
+into a narrow margin than one more colourbar.
 
 Pure numpy/sklearn/matplotlib - no JAX/Flax/hydra/checkpoint restore needed.
 Reads `plot_data-lightsout.pkl`/`plot_data-slidingpuzzle.pkl`, produced by the
@@ -52,24 +62,24 @@ def main():
         "MAX_STEPS (both are 5 as of writing) - the grid has one column per step."
     )
 
-    # One discrete colour per integer compute time (1..max_steps), shared
-    # across every panel so a colour means the same compute time everywhere.
-    step_colours = {
-        k: plt.get_cmap("tab10")(i) for i, k in enumerate(range(1, max_steps + 1))
-    }
-
+    nrows = 2 * len(envs)
     fig, axes = plt.subplots(
-        2,
+        nrows,
         max_steps,
         figsize=set_size(
-            doc_width_pt, fraction=0.95, subplots=(2, max_steps), use_golden_ratio=False
+            doc_width_pt, fraction=0.95, subplots=(nrows, max_steps), use_golden_ratio=False
         ),
         subplot_kw={"projection": "3d"},
     )
 
-    for row, env in enumerate(envs):
+    row_scatter = {}  # row -> one representative scatter mappable for that row's colourbar
+    for env_idx, env in enumerate(envs):
+        compute_row = 2 * env_idx
+        hardness_row = 2 * env_idx + 1
+
         step_latents = env["step_latents"]  # (n, max_steps, hidden_dim)
         compute_time = env["tsne_sample_compute_time"]
+        hardness = env["tsne_sample_hardness"]
         # states_history keeps recomputing a "thought" for every example at
         # every CoT step regardless of when it actually halted (see
         # TransformerChainOfThoughtTorso's docstring) - those post-halt steps
@@ -82,54 +92,78 @@ def main():
         compute_time_int = np.rint(compute_time).astype(int)
         n = step_latents.shape[0]
         perplexity = perplexity_for(n)
-        for col in tqdm.tqdm(range(max_steps)):
+        for col in tqdm.tqdm(range(max_steps), desc=env["env_label"]):
             step_count = col + 1
             step_idx = np.minimum(step_count, compute_time_int) - 1
             latents = step_latents[np.arange(n), step_idx, :]
+            # One t-SNE fit per column, reused for both of this env's rows
+            # below - the compute-time and shortest-path-length panels plot
+            # the exact same points, just recoloured.
             embedding = TSNE(
                 n_components=3, perplexity=perplexity, random_state=0, init="pca"
             ).fit_transform(latents)
-            ax = axes[row, col]
-            for k, colour in step_colours.items():
-                mask = compute_time_int == k
-                if not mask.any():
-                    continue
-                ax.scatter(
-                    embedding[mask, 0],
-                    embedding[mask, 1],
-                    embedding[mask, 2],
-                    color=colour,
-                    s=4,
-                    alpha=0.9,
-                )
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_zticks([])
-            if row == 0:
-                ax.set_title(f"Step {col + 1}", fontsize=8, y=1.0)
 
-    # Reserve a right margin for the figure legend (unlike fig.colorbar, a
-    # figure legend doesn't shrink the axes to make room for itself). 0.88 was
-    # not enough room for the "First-step compute time" legend title, which
-    # ended up overlapping the last column's 3D panel - a 3D axes' actual
-    # drawn extent (the perspective cube) also overflows its own get_position()
-    # bbox, so this needs a bigger margin than a 2D legend would.
-    fig.subplots_adjust(right=0.8)
-    legend_handles = [
-        plt.Line2D(
-            [], [], marker="o", linestyle="", markersize=4, color=colour, label=str(k)
-        )
-        for k, colour in step_colours.items()
-    ]
-    fig.legend(
-        handles=legend_handles,
-        title="Compute time",
-        loc="center right",
-        bbox_to_anchor=(1.0, 0.5),
-        fontsize=7,
-        title_fontsize=8,
-        frameon=False,
-    )
+            ax_compute = axes[compute_row, col]
+            # vmin/vmax fixed to [1, max_steps] (not autoscaled to this
+            # column's observed range) since compute_time is bounded there by
+            # construction - keeps the colour scale identical across every
+            # column/row even if, say, 5 never actually occurs in one column.
+            row_scatter[compute_row] = ax_compute.scatter(
+                embedding[:, 0],
+                embedding[:, 1],
+                embedding[:, 2],
+                c=compute_time_int,
+                cmap="viridis",
+                vmin=1,
+                vmax=max_steps,
+                s=1,
+                alpha=0.9,
+            )
+            if compute_row == 0:
+                ax_compute.set_title(f"Step {col + 1}", fontsize=8, y=1.0)
+
+            ax_hardness = axes[hardness_row, col]
+            row_scatter[hardness_row] = ax_hardness.scatter(
+                embedding[:, 0],
+                embedding[:, 1],
+                embedding[:, 2],
+                c=hardness,
+                cmap="viridis",
+                s=1,
+                alpha=0.9,
+            )
+
+            for ax in (ax_compute, ax_hardness):
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_zticks([])
+
+    # Reserve a right margin for the colourbars added below (fig.colorbar(ax=
+    # axes[row, :]) would shrink those axes *after* the row-label loop below
+    # already read their positions, so colourbar axes are placed manually via
+    # fig.add_axes instead) and tighten the column spacing - the 3D panels'
+    # own drawn content doesn't fill their bounding box, so the default
+    # wspace left a lot of dead space between columns.
+    fig.subplots_adjust(right=0.88, wspace=0.05)
+
+    # One colourbar per row, positioned to match that row's own axes span -
+    # every row gets the same treatment now (compute time and hardness both
+    # use the continuous viridis spectrum), which is simpler than singling
+    # out a discrete legend for the compute-time rows and also avoids that
+    # legend's width/collision issues from an earlier version of this script.
+    for row in range(nrows):
+        row_axes = axes[row, :]
+        y0 = min(ax.get_position().y0 for ax in row_axes)
+        y1 = max(ax.get_position().y1 for ax in row_axes)
+        pad = 0.2 * (y1 - y0)
+        cax = fig.add_axes([0.885, y0 + pad, 0.015, (y1 - y0) - 2 * pad])
+        cbar = fig.colorbar(row_scatter[row], cax=cax)
+        if row % 2 == 0:
+            cbar.set_label("Compute time", fontsize=8)
+            cbar.set_ticks(range(1, max_steps + 1))
+        else:
+            cbar.set_label("Hardness", fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
 
     # Row labels via fig.text at each row's leftmost axis position, not
     # ax.set_ylabel: on a 3D axes, set_ylabel places a rotated label *inside*
@@ -137,26 +171,23 @@ def main():
     # not a conventional row label on the left margin like it would for a 2D
     # axes - it comes out diagonal and clipped against the next axes. Read
     # positions after layout is final.
-    for row, env in enumerate(envs):
-        pos = axes[row, 0].get_position()
-        fig.text(
-            pos.x0 - 0.02,
-            (pos.y0 + pos.y1) / 2,
-            ENV_LABELS[env["env_label"]],
-            fontsize=9,
-            rotation=90,
-            ha="right",
-            va="center",
-        )
+    for env_idx, env in enumerate(envs):
+        for sub_row, coloured_by in [(0, "compute time"), (1, "hardness")]:
+            row = 2 * env_idx + sub_row
+            pos = axes[row, 0].get_position()
+            fig.text(
+                pos.x0 - 0.02,
+                (pos.y0 + pos.y1) / 2,
+                f"{ENV_LABELS[env['env_label']]}\n({coloured_by})",
+                fontsize=8,
+                rotation=90,
+                ha="right",
+                va="center",
+            )
 
-    # Figure-level suptitle, not per-axis titles for the row label: 3D axes'
-    # titles/labels tend to clip against the figure edge, and bbox_inches=
-    # "tight" mis-crops 3D axes' irregular bounding box - so it's omitted
-    # below (see the notebooks' own single-panel 3D t-SNE cells for the same
-    # two issues and fixes).
-    fig.suptitle("t-SNE of CoT step latent states, coloured by compute step", y=0.98)
-    out_path = HERE / "analysis-tsne_step_grid.pdf"
-    fig.savefig(out_path, dpi=600, format="pdf")
+    fig.suptitle("t-SNE of CoT step latent states", y=0.98)
+    out_path = HERE / "analysis-tsne_step_grid.png"
+    fig.savefig(out_path, dpi=600, format="png")
     print(f"Saved {out_path}")
 
 

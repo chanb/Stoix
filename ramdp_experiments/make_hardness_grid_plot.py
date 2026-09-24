@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 from matplotlib.patches import Patch
+from scipy.stats import trim_mean
 
 import analysis_utils as base
 
@@ -28,7 +29,31 @@ plt.rcParams.update(pgf_with_latex)
 sns.set_palette("colorblind")
 
 HERE = Path(__file__).resolve().parent
-CI95_Z = 1.96  # normal-approximation 95% CI half-width, in units of SEM
+N_BOOTSTRAP = 2000
+CI_LEVEL = 0.95
+BOOTSTRAP_SEED = 0
+
+
+def iqm(x, axis=None):
+    """Interquartile mean: mean of the middle 50% (25% trimmed each side)."""
+    return trim_mean(x, 0.25, axis=axis)
+
+
+def iqm_bootstrap_ci(x, rng, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL, chunk=200):
+    """Percentile bootstrap CI of the IQM of `x`. Resamples in chunks so the
+    largest hardness groups (~10k episodes) don't allocate n_bootstrap * n at
+    once."""
+    x = np.asarray(x)
+    if len(x) < 2:
+        return x.mean(), x.mean()
+    stats = []
+    for start in range(0, n_bootstrap, chunk):
+        size = min(chunk, n_bootstrap - start)
+        idx = rng.integers(0, len(x), size=(size, len(x)))
+        stats.append(iqm(x[idx], axis=1))
+    stats = np.concatenate(stats)
+    alpha = (1 - ci) / 2
+    return np.quantile(stats, alpha), np.quantile(stats, 1 - alpha)
 
 
 def load_plot_data(name):
@@ -70,15 +95,12 @@ def plot_hardness_panel(ax, hardness, values, ylabel, title, diagonal=False):
             body.set_alpha(0.4)
 
     unique_h = np.unique(hardness)
-    means = np.array([values[hardness == h].mean() for h in unique_h])
-    sems = np.array(
-        [
-            values[hardness == h].std(ddof=1) / np.sqrt((hardness == h).sum())
-            if (hardness == h).sum() > 1
-            else 0.0
-            for h in unique_h
-        ]
-    )
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    iqms = np.array([iqm(values[hardness == h]) for h in unique_h])
+    cis = np.array([iqm_bootstrap_ci(values[hardness == h], rng) for h in unique_h])
+    # errorbar wants non-negative (below, above) offsets; clip guards against
+    # tiny negative offsets when the IQM sits on a CI endpoint.
+    yerr = np.clip(np.stack([iqms - cis[:, 0], cis[:, 1] - iqms]), 0, None)
 
     handles = [Patch(facecolor=violin_color, alpha=0.4, label="episode distribution")]
 
@@ -96,15 +118,18 @@ def plot_hardness_panel(ax, hardness, values, ylabel, title, diagonal=False):
         )
         handles.append(diagonal_line)
 
+    if not diagonal:
+        ax.set_yticks([1, 2, 3, 4, 5])
+
     mean_errorbar = ax.errorbar(
         unique_h,
-        means,
-        yerr=CI95_Z * sems,
+        iqms,
+        yerr=yerr,
         marker="o",
         ms=1,
         linewidth=1,
         color=mean_color,
-        label=r"mean $\pm$ 95\% CI",
+        label=r"IQM $\pm$ 95\% bootstrap CI",
     )
     handles.append(mean_errorbar)
 
