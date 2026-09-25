@@ -56,7 +56,8 @@ def perplexity_for(n):
 
 def main():
     # envs = [load_plot_data("lightsout"), load_plot_data("slidingpuzzle")]
-    envs = [load_plot_data("slidingpuzzle")]
+    # envs = [load_plot_data("slidingpuzzle")]
+    envs = [load_plot_data("lightsout")]
     max_steps = envs[0]["max_steps"]
     assert all(env["max_steps"] == max_steps for env in envs), (
         "make_tsne_step_grid_plot.py assumes both environments share the same "
@@ -186,7 +187,7 @@ def main():
                 va="center",
             )
 
-    fig.suptitle("t-SNE of CoT step latent states", y=0.98)
+    # fig.suptitle("t-SNE of CoT step latent states", y=0.98)
     out_path = HERE / "analysis-tsne_step_grid.png"
     fig.savefig(out_path, dpi=600, format="png")
     print(f"Saved {out_path}")

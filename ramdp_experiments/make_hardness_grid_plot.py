@@ -161,7 +161,7 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
         marker="o",
         # Unordered actions: no connecting line (it would imply a trend
         # between neighbouring indices), so the markers need to be visible.
-        ms=3 if categorical else 1,
+        ms=1,
         linestyle="none" if categorical else "-",
         linewidth=1,
         color=mean_color,
