@@ -55,7 +55,8 @@ def perplexity_for(n):
 
 
 def main():
-    envs = [load_plot_data("lightsout"), load_plot_data("slidingpuzzle")]
+    # envs = [load_plot_data("lightsout"), load_plot_data("slidingpuzzle")]
+    envs = [load_plot_data("slidingpuzzle")]
     max_steps = envs[0]["max_steps"]
     assert all(env["max_steps"] == max_steps for env in envs), (
         "make_tsne_step_grid_plot.py assumes both environments share the same "
@@ -116,7 +117,7 @@ def main():
                 cmap="viridis",
                 vmin=1,
                 vmax=max_steps,
-                s=1,
+                s=0.1,
                 alpha=0.9,
             )
             if compute_row == 0:
@@ -129,7 +130,7 @@ def main():
                 embedding[:, 2],
                 c=hardness,
                 cmap="viridis",
-                s=1,
+                s=0.1,
                 alpha=0.9,
             )
 

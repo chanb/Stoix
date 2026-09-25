@@ -1,14 +1,17 @@
-"""Combines the hardness-vs-compute-time and hardness-vs-episode-length plots
+"""Combines the hardness-vs-compute-time and action-vs-compute-time plots
 from both `analysis-compute_time-hardness.ipynb` (Lights Out) and
 `analysis-compute_time-hardness-slidingpuzzle.ipynb` (sliding puzzle) into a
-single 1x4 figure: [lightsout compute time, lightsout episode length,
-slidingpuzzle compute time, slidingpuzzle episode length].
+single 1x4 figure: [lightsout hardness, lightsout action, slidingpuzzle
+hardness, slidingpuzzle action], all against compute time.
 
 Pure numpy/pandas/matplotlib - no JAX/Flax/hydra/checkpoint restore needed.
-Reads `plot_data-lightsout.pkl`/`plot_data-slidingpuzzle.pkl`, produced by the
-"Export plot data for the standalone plotting scripts" cell near the end of
-each notebook - run that cell (in each notebook) at least once before running
-this script.
+The hardness panels read `plot_data-lightsout.pkl`/`plot_data-slidingpuzzle.pkl`,
+produced by the "Export plot data for the standalone plotting scripts" cell
+near the end of each notebook - run that cell (in each notebook) at least once
+before running this script. The action panels need every step's action, which
+those pickles don't carry, so they read the notebooks' rollout caches
+(`ROLLOUT_CACHES` below) directly - keep those pointing at the same rollouts
+the pickles were exported from.
 """
 
 import pickle
@@ -16,6 +19,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 from matplotlib.patches import Patch
 from scipy.stats import trim_mean
@@ -33,19 +37,28 @@ N_BOOTSTRAP = 2000
 CI_LEVEL = 0.95
 BOOTSTRAP_SEED = 0
 
+# Rollout caches the notebooks' per-step action-vs-compute-time cells read
+# (and that plot_data-*.pkl's hardness data was exported from).
+ROLLOUT_CACHES = {
+    "lightsout": "rollout_cache-lightsout_5x4-trained-20260923032800-n50000-seed0-v3.pkl",
+    "slidingpuzzle": "rollout_cache-slidingtile_gs3-nrm200-20260923063537-n50000-seed0-v2.pkl",
+}
+SLIDINGPUZZLE_ACTION_NAMES = [r"$\uparrow$", r"$\rightarrow$", r"$\downarrow$", r"$\leftarrow$"]  # jumanji's MOVES order (Up, Right, Down, Left)
+
 
 def iqm(x, axis=None):
     """Interquartile mean: mean of the middle 50% (25% trimmed each side)."""
     return trim_mean(x, 0.25, axis=axis)
 
 
-def iqm_bootstrap_ci(x, rng, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL, chunk=200):
-    """Percentile bootstrap CI of the IQM of `x`. Resamples in chunks so the
-    largest hardness groups (~10k episodes) don't allocate n_bootstrap * n at
-    once."""
+def iqm_bootstrap_ci(x, rng, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL, max_chunk_elems=20_000_000):
+    """Percentile bootstrap CI of the IQM of `x`. Resamples in chunks of at
+    most `max_chunk_elems` elements so the largest groups (~200k steps per
+    action for the sliding puzzle) don't allocate n_bootstrap * n at once."""
     x = np.asarray(x)
     if len(x) < 2:
         return x.mean(), x.mean()
+    chunk = max(1, min(n_bootstrap, max_chunk_elems // len(x)))
     stats = []
     for start in range(0, n_bootstrap, chunk):
         size = min(chunk, n_bootstrap - start)
@@ -62,6 +75,33 @@ def load_plot_data(name):
         return pickle.load(f)
 
 
+def load_step_actions(name):
+    """Every real (non-padding) step's action and compute time, from solved
+    episodes only - matching the notebooks' build_step_dataframe, which the
+    action-vs-compute-time cells use. Episodes that start already solved
+    (shortest_path_length 0) are dropped, which is what the sliding-puzzle
+    notebook's per-step "already at the goal" filter amounts to (an episode
+    ends as soon as it's solved, so only its first state can be)."""
+    df = pd.read_pickle(HERE / ROLLOUT_CACHES[name])
+    df = df[df["solved"] & (df["shortest_path_length"] > 0)]
+    valid = np.stack(df["valid_steps"].to_numpy())
+    actions = np.stack(df["actions"].to_numpy())[valid]
+    compute_times = np.stack(df["compute_times"].to_numpy())[valid]
+    return actions, compute_times
+
+
+def eta_squared(groups, values):
+    """One-way ANOVA effect size SS_between / SS_total: the share of `values`'
+    variance explained by `groups`, treating groups as unordered categories
+    (unlike Pearson r, which would treat action indices as ordinal)."""
+    grand_mean = values.mean()
+    ss_between = sum(
+        (groups == g).sum() * (values[groups == g].mean() - grand_mean) ** 2 for g in np.unique(groups)
+    )
+    ss_total = ((values - grand_mean) ** 2).sum()
+    return ss_between / ss_total
+
+
 def violin_groups_for(hardness, values):
     """One (hardness_value, values) group per distinct hardness value, KDE-
     plottable groups only (>= 2 points, non-degenerate) - see the notebooks'
@@ -73,11 +113,17 @@ def violin_groups_for(hardness, values):
     return [(h, v) for h, v in sorted(groups.items()) if len(v) >= 2 and np.std(v) > 0]
 
 
-def plot_hardness_panel(ax, hardness, values, ylabel, title, diagonal=False):
+def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabels=None):
+    """Violins + IQM of `values` per distinct `hardness` value. `hardness` is
+    either the shortest path length or, with categorical=True, the action
+    index - the annotation is then eta^2 instead of Pearson r."""
     violin_color = sns.color_palette("colorblind")[0]
     mean_color = sns.color_palette("colorblind")[3]
 
-    pearson_r = np.corrcoef(hardness, values)[0, 1]
+    if categorical:
+        stat_label = rf"$\eta^2={eta_squared(hardness, values):.2f}$"
+    else:
+        stat_label = f"$r={np.corrcoef(hardness, values)[0, 1]:.2f}$"
 
     groups = violin_groups_for(hardness, values)
     if groups:
@@ -102,54 +148,43 @@ def plot_hardness_panel(ax, hardness, values, ylabel, title, diagonal=False):
     # tiny negative offsets when the IQM sits on a CI endpoint.
     yerr = np.clip(np.stack([iqms - cis[:, 0], cis[:, 1] - iqms]), 0, None)
 
-    handles = [Patch(facecolor=violin_color, alpha=0.4, label="episode distribution")]
+    handles = [Patch(facecolor=violin_color, alpha=0.4, label="distribution")]
 
-    if diagonal:
-        axis_min = min(hardness.min(), values.min())
-        (diagonal_line,) = ax.plot(
-            [axis_min, hardness.max()],
-            [axis_min, hardness.max()],
-            linestyle="--",
-            color="gray",
-            linewidth=1.2,
-            alpha=0.7,
-            zorder=0,
-            label="optimal (episode length = shortest path)",
-        )
-        handles.append(diagonal_line)
-
-    if not diagonal:
-        ax.set_yticks([1, 2, 3, 4, 5])
+    ax.set_yticks([1, 2, 3, 4, 5])
+    if xticklabels is not None:
+        ax.set_xticks(unique_h, xticklabels)
 
     mean_errorbar = ax.errorbar(
         unique_h,
         iqms,
         yerr=yerr,
         marker="o",
-        ms=1,
+        # Unordered actions: no connecting line (it would imply a trend
+        # between neighbouring indices), so the markers need to be visible.
+        ms=3 if categorical else 1,
+        linestyle="none" if categorical else "-",
         linewidth=1,
         color=mean_color,
         label=r"IQM $\pm$ 95\% bootstrap CI",
     )
     handles.append(mean_errorbar)
 
-    # Pearson r as an in-axis annotation (not the title): a 4-up figure has no
-    # room for a title long enough to spell out both the env label and the
-    # correlation without adjacent panels' titles colliding. fontsize=8
-    # matches analysis-unshared_iru.ipynb's analogous delta annotation.
+    # Pearson r / eta^2 as an in-axis annotation (not the title): a 4-up
+    # figure has no room for a title long enough to spell out both the env
+    # label and the statistic without adjacent panels' titles colliding.
+    # fontsize=8 matches analysis-unshared_iru.ipynb's analogous delta
+    # annotation.
     ax.text(
         0.95,
         0.05,
-        f"$r={pearson_r:.2f}$",
+        stat_label,
         transform=ax.transAxes,
         ha="right",
         va="bottom",
         fontsize=8,
         bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.0),
     )
-    # ax.set_xlabel("Shortest path length")
-    # ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    ax.set_xlabel(xlabel)
     ax.grid(True, alpha=0.3)
     return handles
 
@@ -170,43 +205,42 @@ def main():
     figsize = set_size(doc_width_pt, fraction=0.95, subplots=(nrows, ncols), use_golden_ratio=False)
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
 
-    plot_hardness_panel(
+    lightsout_actions, lightsout_step_compute_time = load_step_actions("lightsout")
+    slidingpuzzle_actions, slidingpuzzle_step_compute_time = load_step_actions("slidingpuzzle")
+
+    handles = plot_violin_panel(
         axes[0],
         lightsout["hardness"],
         lightsout["first_step_compute_time"],
-        ylabel="Compute steps",
-        title="Compute steps",
-        # title=env_map[lightsout["env_label"]],
+        xlabel="Shortest path length",
     )
-    handles = plot_hardness_panel(
+    plot_violin_panel(
         axes[1],
-        lightsout["hardness"],
-        lightsout["episode_length"],
-        ylabel="Ep. length",
-        title="Ep. length",
-        # title=env_map[lightsout["env_label"]],
-        diagonal=True,
+        lightsout_actions,
+        lightsout_step_compute_time,
+        xlabel="Action (button)",
+        categorical=True,
     )
-    plot_hardness_panel(
+    # 20 buttons don't fit as individual tick labels in a quarter-width panel.
+    axes[1].set_xticks([0, 5, 10, 15])
+    plot_violin_panel(
         axes[2],
         slidingpuzzle["hardness"],
         slidingpuzzle["first_step_compute_time"],
-        ylabel="Compute steps",
-        title="Compute steps",
-        # title=env_map[slidingpuzzle["env_label"]],
+        xlabel="Shortest path length",
     )
-    plot_hardness_panel(
+    plot_violin_panel(
         axes[3],
-        slidingpuzzle["hardness"],
-        slidingpuzzle["episode_length"],
-        ylabel="Ep. length",
-        title="Ep. length",
-        # title=env_map[slidingpuzzle["env_label"]],
-        diagonal=True,
+        slidingpuzzle_actions,
+        slidingpuzzle_step_compute_time,
+        xlabel="Action",
+        categorical=True,
+        xticklabels=SLIDINGPUZZLE_ACTION_NAMES,
     )
+    axes[0].set_ylabel("Compute steps")
 
     # Matches analysis-unshared_iru.ipynb's plot_pareto_row exactly: a single
-    # tight_layout call (before adding the group titles/legend/x label below),
+    # tight_layout call (before adding the group titles/legend below),
     # pad=0.2/w_pad=1.0 for a squarer per-panel look, then those three sit
     # *outside* the resulting figure box (y > 1 or y < 0) - bbox_inches=
     # "tight" at save time expands the saved page to include them. A second
@@ -215,11 +249,9 @@ def main():
     # an earlier version of this script, there is only one here.
     fig.tight_layout(pad=0.2, w_pad=1.0)
 
-    XLABEL_OFFSET_IN = 0.19  # x label's bottom edge below the figure box
     GROUP_TITLE_GAP_IN = 0.07  # group titles' bottom edge above the figure box
     GROUP_TITLE_HEIGHT_IN = 0.2  # room the legend leaves for the group titles
     fig_h = fig.get_figheight()
-    fig.supxlabel("Shortest path length", y=-XLABEL_OFFSET_IN / fig_h)
     PANEL_GROUPS = [("Lightsout", [0, 1]), ("Sliding puzzle", [2, 3])]
     for title, cols in PANEL_GROUPS:
         x0 = min(axes[i].get_position().x0 for i in cols)
