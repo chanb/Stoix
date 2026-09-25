@@ -1,5 +1,7 @@
-# sliding puzzle: 20260923063537
-.venv/bin/python /home/chanb/research/iclr_2027/Stoix/stoix/systems/ramdp_vpg/ff_ppo.py \
+PATH_TO_REPO=""
+BASE_EXP_DIR=""
+
+.venv/bin/python ${PATH_TO_REPO}/stoix/systems/ramdp_vpg/ff_ppo.py \
     env=jumanji/slidingtile_grid \
     network=cnn_transformer_compute \
     system.gamma=0.999 \
@@ -19,7 +21,7 @@
     system.ent_coef=0.01 \
     system.max_grad_norm=0.5 \
     system.rollout_length=32 \
-    logger.base_exp_path=/home/chanb/scratch/logs/ramdp/slidingpuzzle-icot-icot_sweep_2/ANALYSIS-slidingtile-gs3-nrm200-evaltl80-ppo_reinf-cnn+TF-iCoT-mn1-mx5-g0.999-seed_5 \
+    logger.base_exp_path=${BASE_EXP_DIR}/logs/ramdp/slidingpuzzle-icot-icot_sweep_2/ANALYSIS-slidingtile-gs3-nrm200-evaltl80-ppo_reinf-cnn+TF-iCoT-mn1-mx5-g0.999-seed_5 \
     env.kwargs.generator.grid_size=3 \
     env.kwargs.generator.num_random_moves=200 \
     +env.eval_kwargs.time_limit=80 \
@@ -52,7 +54,6 @@
     ++network.actor_network.pre_torso.stop_gradient_halting_input=False \
     network.actor_network.pre_torso.halting_temperature=1 \
     ++network.actor_network.pre_torso.halting_hidden_dims=[] \
-    system.qac_variant=reinforce \
     network.actor_network.input_layer.channel_sizes=[8,8] \
     network.actor_network.input_layer.kernel_sizes=[2,1] \
     network.actor_network.input_layer.strides=[1] \
@@ -65,7 +66,7 @@
 
 
 # lightsout: 20260923032800
-.venv/bin/python /home/chanb/research/iclr_2027/Stoix/stoix/systems/ramdp_vpg/ff_ppo.py \
+.venv/bin/python ${PATH_TO_REPO}/stoix/systems/ramdp_vpg/ff_ppo.py \
     env=lightsout/lightsout_3x3 \
     env.scenario.name=lightsout-5x4 \
     env.scenario.task_name=lightsout_5x4 \
@@ -90,7 +91,7 @@
     system.ent_coef=0.01 \
     system.max_grad_norm=0.5 \
     system.rollout_length=32 \
-    logger.base_exp_path=/home/chanb/scratch/logs/ramdp/lightsout-icot-icot_sweep-qkv/ANALYSIS-lightsout-5x4-ppo_reinf-TF-iCoT-mn1-mx5-g0.995-hd128-lr0.0003-clr0.0003-ec001-mgn0.5-nl2-nh8-md256-qkv256-seed_5 \
+    logger.base_exp_path=${BASE_EXP_DIR}/logs/ramdp/lightsout-icot-icot_sweep-qkv/ANALYSIS-lightsout-5x4-ppo_reinf-TF-iCoT-mn1-mx5-g0.995-hd128-lr0.0003-clr0.0003-ec001-mgn0.5-nl2-nh8-md256-qkv256-seed_5 \
     system.epochs=4 \
     system.num_minibatches=8 \
     system.clip_eps=0.2 \
@@ -121,5 +122,4 @@
     ++network.actor_network.pre_torso.stop_gradient_halting_input=False \
     network.actor_network.pre_torso.halting_temperature=1 \
     ++network.actor_network.pre_torso.halting_hidden_dims=[] \
-    system.qac_variant=reinforce \
     +env.wrapper._target_=stoa.FlattenObservationWrapper

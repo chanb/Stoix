@@ -1,221 +1,19 @@
 """Compute-time-aware PPO (RAMDP-PPO).
 
-Variant of `stoix.systems.ramdp_vpg.ff_reinforce`/`ff_qac`, trained with
-PPO's clipped surrogate objective (several epochs of minibatch gradient steps
-per rollout) instead of a single REINFORCE/QAC gradient step. As in those
-files, compute time is folded into the discounting rather than the reward
-(see `ff_reinforce.py`'s module docstring for the full
-`G_h = gamma^(C_h - 1) * (r_h + gamma * G_{h+1})` derivation), and the
-actor's halting trajectory (sampled by an Adaptive Computation Time torso)
-is trained alongside the environment action.
+The actor's torso is an Adaptive Computation Time torso (see
+`stoix.networks.torso_compute`) that samples a "halt now?" decision at each
+pondering step, so `compute_time` is the sampled number of steps taken. The
+halting trajectory is trained alongside the environment action, each with its
+own per-decision PPO ratio/clip.
 
-`config.system.qac_variant` selects how the advantage used to train the
-actor is computed - the same knob `ff_qac.py` uses, extended with three more
-values:
+Compute cost is folded into the discounting rather than the reward: a
+transition that took `C_h` pondering steps is treated as `C_h` elapsed time
+steps, so the return recursion is
 
-  - "fac" / "naive": Q - V, exactly as in `ff_qac.py`. Advantage =
-    Q(s_t, a_t, c_t) - V(s_t), with no n-step return or bootstrapping in the
-    advantage itself.
-  - "cond_naive" / "cond_fac": Q - V too, using the same conditioned
-    architecture and parameter count (`compute_time` fed into the critic as
-    an *input*, see `ValueAndQCritic._q_input`) rather than "naive"'s
-    `(num_actions, max_steps)` output table. "cond_naive" is queried at the
-    realised `compute_time` and reads the conditioned output directly as
-    Q(s,·,c). "cond_fac" is always queried at the fixed reference
-    `compute_time=1` - so, like "fac", its raw output is `c`-invariant - and
-    is scaled by `gamma ** (c - 1)` to recover Q(s,·,c); this isolates the
-    naive-vs-fac parameter-count confound while keeping "fac"'s analytic
-    scaling as the only source of `c`-dependence.
-  - "reinforce": G - V, REINFORCE-with-baseline exactly as in
-    `ff_reinforce.py` - advantage = compute-discounted n-step Monte-Carlo
-    return `G_h` minus V(s_t), with no GAE(lambda) term. Uses
-    `stoix.networks.base.FeedForwardCritic` (a plain V-only critic).
+    G_h = gamma^(C_h - 1) * (r_h + gamma * G_{h+1})
 
-The four Q-V variants all use `stoix.networks.base_qac.ValueAndQCritic` (a
-shared torso with a V head and a Q head).
-
-`targets` - the critic's own regression target, `g_targets` below, which also
-feeds the "reinforce" advantage (see next paragraph) - is computed with
-`config.system.gae_lambda` via
-`stoix.utils.multistep.batch_truncated_generalized_advantage_estimation`
-rather than a plain to-the-end Monte-Carlo return. `gae_lambda=1.0` (the
-default) makes this mathematically identical to the to-the-end return the
-four Q-V variants' description above assumes (`batch_discounted_returns`,
-which this replaced); `gae_lambda<1.0` instead blends in earlier
-bootstrapped estimates for a lower-variance, more-biased target - standard
-GAE(lambda), Schulman et al. This is orthogonal to `qac_variant`: for the
-four Q-V variants it only changes what trains V (and Q, for "naive"/"fac"),
-since their advantage is `Q(s,a,c) - V(s)` either way; for "reinforce",
-whose advantage is `targets - V(s)`, it changes the advantage too, making
-this exactly GAE(lambda) rather than the n-step-to-end special case.
-
-Two quantities derived from the critic can be recomputed at the end of every
-PPO epoch from that epoch's just-updated critic params, rather than staying
-frozen at their rollout-time values for the whole update - both gated by the
-single flag `config.system.recompute_advantages` (default `False`):
-
-  - `targets`, the GAE(lambda) target (`g_targets`) that trains the critic
-    itself, bootstraps off a per-step value estimate at the tail of each
-    n-step window (`v_t`). When `recompute_advantages=True`, that bootstrap
-    is rebuilt each epoch from the updated critic (`new_value`/`new_last_val`
-    below), reusing the same rewards/discounts (`r_t`/`d_t`, unaffected by
-    the critic) - otherwise the critic would spend every epoch regressing
-    towards a target that is itself built from an increasingly outdated
-    value function. With the default `recompute_advantages=False`, `targets`
-    instead stays pinned at its pre-epoch-loop value (computed once from the
-    rollout-time critic) for the whole update, and the `new_value`/
-    `new_last_val` forward passes that would only feed this bootstrap are
-    skipped entirely - wasted compute if nothing downstream uses them.
-  - The advantage's "what changed" term - Q(s,a,c) for the four Q-V
-    variants, V(s) for "reinforce" - is likewise recomputed each epoch (same
-    readouts as at rollout time, see `_q_at_action_and_compute_time`) only
-    when `recompute_advantages=True`, so the actor trains against an
-    increasingly accurate estimate as the critic learns. With
-    `recompute_advantages=False`, this term instead stays pinned at its
-    rollout-time value for every epoch, as in vanilla PPO.
-
-The advantage's *other* term - the fixed baseline it's compared against -
-is deliberately NOT refreshed alongside it, unlike the two quantities above:
-for the four Q-V variants, V stays fixed at `traj_batch.value` (the
-rollout-time estimate) rather than the epoch's `new_value`, so the actor's
-signal reflects only "how has the critic's opinion of this action's Q-value
-changed since rollout", not drift from Q and V moving together. "reinforce"
-has no such fixed baseline to preserve - both G and V are outputs of the one
-critic being trained, so both are refreshed together each epoch and the
-advantage is `targets - new_value` throughout.
-
-`config.system.critic_before_actor` (default `False`) replaces the joint
-per-minibatch actor+critic update above with two fully sequential phases:
-`config.system.epochs` epochs of critic-only minibatch updates (actor
-params/opt_state untouched), followed by `config.system.epochs` epochs of
-actor-only minibatch updates (critic params/opt_state untouched) - i.e.
-
-    for each epoch: for each minibatch: update critic
-    for each epoch: for each minibatch: update actor
-
-instead of updating both networks together in every minibatch. This targets
-the cold-start failure mode where the Q-V variants' advantage is
-`Q(s,a,c) - V(s)` with both freshly initialised: until the critic has
-learned to differentiate actions, that advantage is ~0 everywhere, so the
-actor gets essentially no gradient (near-max entropy, near-zero
-`actor_grad_norm`) for a long stretch of training. Training the critic to
-(approximate) convergence first, then handing the actor a properly
-differentiated advantage, is meant to shorten or remove that dead zone.
-Regardless of `config.system.recompute_advantages`, `advantages`/`targets`
-are always refreshed once from the fully-trained critic params at the
-boundary between the two phases, right before the actor-only phase starts -
-otherwise the actor would train against the same stale, rollout-time
-advantage the critic phase was specifically meant to improve on.
-`recompute_advantages` still independently controls whether `targets` (and,
-harmlessly, `advantages`) are also refreshed epoch-to-epoch *within* the
-critic-only phase; the actor-only phase never recomputes either, since the
-critic is frozen by then and doing so would be a no-op. Doubles the number
-of gradient-epoch passes over each rollout relative to the joint default
-(`epochs` for the critic, then another `epochs` for the actor), so it costs
-roughly 2x the per-rollout update compute when enabled.
-
-Whichever variant, PPO's clipped ratio (`stoix.utils.loss.ppo_clip_loss`) is
-applied *per decision*, not once over the joint trajectory: the environment
-action gets its own ratio/clip (`env_log_prob` vs. its rollout-time value),
-and each pondering step gets its own ratio/clip too (`halting_log_prob`,
-shape `(*batch, max_steps)`, vs. its rollout-time value), masked to the
-steps actually taken and averaged over them across the whole minibatch. This
-mirrors `ff_ppo_explicit_cot.py`'s per-step CoT-token clip, for the same
-reason: summing the `max_steps` (weight-tied, for `TransformerChainOfThoughtTorso`;
-independently-parameterized for `UnsharedIRUAdaptiveComputationTimeTorso`,
-still no probability-ratio protection either way) per-step log-probs into
-one joint ratio before exponentiating would make the *effective* per-step
-trust region shrink as `max_steps` grows - clipping longer-budget runs far
-more readily than short ones for reasons unrelated to whether the update is
-actually good. The two clipped surrogates are added together (each already
-an average over its own decisions) before the entropy bonus. The critic (V,
-and Q for "naive"/"fac") is trained with PPO's own clipped value loss
-(`stoix.utils.loss.clipped_value_loss`) against the `old` value/Q estimate
-recorded at rollout time by default, or with plain L2 regression
-(`rlax.l2_loss`) when `config.system.clip_value_loss=False`.
-
-Optionally (`config.system.use_expectile_value_loss=True`), V's loss (only
-V - Q, where it exists, is left as configured by `clip_value_loss` above)
-instead uses expectile regression (`stoix.utils.loss.expectile_loss`, as in
-Kostrikov et al. 2021's Implicit Q-Learning) at expectile
-`config.system.expectile`. With `expectile < 0.5` this makes V converge to a
-*lower* expectile of the return distribution than plain L2 regression's
-conditional mean - i.e. V deliberately underestimates - which biases the
-advantage (`Q - V` or `targets - V`) positive more often. This is *not*
-optimism-under-uncertainty exploration in the UCB/optimistic-initialization
-sense: that requires the bias to be uncertainty-dependent and shrink as a
-given state/action gets visited, which a fixed `expectile` does not do (it
-underestimates by roughly the same amount everywhere, indefinitely) - and
-for `qac_variant="reinforce"` (no Q head, `advantage = targets - V(s)`)
-there is no per-action information in the loss at all, so a lower V just
-reinforces whichever action was actually sampled a bit more, with no
-preference for untried alternatives. For the Q-V variants, where Q *does*
-carry genuine per-action signal, the more accurate framing is "prune tried,
-merely-average actions less aggressively": actions whose real Q sits just
-below an honest V no longer get penalized once V is deliberately deflated
-below them, so the actor stops suppressing them - a softer failure mode than
-directed exploration, but one that can still slow premature policy collapse.
-`expectile=0.5` recovers plain (unweighted) squared-error
-regression to the same target `clip_value_loss=False` would, just without
-the old-estimate clip.
-
-The entropy bonus itself has two independent terms: `config.system.ent_coef`
-on the environment action's distribution entropy (`actor_policy.entropy()`,
-as in any PPO), and `config.system.halting_ent_coef` on the halting
-decision's own entropy (`per_step_halting_entropy` from the torso, masked
-and averaged the same way as `halting_log_prob` above). The two are
-deliberately separate coefficients, not one shared `ent_coef`: without a
-dedicated halting term, nothing regularizes the halting head's own
-exploration - `ent_coef` never reaches it, since `actor_policy` is only the
-environment action's distribution - so the halting policy is otherwise free
-to collapse to a degenerate, non-adaptive compute-time (e.g. always halting
-at `min_steps`) before it ever discovers genuine per-example structure, no
-matter how large `ent_coef` is set. `halting_ent_coef=0.0` (the default)
-recovers the original behaviour exactly.
-
-Because PPO needs a fixed "old" log-probability to compute the ratio against
-across every epoch, and the Adaptive Computation Time torso's sampling pass
-does not itself report the log-probability of the halting trajectory it just
-sampled, each rollout step makes a second actor forward pass in replay mode
-(`torso_kwargs={"target_compute_time": compute_time}`) purely to read off
-`halting_log_prob` (per-step) at the rollout-time parameters. This doubles
-the actor's per-step forward cost during rollout.
-
-Optionally (`config.system.latent_kl_coef > 0`), the actor loss also adds a
-trust-region *penalty* (not a clip) on how far the torso's per-step "thought"
-states are allowed to drift across a PPO update - the halting-log-prob ratio
-above only bounds the halting *decision*; the continuous states themselves
-(a deterministic function of the parameters, not a sampled action) have no
-probability ratio PPO's clip could apply to, so nothing else protects them.
-Treating each step's state as the mean of a fixed-variance isotropic
-Gaussian, `KL(N(new, sigma^2 I) || N(old, sigma^2 I)) = ||new - old||^2 /
-(2 * sigma^2)`, so an L2 penalty on `(new_latent_states - old_latent_states)`
-*is* such a KL penalty, with `latent_kl_coef = 1 / (2 * sigma^2)`. Both
-`old`/`new` come from replay-mode passes (`states_history`, see
-`stoix.networks.torso_compute`/`torso_compute_transformer`) at the same
-`compute_time` trajectory - `old_latent_states` is read off the same
-rollout-time replay pass that produces `halting_log_prob` above (no extra
-forward pass), `new_latent_states` off the same per-epoch replay pass that
-produces `halting_log_prob` in `_actor_loss_fn`. Averaged only over steps
-actually
-taken (`step_idx < compute_time`) across the whole minibatch, matching how
-`ff_ppo_explicit_cot.py` averages its per-step CoT terms. Clipping (rather
-than a soft penalty) was considered and rejected for this term - see the
-design discussion this was drafted from: because the "sample" and the
-Gaussian's mean coincide (there's no injected noise), the resulting ratio is
-bounded in (0, 1], which makes PPO's two-sided clip degenerate and, for
-negative-advantage examples, creates an unbounded incentive to blow up the
-state.
-
-Like `ff_reinforce.py`/`ff_qac.py`, and unlike `stoix.systems.vpg.ff_ppo`,
-this file does not implement truncation-aware bootstrapping (`done` is
-`timestep.last()`, covering both termination and truncation) or observation
-normalization. It also drops the optional "delightful" REINFORCE-weight
-gate: PPO's clipped surrogate already serves an analogous role built on the
-ratio instead.
-
-This file intentionally duplicates most of `ff_reinforce.py`/`ff_qac.py`
-rather than modifying them, so those systems are left untouched.
+The advantage is G - V, with `G` computed via GAE(lambda)
+(`config.system.gae_lambda`) and a plain V-only critic.
 """
 
 import copy
@@ -244,9 +42,7 @@ from stoix.base_types import (
 )
 from stoix.networks.base import FeedForwardCritic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
-from stoix.networks.base_qac import SeparateValueAndQCritic, ValueAndQCritic
-from stoix.systems.ramdp_vpg.evaluator import evaluator_setup_with_compute_time
-from stoix.systems.ramdp_vpg.ff_reinforce import get_distribution_act_fn_with_compute_time
+from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ppo_types import PPOTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
@@ -273,6 +69,34 @@ from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
 
+def get_distribution_act_fn_with_compute_time(
+    config: DictConfig,
+    actor_apply: ActorApply,
+) -> ComputeAwareActFn:
+    """Like `stoix.evaluator.get_distribution_act_fn`, but for actor networks
+    whose torso samples a halting trajectory and so returns
+    `(action_distribution, compute_time, first_convergence_step,
+    num_close_steps)` instead of just the action distribution."""
+
+    def act_fn(
+        params: FrozenDict, observation: chex.Array, key: chex.PRNGKey
+    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+        if config.arch.evaluation_greedy:
+            pi, compute_time, first_convergence_step, num_close_steps = actor_apply(
+                params, observation, torso_kwargs={"deterministic": True}
+            )
+            action = pi.mode()
+        else:
+            halting_key, action_key = jax.random.split(key)
+            pi, compute_time, first_convergence_step, num_close_steps = actor_apply(
+                params, observation, torso_kwargs={"rng": halting_key}
+            )
+            action = pi.sample(seed=action_key)
+        return action, compute_time, first_convergence_step, num_close_steps
+
+    return act_fn
+
+
 def get_learner_fn(
     env: Environment,
     apply_fns: Tuple[ActorApply, CriticApply],
@@ -288,69 +112,13 @@ def get_learner_fn(
     # by the optional latent KL penalty below - see `_actor_loss_fn`.
     max_steps = config.network.actor_network.pre_torso.max_steps
 
-    qac_variant = config.system.qac_variant
-    assert qac_variant in (
-        "naive",
-        "fac",
-        "cond_naive",
-        "cond_fac",
-        "reinforce",
-    ), f"Unknown qac_variant: {qac_variant}"
-    is_qac = qac_variant in ("naive", "fac", "cond_naive", "cond_fac")
-
-    def _q_output(
-        critic_params: FrozenDict, obs: chex.Array, compute_time: chex.Array
-    ) -> chex.Array:
-        """Get the critic's raw `q_value` output. "cond_naive" conditions the
-        network on the realised `compute_time` as an extra input; "cond_fac"
-        shares that same conditioned architecture/parameter count but is
-        always queried at the fixed reference `compute_time=1`, so - like
-        "fac" - its raw output is `c`-invariant and stays a genuine Q(s,·,1)
-        that the `gamma ** (c - 1)` scaling in `_q_at_action_and_compute_time`
-        is the *only* source of `c`-dependence for. The other variants apply
-        `compute_time` afterwards instead, see `_q_at_action_and_compute_time`."""
-        if qac_variant == "cond_naive":
-            return critic_apply_fn(
-                critic_params, obs, method="q_value", compute_time=compute_time
-            )
-        if qac_variant == "cond_fac":
-            return critic_apply_fn(
-                critic_params,
-                obs,
-                method="q_value",
-                compute_time=jnp.ones_like(compute_time),
-            )
-        return critic_apply_fn(critic_params, obs, method="q_value")
-
-    def _q_at_action_and_compute_time(
-        q_output: chex.Array, action: chex.Array, compute_time: chex.Array
-    ) -> chex.Array:
-        """Read Q(s, a, c) off `_q_output`'s raw output, however it's
-        parameterised: "naive" indexes a `(num_actions, max_steps)` table by
-        both `action` and `compute_time`; "fac" indexes Q(s,·,1) by `action`
-        then scales by `gamma ** (compute_time - 1)`; "cond_naive" indexes
-        the already-conditioned Q(s,·,c) by `action` only; "cond_fac" indexes
-        Q(s,·,1) (from `_q_output`'s fixed `compute_time=1` query) by
-        `action`, then applies the same `gamma ** (compute_time - 1)` scaling
-        as "fac"."""
-        if qac_variant == "naive":
-            compute_time_idx = (compute_time - 1).astype(jnp.int32)
-            q_at_c = jnp.take_along_axis(
-                q_output, compute_time_idx[..., jnp.newaxis, jnp.newaxis], axis=-1
-            ).squeeze(-1)
-            return jnp.take_along_axis(q_at_c, action[..., jnp.newaxis], axis=-1).squeeze(-1)
-        q_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
-        if qac_variant in ("fac", "cond_fac"):
-            return config.system.gamma ** (compute_time - 1) * q_sa
-        return q_sa  # "cond_naive"
-
     def _value_loss_fn(
         pred: chex.Array, behavior: chex.Array, targets: chex.Array, use_expectile: bool = False
     ) -> chex.Array:
         """PPO's clipped value loss against `behavior`, plain L2 to
-        `targets`, or (when `use_expectile=True` - only ever passed for V,
-        never Q, see `config.system.use_expectile_value_loss` and the module
-        docstring) expectile regression to `targets`
+        `targets`, or (when `use_expectile=True`, see
+        `config.system.use_expectile_value_loss` and the module docstring)
+        expectile regression to `targets`
         (`stoix.utils.loss.expectile_loss`) at `config.system.expectile`."""
         if use_expectile:
             return expectile_loss(pred, targets, config.system.expectile)
@@ -384,30 +152,16 @@ def get_learner_fn(
             action = actor_policy.sample(seed=policy_key)
             env_log_prob = actor_policy.log_prob(action)
 
-            # Second replay-mode pass to get halting_log_prob at these same
-            # (rollout-time) params, giving PPO a fixed "old" per-step
-            # log_prob (the summed scalar is discarded - PPO clips each
-            # step individually, see module docstring). `old_latent_states`
-            # (the per-step "thought" states from this same pass) is only
-            # used by the optional latent KL penalty - harmless to always
-            # compute, since it's read off a pass already being made.
+            # Second replay-mode pass to get halting_log_prob at these same (rollout-time) params,
+            # giving PPO a fixed "old" per-step log_prob (the summed scalar is discarded - PPO clips
+            # each step individually, see module docstring).
             _, _, old_latent_states, halting_log_prob, _ = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_compute_time": compute_time},
             )
 
-            if is_qac:
-                value = critic_apply_fn(
-                    params.critic_params, last_timestep.observation, method="value"
-                )
-                q_output = _q_output(
-                    params.critic_params, last_timestep.observation, compute_time
-                )
-                q_value = _q_at_action_and_compute_time(q_output, action, compute_time)
-            else:  # "reinforce"
-                value = critic_apply_fn(params.critic_params, last_timestep.observation)
-                q_value = jnp.zeros_like(value)
+            value = critic_apply_fn(params.critic_params, last_timestep.observation)
 
             env_state, timestep = env.step(env_state, action)
 
@@ -436,7 +190,6 @@ def get_learner_fn(
                 done,
                 action,
                 value,
-                q_value,
                 timestep.reward,
                 last_timestep.observation,
                 info,
@@ -473,17 +226,12 @@ def get_learner_fn(
             running_discounted_return,
             episode_discounted_return,
         ) = learner_state
-        if is_qac:
-            last_val = critic_apply_fn(
-                params.critic_params, last_timestep.observation, method="value"
-            )
-        else:
-            last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
+        last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
 
         traj_batch = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), traj_batch)
 
-        # Return target for V (and, for "naive", Q too): the same n-step,
-        # compute-discounted return as `ff_reinforce.py`'s critic.
+        # Return target for V: the n-step compute-discounted return `G_h`
+        # (see module docstring).
         compute_time = traj_batch.compute_time
         r_t = traj_batch.reward * config.system.gamma ** (compute_time - 1)
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
@@ -494,23 +242,17 @@ def get_learner_fn(
             stop_target_gradients=True,
         )
 
-        if is_qac:
-            # Q - V directly, no n-step/Monte-Carlo return in the advantage
-            # itself; g_targets here trains the critic only.
-            advantages = traj_batch.q_value - traj_batch.value
-        else:
-            advantages = g_targets - traj_batch.value  # G - V, as in ff_reinforce.py
+        advantages = g_targets - traj_batch.value  # G - V
         targets = g_targets
 
         if config.system.standardize_advantages:
             advantages = jax.nn.standardize(advantages, axis=(0, 1))
 
-        # --- config.system.critic_before_actor machinery (see module
-        # docstring) - `_actor_loss_fn`/`_critic_loss_fn` below are exact
-        # copies of the ones nested inside the joint `_update_minibatch`
-        # further down, hoisted to this scope so both the sequential path
-        # here and the joint path below can each use their own copy without
-        # the two paths depending on one another. ---
+        # --- config.system.critic_before_actor machinery (see module docstring) -
+        # `_actor_loss_fn`/`_critic_loss_fn` below are exact copies of the ones nested inside the
+        # joint `_update_minibatch` further down, hoisted to this scope so both the sequential path
+        # here and the joint path below can each use their own copy without the two paths depending
+        # on one another.
 
         def _actor_loss_fn(
             actor_params: FrozenDict,
@@ -581,17 +323,11 @@ def get_learner_fn(
                 )
                 / num_valid_steps
             )
-            # Entropy bonus on the halting decision itself, mirroring
-            # `entropy` above for the environment action - `ent_coef` alone
-            # never reaches the halting head (`actor_policy.entropy()` is
-            # only the environment action's distribution), so without this
-            # nothing keeps the halting policy from collapsing to a
-            # degenerate, non-adaptive compute-time before it discovers any
-            # genuine per-example structure. Same `valid_step` masking as
-            # `halting_loss` above - `per_step_halting_entropy` is already
-            # zeroed at forced steps (before `min_steps`, or the forced halt
-            # at `max_steps`) and past each example's actual halt, see the
-            # torso's docstring.
+            # Entropy bonus on the halting decision itself, mirroring `entropy` above for the
+            # environment action - `ent_coef` alone never reaches the halting head
+            # (`actor_policy.entropy()` is only the environment action's distribution), so without
+            # this nothing keeps the halting policy from collapsing to a degenerate, non-adaptive
+            # compute-time before it discovers any genuine per-example structure.
             halting_entropy = jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
 
             loss_actor = action_loss + halting_loss
@@ -630,41 +366,16 @@ def get_learner_fn(
         ) -> Tuple:
             """Calculate the critic loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
-            if is_qac:
-                value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
-                value_loss = _value_loss_fn(
-                    value,
-                    traj_batch.value,
-                    targets,
-                    use_expectile=config.system.use_expectile_value_loss,
-                )
+            value = critic_apply_fn(critic_params, traj_batch.obs)
+            value_loss = _value_loss_fn(
+                value,
+                traj_batch.value,
+                targets,
+                use_expectile=config.system.use_expectile_value_loss,
+            )
 
-                q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
-                if qac_variant == "fac":
-                    q_pred = jnp.take_along_axis(
-                        q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                    ).squeeze(-1) * config.system.gamma ** (traj_batch.compute_time - 1)
-                    q_targets = targets
-                else:  # "naive", "cond_naive", "cond_fac"
-                    q_pred = _q_at_action_and_compute_time(
-                        q_output, traj_batch.action, traj_batch.compute_time
-                    )
-                    q_targets = targets
-                q_loss = _value_loss_fn(q_pred, traj_batch.q_value, q_targets)
-
-                critic_total_loss = config.system.vf_coef * (value_loss + q_loss)
-                loss_info = {"value_loss": value_loss, "q_loss": q_loss}
-            else:  # "reinforce"
-                value = critic_apply_fn(critic_params, traj_batch.obs)
-                value_loss = _value_loss_fn(
-                    value,
-                    traj_batch.value,
-                    targets,
-                    use_expectile=config.system.use_expectile_value_loss,
-                )
-
-                critic_total_loss = config.system.vf_coef * value_loss
-                loss_info = {"value_loss": value_loss}
+            critic_total_loss = config.system.vf_coef * value_loss
+            loss_info = {"value_loss": value_loss}
             return critic_total_loss, loss_info
 
         def _apply_actor_update(
@@ -730,20 +441,10 @@ def get_learner_fn(
         def _refresh_targets_and_advantages(
             critic_params: FrozenDict,
         ) -> Tuple[chex.Array, chex.Array]:
-            """Recompute `targets`/`advantages` from `critic_params`,
-            mirroring the joint path's `recompute_advantages` refresh
-            further down. Used by `critic_before_actor`'s critic-only epochs
-            (gated by `recompute_advantages`, as usual) and, unconditionally,
-            once at the critic-to-actor phase boundary - see module
-            docstring."""
-            if is_qac:
-                new_value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
-                new_last_val = critic_apply_fn(
-                    critic_params, last_timestep.observation, method="value"
-                )
-            else:  # "reinforce"
-                new_value = critic_apply_fn(critic_params, traj_batch.obs)
-                new_last_val = critic_apply_fn(critic_params, last_timestep.observation)
+            """Recompute `targets`/`advantages` from `critic_params`, mirroring the joint path's
+            `recompute_advantages` refresh further down."""
+            new_value = critic_apply_fn(critic_params, traj_batch.obs)
+            new_last_val = critic_apply_fn(critic_params, last_timestep.observation)
 
             v_t = jnp.concatenate([new_value, new_last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
             _, refreshed_targets = batch_truncated_generalized_advantage_estimation(
@@ -751,14 +452,7 @@ def get_learner_fn(
                 stop_target_gradients=True,
             )
 
-            if is_qac:
-                q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
-                q_value = _q_at_action_and_compute_time(
-                    q_output, traj_batch.action, traj_batch.compute_time
-                )
-                refreshed_advantages = q_value - traj_batch.value
-            else:  # "reinforce"
-                refreshed_advantages = refreshed_targets - new_value
+            refreshed_advantages = refreshed_targets - new_value
 
             if config.system.standardize_advantages:
                 refreshed_advantages = jax.nn.standardize(refreshed_advantages, axis=(0, 1))
@@ -815,10 +509,8 @@ def get_learner_fn(
             return update_state, loss_info
 
         def _update_epoch_actor_only(update_state: Tuple, _: Any) -> Tuple:
-            """`critic_before_actor`'s actor-only epoch: one full shuffled
-            pass over the rollout's minibatches, actor params only. No
-            recompute here - the critic is frozen through this phase, so
-            `advantages` would not change even if refreshed."""
+            """`critic_before_actor`'s actor-only epoch: one full shuffled pass over the
+            rollout's minibatches, actor params only."""
             params, opt_states, epoch_traj_batch, epoch_advantages, key = update_state
             key, shuffle_key = jax.random.split(key)
 
@@ -857,20 +549,9 @@ def get_learner_fn(
                     traj_batch: PPOTransition,
                     advantage: chex.Array,
                 ) -> Tuple:
-                    """Calculate the actor loss.
-
-                    Per-decision PPO clipping (see module docstring): the
-                    environment action and each pondering step get their own
-                    ratio/clip against the shared, trajectory-level
-                    `advantage` - rather than summing `env_log_prob` and
-                    `halting_log_prob` into one joint log-prob and clipping a
-                    single ratio over that sum.
-                    """
-                    # Replay the halting trajectory actually taken during
-                    # rollout, mirroring log_prob(traj_batch.action) below.
-                    # `new_latent_states` is this epoch's per-step "thought"
-                    # states at the same trajectory - only used by the
-                    # optional latent KL penalty below (see module docstring).
+                    """Calculate the actor loss."""
+                    # Replay the halting trajectory actually taken during rollout, mirroring
+                    # log_prob(traj_batch.action) below.
                     (
                         actor_policy,
                         _,
@@ -904,16 +585,8 @@ def get_learner_fn(
                     )
                     entropy = actor_policy.entropy().mean()
 
-                    # `halting_log_prob`/`traj_batch.halting_log_prob`:
-                    # `(*batch, max_steps)`, zeroed at forced steps or past
-                    # the step each example actually halted at. A step is
-                    # "actually taken" iff its index is before
-                    # `compute_time` - reconstructed here (not passed through
-                    # the transition) since it's a fixed function of
-                    # `compute_time` alone (same at rollout time and at every
-                    # replay), unlike the log-probs, which change with
-                    # `actor_params` each epoch. Reused below for the latent
-                    # KL penalty's masking too.
+                    # `halting_log_prob`/`traj_batch.halting_log_prob`: `(*batch, max_steps)`,
+                    # zeroed at forced steps or past the step each example actually halted at.
                     step_idx = jnp.arange(max_steps)
                     valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(
                         jnp.float32
@@ -958,33 +631,21 @@ def get_learner_fn(
                         )
                         / num_valid_steps
                     )
-                    # Entropy bonus on the halting decision itself, mirroring
-                    # `entropy` above for the environment action - `ent_coef`
-                    # alone never reaches the halting head
-                    # (`actor_policy.entropy()` is only the environment
-                    # action's distribution), so without this nothing keeps
-                    # the halting policy from collapsing to a degenerate,
-                    # non-adaptive compute-time before it discovers any
-                    # genuine per-example structure. Same `valid_step`
-                    # masking as `halting_loss` above -
-                    # `per_step_halting_entropy` is already zeroed at forced
-                    # steps (before `min_steps`, or the forced halt at
-                    # `max_steps`) and past each example's actual halt, see
-                    # the torso's docstring.
+                    # Entropy bonus on the halting decision itself, mirroring `entropy` above for
+                    # the environment action - `ent_coef` alone never reaches the halting head
+                    # (`actor_policy.entropy()` is only the environment action's distribution), so
+                    # without this nothing keeps the halting policy from collapsing to a degenerate,
+                    # non-adaptive compute-time before it discovers any genuine per-example
+                    # structure.
                     halting_entropy = (
                         jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
                     )
 
                     loss_actor = action_loss + halting_loss
 
-                    # Optional latent trust-region penalty (see module
-                    # docstring): KL(N(new, sigma^2 I) || N(old, sigma^2 I))
-                    # = ||new - old||^2 / (2 sigma^2), i.e. a plain L2 penalty
-                    # with latent_kl_coef playing the role of 1/(2 sigma^2).
-                    # `latent_kl_coef=0.0` (the default) makes this an exact
-                    # no-op - `new_latent_states`/`old_latent_states` are
-                    # still computed either way, since they're read off
-                    # passes already being made for `halting_log_prob`.
+                    # Optional latent trust-region penalty (see module docstring): KL(N(new, sigma^2
+                    # I) || N(old, sigma^2 I)) = ||new - old||^2 / (2 sigma^2), i.e. a plain L2
+                    # penalty with latent_kl_coef playing the role of 1/(2 sigma^2).
                     sq_dist = jnp.sum(
                         (new_latent_states - traj_batch.old_latent_states) ** 2, axis=-1
                     )
@@ -1018,58 +679,18 @@ def get_learner_fn(
                     targets: chex.Array,
                 ) -> Tuple:
                     """Calculate the critic loss."""
-                    if is_qac:
-                        value = critic_apply_fn(critic_params, traj_batch.obs, method="value")
-                        value_loss = _value_loss_fn(
-                            value,
-                            traj_batch.value,
-                            targets,
-                            use_expectile=config.system.use_expectile_value_loss,
-                        )
+                    value = critic_apply_fn(critic_params, traj_batch.obs)
+                    value_loss = _value_loss_fn(
+                        value,
+                        traj_batch.value,
+                        targets,
+                        use_expectile=config.system.use_expectile_value_loss,
+                    )
 
-                        q_output = _q_output(
-                            critic_params, traj_batch.obs, traj_batch.compute_time
-                        )
-                        if qac_variant == "fac":
-                            # Scale the raw Q(s,·,1) prediction up to the true
-                            # Q(s,a,c) scale by gamma ** (c - 1), then regress
-                            # against `targets` (already on that true scale).
-                            q_pred = jnp.take_along_axis(
-                                q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                            ).squeeze(-1) * config.system.gamma ** (
-                                traj_batch.compute_time - 1
-                            )
-                            q_targets = targets
-                        else:  # "naive", "cond_naive", "cond_fac"
-                            # "naive"/"cond_naive" are already in the true
-                            # Q(s,a,c) scale; "cond_fac" goes through the same
-                            # gamma ** (c - 1) rescaling as "fac" above (see
-                            # `_q_at_action_and_compute_time`). Either way,
-                            # regress directly against targets.
-                            q_pred = _q_at_action_and_compute_time(
-                                q_output, traj_batch.action, traj_batch.compute_time
-                            )
-                            q_targets = targets
-                        q_loss = _value_loss_fn(q_pred, traj_batch.q_value, q_targets)
-
-                        critic_total_loss = config.system.vf_coef * (value_loss + q_loss)
-                        loss_info = {
-                            "value_loss": value_loss,
-                            "q_loss": q_loss,
-                        }
-                    else:  # "reinforce"
-                        value = critic_apply_fn(critic_params, traj_batch.obs)
-                        value_loss = _value_loss_fn(
-                            value,
-                            traj_batch.value,
-                            targets,
-                            use_expectile=config.system.use_expectile_value_loss,
-                        )
-
-                        critic_total_loss = config.system.vf_coef * value_loss
-                        loss_info = {
-                            "value_loss": value_loss,
-                        }
+                    critic_total_loss = config.system.vf_coef * value_loss
+                    loss_info = {
+                        "value_loss": value_loss,
+                    }
                     return critic_total_loss, loss_info
 
                 actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
@@ -1146,33 +767,14 @@ def get_learner_fn(
             )
 
             if config.system.recompute_advantages:
-                # `targets` (the n-step return that trains the critic in
-                # `_critic_loss_fn`) bootstraps off the value estimate at the
-                # tail of each n-step window (`v_t` below, mirroring the
-                # pre-epoch-loop computation above) - holding it fixed at its
-                # rollout-time bootstrap across every epoch would leave the
-                # critic regressing towards a target built from an
-                # increasingly stale value function as the critic itself
-                # moves epoch to epoch. So it's rebuilt here from this
-                # epoch's updated critic params, reusing `r_t`/`d_t`
-                # (rewards/discounts, unaffected by the critic) from the
-                # original computation. Skipped entirely (along with the
-                # `new_value`/`new_last_val` forward passes below) when
-                # `recompute_advantages=False`, since in that case `targets`
-                # and `advantages` both stay pinned at their pre-epoch-loop
-                # values anyway - recomputing either would be wasted compute.
-                if is_qac:
-                    new_value = critic_apply_fn(
-                        params.critic_params, traj_batch.obs, method="value"
-                    )
-                    new_last_val = critic_apply_fn(
-                        params.critic_params, last_timestep.observation, method="value"
-                    )
-                else:  # "reinforce"
-                    new_value = critic_apply_fn(params.critic_params, traj_batch.obs)
-                    new_last_val = critic_apply_fn(
-                        params.critic_params, last_timestep.observation
-                    )
+                # `targets` (the n-step return that trains the critic in `_critic_loss_fn`)
+                # bootstraps off the value estimate at the tail of each n-step window (`v_t` below,
+                # mirroring the pre-epoch-loop computation above) - holding it fixed at its
+                # rollout-time bootstrap across every epoch would leave the critic regressing
+                # towards a target built from an increasingly stale value function as the critic
+                # itself moves epoch to epoch.
+                new_value = critic_apply_fn(params.critic_params, traj_batch.obs)
+                new_last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
 
                 v_t = jnp.concatenate(
                     [new_value, new_last_val[..., jnp.newaxis]], axis=-1
@@ -1182,32 +784,10 @@ def get_learner_fn(
                     stop_target_gradients=True,
                 )
 
-                if is_qac:
-                    # Refresh the advantage's Q term with this epoch's
-                    # just-updated critic params before the next epoch trains
-                    # on it - the critic moves every epoch, so the
-                    # rollout-time `traj_batch.q_value` baked into
-                    # `advantages` before the epoch loop would otherwise go
-                    # increasingly stale by the later epochs. `traj_batch.value`
-                    # is deliberately used here instead of `new_value` above:
-                    # holding the V baseline fixed at its rollout-time
-                    # estimate isolates the actor's signal to "how has the
-                    # critic's opinion of this action changed since rollout",
-                    # rather than mixing in drift from Q and V moving
-                    # together epoch to epoch. (`new_value` above only feeds
-                    # the target's bootstrap, a separate use of V.)
-                    q_output = _q_output(
-                        params.critic_params, traj_batch.obs, traj_batch.compute_time
-                    )
-                    q_value = _q_at_action_and_compute_time(
-                        q_output, traj_batch.action, traj_batch.compute_time
-                    )
-                    advantages = q_value - traj_batch.value
-                else:  # "reinforce"
-                    # Both terms of G - V are this epoch's fresh critic
-                    # output: `new_value` for V, and `targets` above (itself
-                    # bootstrapped off `new_value`/`new_last_val`) for G.
-                    advantages = targets - new_value
+                # Both terms of G - V are this epoch's fresh critic output:
+                # `new_value` for V, and `targets` above (itself bootstrapped
+                # off `new_value`/`new_last_val`) for G.
+                advantages = targets - new_value
 
                 if config.system.standardize_advantages:
                     advantages = jax.nn.standardize(advantages, axis=(0, 1))
@@ -1223,20 +803,16 @@ def get_learner_fn(
             return update_state, loss_info
 
         if config.system.critic_before_actor:
-            # Phase 1: `epochs` epochs of critic-only updates (see module
-            # docstring). `advantages` isn't threaded through here - unused
-            # until the actor-only phase.
+            # Phase 1: `epochs` epochs of critic-only updates (see module docstring).
             critic_update_state = (params, opt_states, traj_batch, targets, key)
             critic_update_state, critic_loss_info = jax.lax.scan(
                 _update_epoch_critic_only, critic_update_state, None, config.system.epochs
             )
             params, opt_states, traj_batch, targets, key = critic_update_state
 
-            # Unconditional refresh at the phase boundary, regardless of
-            # `recompute_advantages`: the actor-only phase must see an
-            # advantage informed by the now-trained critic, not the stale
-            # rollout-time one - otherwise this option would do nothing for
-            # the actor. See module docstring.
+            # Unconditional refresh at the phase boundary, regardless of `recompute_advantages`: the
+            # actor-only phase must see an advantage informed by the now-trained critic, not the
+            # stale rollout-time one - otherwise this option would do nothing for the actor.
             targets, advantages = _refresh_targets_and_advantages(params.critic_params)
 
             # Phase 2: `epochs` epochs of actor-only updates against that
@@ -1296,17 +872,13 @@ def get_learner_fn(
 
 
 def _label_actor_params_by_halting_head(params: Any) -> Any:
-    """Labels every actor param leaf "halting_head" if it sits inside a
-    submodule named `HaltingHead*` (currently only `stoix.networks.torso_
-    compute_transformer.HaltingHead`, used by `TransformerChainOfThoughtTorso`),
-    or "default" otherwise - for `optax.multi_transform` to give the halting
-    head's own weights a different gradient-clipping and/or learning-rate/
-    weight-decay treatment than the rest of the actor (see
-    `config.system.clip_halting_head`/`halting_lr`/`halting_weight_decay` in
-    `learner_setup`). Raises if no "halting_head" leaf is found, since that
-    means the actor's torso has no separately-named halting head to single
-    out in the first place - silently treating everything as "default" would
-    defeat the point of setting any of those config options."""
+    """Labels every actor param leaf "halting_head" if it sits inside a submodule named
+    `HaltingHead*` (currently only `stoix.networks.torso_ compute_transformer.HaltingHead`,
+    used by `TransformerChainOfThoughtTorso`), or "default" otherwise - for
+    `optax.multi_transform` to give the halting head's own weights a different
+    gradient-clipping and/or learning-rate/ weight-decay treatment than the rest of the actor
+    (see `config.system.clip_halting_head`/`halting_lr`/`halting_weight_decay` in
+    `learner_setup`)."""
 
     def _label(path: Tuple[Any, ...], _leaf: Any) -> str:
         keys = (getattr(entry, "key", None) for entry in path)
@@ -1337,27 +909,11 @@ def learner_setup(
 
     key, actor_net_key, critic_net_key = keys
 
-    qac_variant = config.system.qac_variant
-    assert qac_variant in (
-        "naive",
-        "fac",
-        "cond_naive",
-        "cond_fac",
-        "reinforce",
-    ), f"Unknown qac_variant: {qac_variant}"
-
     actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
     actor_action_head = hydra.utils.instantiate(
         config.network.actor_network.action_head, action_dim=num_actions
     )
-    # A `value_pre_torso`/`q_pre_torso` pair selects `SeparateValueAndQCritic`:
-    # V and Q each get their own torso and share no parameters.
-    separate_qv_torsos = "value_pre_torso" in config.network.critic_network
-    if separate_qv_torsos:
-        value_torso = hydra.utils.instantiate(config.network.critic_network.value_pre_torso)
-        q_torso = hydra.utils.instantiate(config.network.critic_network.q_pre_torso)
-    else:
-        critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
+    critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
 
     # input_layer is optional - defaults to identity when absent.
     actor_kwargs = {}
@@ -1366,54 +922,15 @@ def learner_setup(
             config.network.actor_network.input_layer
         )
     critic_kwargs = {}
-    if separate_qv_torsos:
-        if "value_input_layer" in config.network.critic_network:
-            critic_kwargs["value_input_layer"] = hydra.utils.instantiate(
-                config.network.critic_network.value_input_layer
-            )
-        if "q_input_layer" in config.network.critic_network:
-            critic_kwargs["q_input_layer"] = hydra.utils.instantiate(
-                config.network.critic_network.q_input_layer
-            )
-    elif "input_layer" in config.network.critic_network:
+    if "input_layer" in config.network.critic_network:
         critic_kwargs["input_layer"] = hydra.utils.instantiate(
             config.network.critic_network.input_layer
         )
 
     actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
 
-    if qac_variant in ("naive", "fac", "cond_naive", "cond_fac"):
-        value_head = hydra.utils.instantiate(config.network.critic_network.value_head)
-        # "naive" learns a full (action, compute_time) table, so needs
-        # max_steps; the other variants only need one value per action.
-        if qac_variant == "naive":
-            max_steps = config.network.actor_network.pre_torso.max_steps
-            q_head = hydra.utils.instantiate(
-                config.network.critic_network.q_head,
-                output_dim=max_steps,
-                pre_shape=(num_actions,),
-            )
-        else:  # "fac", "cond_naive", "cond_fac"
-            q_head = hydra.utils.instantiate(
-                config.network.critic_network.q_head, output_dim=num_actions
-            )
-        if separate_qv_torsos:
-            critic_network = SeparateValueAndQCritic(
-                value_torso=value_torso,
-                q_torso=q_torso,
-                value_head=value_head,
-                q_head=q_head,
-                **critic_kwargs,
-            )
-        else:
-            critic_network = ValueAndQCritic(
-                torso=critic_torso, value_head=value_head, q_head=q_head, **critic_kwargs
-            )
-    else:  # "reinforce"
-        critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
-        critic_network = FeedForwardCritic(
-            torso=critic_torso, critic_head=critic_head, **critic_kwargs
-        )
+    critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
+    critic_network = FeedForwardCritic(torso=critic_torso, critic_head=critic_head, **critic_kwargs)
 
     actor_lr = make_learning_rate(
         config.system.actor_lr, config, config.system.epochs, config.system.num_minibatches
@@ -1486,15 +1003,7 @@ def learner_setup(
     )
     actor_opt_state = actor_optim.init(actor_params)
 
-    # "cond_naive"/"cond_fac" need a representative compute_time at init
-    # time too, so the conditioning feature is sized in from the start.
-    if qac_variant in ("cond_naive", "cond_fac"):
-        dummy_compute_time = jnp.ones((1,), dtype=jnp.int32)
-        critic_params = critic_network.init(
-            critic_net_key, init_x, compute_time=dummy_compute_time
-        )
-    else:
-        critic_params = critic_network.init(critic_net_key, init_x)
+    critic_params = critic_network.init(critic_net_key, init_x)
     critic_opt_state = critic_optim.init(critic_params)
 
     params = ActorCriticParams(actor_params, critic_params)

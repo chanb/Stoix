@@ -1,8 +1,5 @@
 #!/usr/bin/env python
 """Fetch wandb data based on filters
-
-Usage:
-  python ramdp_experiments/fetch_wandb.py --out data.csv
 """
 
 from __future__ import annotations
@@ -28,19 +25,11 @@ METRICS = [
     "evaluator/episode_length/mean",
 ]
 
-# The "absolute metric" (see stoix/evaluator.py's get_ff_evaluator_fn docstring):
-# logged exactly once per run, at the very end of training, by re-evaluating
-# the best-performing checkpoint for 10x as many episodes as a single
-# actor/evaluator eval step - a much less noisy final-performance estimate
-# than evaluator/* (which is itself still a fine per-checkpoint curve, just
-# noisier at any single eval_idx). Deliberately NOT in METRICS above and
-# fetched separately, same reasoning as compute_time/{min,max}: it's logged
-# at a different `_step` than the per-eval actor/evaluator rows, so
-# Run.history(keys=...) requiring every key on the same row would collapse
-# the whole query to that one final row. Unlike compute_time min/max, this
-# IS in wandb's structured history (not console-log-only), so it's fetched
-# via its own `run.history(keys=...)` call instead of console-log parsing -
-# see fetch_absolute_metrics.
+# The "absolute metric" (see stoix/evaluator.py's get_ff_evaluator_fn docstring): logged exactly
+# once per run, at the very end of training, by re-evaluating the best-performing checkpoint for 10x
+# as many episodes as a single actor/evaluator eval step - a much less noisy final-performance
+# estimate than evaluator/* (which is itself still a fine per-checkpoint curve, just noisier at any
+# single eval_idx).
 ABSOLUTE_METRICS = [
     "absolute/episode_return/mean",
     "absolute/episode_discounted_return/mean",
@@ -50,10 +39,7 @@ ABSOLUTE_METRICS = [
 
 # Metrics only some runs log - solved_episode exists only for envs that set
 # `solved_final_reward_threshold` (Sokoban, sliding tile; not Lights Out), see
-# stoix.systems.ramdp_vpg.ramdp_vpg_types.solved_episode_info. Each is fetched
-# with its own `run.history(keys=[...])` call, since putting a key a run never
-# logged into METRICS / ABSOLUTE_METRICS would empty that whole query. Runs
-# without it just get no column (NaN in the concatenated CSV).
+# stoix.systems.ramdp_vpg.ramdp_vpg_types.solved_episode_info.
 OPTIONAL_METRICS = [
     "actor/solved_episode/mean",
     "evaluator/solved_episode/mean",
@@ -62,11 +48,8 @@ OPTIONAL_ABSOLUTE_METRICS = [
     "absolute/solved_episode/mean",
 ]
 
-# How many of the most recent console log lines to pull per run when looking
-# for the tail few eval checkpoints' compute_time min/max (see
-# fetch_compute_time_extrema). Each eval_step contributes only a handful of
-# lines (MISC/TRAINER/ACTOR/EVALUATOR, occasionally ABSOLUTE), so this is
-# generous headroom for N_TAIL_EVALS worth of them in one request.
+# How many of the most recent console log lines to pull per run when looking for the tail few eval
+# checkpoints' compute_time min/max (see fetch_compute_time_extrema).
 CONSOLE_TAIL_LINES = 500
 N_TAIL_EVALS = 3  # matches compute_final_values' n_tail default
 
@@ -100,9 +83,7 @@ IDENTITY_EXCLUDE_KEYS = {"logger"}
 
 
 def config_identity_key(c: dict) -> str:
-    """Canonical string identity for a run's config: every field except
-    `logger`. Two runs get the same key iff every hyperparameter matches -
-    this is what dedup should key on, not a hand-picked subset of fields."""
+    """Canonical string identity for a run's config: every field except `logger`."""
     identity = {k: v for k, v in c.items() if k not in IDENTITY_EXCLUDE_KEYS}
     return json.dumps(identity, sort_keys=True)
 
@@ -111,7 +92,6 @@ def config_identity_key(c: dict) -> str:
 class RunMeta:
     run_id: str
     arch: str
-    qac_variant: str
     min_steps: int
     max_steps: int
     sgh: bool
@@ -295,7 +275,6 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         arch_full = cfg_get(c, "network.actor_network.pre_torso._target_")
         if arch_full not in ARCH_SHORT:
             continue
-        qac = cfg_get(c, "system.qac_variant", "reinforce")
         mn = cfg_get(c, "network.actor_network.pre_torso.min_steps")
         mx = cfg_get(c, "network.actor_network.pre_torso.max_steps")
         if mn is None or mx is None:
@@ -326,7 +305,6 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
                 RunMeta(
                     run_id=r.id,
                     arch=ARCH_SHORT[arch_full],
-                    qac_variant=qac,
                     min_steps=int(mn),
                     max_steps=int(mx),
                     sgh=sgh,
@@ -375,11 +353,9 @@ def dedupe_latest(
 
 def parse_console_log_line(content: str) -> Optional[Tuple[str, Dict[str, float]]]:
     """Parse one ConsoleLogger-formatted line (see stoix/utils/logger.py's
-    `ConsoleLogger.log_dict`), e.g. "EVALUATOR - Compute time mean: 3.480 |
-    Compute time min: 2.200 | ..." into (event_label, {stat_key: value}),
-    e.g. ("EVALUATOR", {"compute_time_mean": 3.48, "compute_time_min": 2.2,
-    ...}). Returns None for lines that don't match this format (config
-    dumps, non-Stoix log lines, etc.)."""
+    `ConsoleLogger.log_dict`), e.g. "EVALUATOR - Compute time mean: 3.480 | Compute time min:
+    2.200 | ..." into (event_label, {stat_key: value}), e.g. ("EVALUATOR",
+    {"compute_time_mean": 3.48, "compute_time_min": 2.2, ...})."""
     content = _ANSI_RE.sub("", content).strip()
     if " - " not in content:
         return None
@@ -399,12 +375,10 @@ def parse_console_log_line(content: str) -> Optional[Tuple[str, Dict[str, float]
 def fetch_compute_time_extrema(
     run: "wandb.apis.public.Run", n_tail: int = N_TAIL_EVALS, tail_lines: int = CONSOLE_TAIL_LINES
 ) -> Dict[str, float]:
-    """{"actor/compute_time/min": ..., "evaluator/compute_time/max": ...,
-    ...} - the mean of the last `n_tail` ACTOR/EVALUATOR eval checkpoints'
-    compute_time min and max, read back from the run's console log (see
-    module docstring for why min/max aren't in wandb's structured history).
-    Missing keys mean nothing was found (e.g. the run has no console log,
-    or ACTOR never logged compute_time in the fetched tail)."""
+    """{"actor/compute_time/min": ..., "evaluator/compute_time/max": ..., ...} - the mean of the
+    last `n_tail` ACTOR/EVALUATOR eval checkpoints' compute_time min and max, read back from
+    the run's console log (see module docstring for why min/max aren't in wandb's structured
+    history)."""
     mins: Dict[str, List[float]] = {"actor": [], "evaluator": []}
     maxs: Dict[str, List[float]] = {"actor": [], "evaluator": []}
     try:
@@ -434,12 +408,9 @@ def fetch_compute_time_extrema(
 
 
 def fetch_absolute_metrics(run: "wandb.apis.public.Run") -> Dict[str, float]:
-    """{"absolute/episode_return/mean": ..., ...} - the single post-training
-    absolute-metric row (see ABSOLUTE_METRICS), fetched with its own
-    `run.history` call so it doesn't collapse the main per-eval METRICS
-    query (see ABSOLUTE_METRICS docstring). Empty dict if the run has no
-    absolute-metric row (e.g. `arch.absolute_metric: false`, or the run
-    didn't reach the end of training)."""
+    """{"absolute/episode_return/mean": ..., ...} - the single post-training absolute-metric row
+    (see ABSOLUTE_METRICS), fetched with its own `run.history` call so it doesn't collapse the
+    main per-eval METRICS query (see ABSOLUTE_METRICS docstring)."""
     hist = run.history(keys=ABSOLUTE_METRICS, pandas=True)
     if hist.empty:
         return {}
@@ -488,7 +459,6 @@ def main() -> None:
         for col, value in fetch_absolute_metrics(run).items():
             hist[col] = value
         hist["arch"] = meta.arch
-        hist["qac_variant"] = meta.qac_variant
         hist["min_steps"] = meta.min_steps
         hist["max_steps"] = meta.max_steps
         hist["sgh"] = meta.sgh

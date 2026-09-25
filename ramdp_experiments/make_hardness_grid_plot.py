@@ -3,15 +3,6 @@ from both `analysis-compute_time-hardness.ipynb` (Lights Out) and
 `analysis-compute_time-hardness-slidingpuzzle.ipynb` (sliding puzzle) into a
 single 1x4 figure: [lightsout hardness, lightsout action, slidingpuzzle
 hardness, slidingpuzzle action], all against compute time.
-
-Pure numpy/pandas/matplotlib - no JAX/Flax/hydra/checkpoint restore needed.
-The hardness panels read `plot_data-lightsout.pkl`/`plot_data-slidingpuzzle.pkl`,
-produced by the "Export plot data for the standalone plotting scripts" cell
-near the end of each notebook - run that cell (in each notebook) at least once
-before running this script. The action panels need every step's action, which
-those pickles don't carry, so they read the notebooks' rollout caches
-(`ROLLOUT_CACHES` below) directly - keep those pointing at the same rollouts
-the pickles were exported from.
 """
 
 import pickle
@@ -52,9 +43,7 @@ def iqm(x, axis=None):
 
 
 def iqm_bootstrap_ci(x, rng, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL, max_chunk_elems=20_000_000):
-    """Percentile bootstrap CI of the IQM of `x`. Resamples in chunks of at
-    most `max_chunk_elems` elements so the largest groups (~200k steps per
-    action for the sliding puzzle) don't allocate n_bootstrap * n at once."""
+    """Percentile bootstrap CI of the IQM of `x`."""
     x = np.asarray(x)
     if len(x) < 2:
         return x.mean(), x.mean()
@@ -76,12 +65,8 @@ def load_plot_data(name):
 
 
 def load_step_actions(name):
-    """Every real (non-padding) step's action and compute time, from solved
-    episodes only - matching the notebooks' build_step_dataframe, which the
-    action-vs-compute-time cells use. Episodes that start already solved
-    (shortest_path_length 0) are dropped, which is what the sliding-puzzle
-    notebook's per-step "already at the goal" filter amounts to (an episode
-    ends as soon as it's solved, so only its first state can be)."""
+    """Every real (non-padding) step's action and compute time, from solved episodes only -
+    matching the notebooks' build_step_dataframe, which the action-vs-compute-time cells use."""
     df = pd.read_pickle(HERE / ROLLOUT_CACHES[name])
     df = df[df["solved"] & (df["shortest_path_length"] > 0)]
     valid = np.stack(df["valid_steps"].to_numpy())
@@ -114,9 +99,7 @@ def violin_groups_for(hardness, values):
 
 
 def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabels=None):
-    """Violins + IQM of `values` per distinct `hardness` value. `hardness` is
-    either the shortest path length or, with categorical=True, the action
-    index - the annotation is then eta^2 instead of Pearson r."""
+    """Violins + IQM of `values` per distinct `hardness` value."""
     violin_color = sns.color_palette("colorblind")[0]
     mean_color = sns.color_palette("colorblind")[3]
 
@@ -169,11 +152,9 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
     )
     handles.append(mean_errorbar)
 
-    # Pearson r / eta^2 as an in-axis annotation (not the title): a 4-up
-    # figure has no room for a title long enough to spell out both the env
-    # label and the statistic without adjacent panels' titles colliding.
-    # fontsize=8 matches analysis-unshared_iru.ipynb's analogous delta
-    # annotation.
+    # Pearson r / eta^2 as an in-axis annotation (not the title): a 4-up figure has no room for a
+    # title long enough to spell out both the env label and the statistic without adjacent panels'
+    # titles colliding.
     ax.text(
         0.95,
         0.05,

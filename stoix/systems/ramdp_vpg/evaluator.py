@@ -1,16 +1,8 @@
 """Compute-time-aware evaluator utilities.
 
-Mirrors the feedforward parts of `stoix.evaluator` (which is left unmodified)
-for actor networks whose torso reports a `compute_time` (see
-`stoix.networks.torso_compute.AdaptiveComputationTimeTorso`), so that
-evaluation - not just training - reports how much the actor "thinks" per
-action. `stoix.evaluator.get_ff_evaluator_fn`'s `act_fn` returns a bare
-action, which is why it can't be reused directly here: our `act_fn`
-(`stoix.systems.ramdp_vpg.ff_reinforce.get_distribution_act_fn_with_compute_time`)
-also returns the realised `compute_time` and the torso's latent-convergence
-diagnostics (`first_convergence_step`, `num_close_steps` - see
-`stoix.networks.torso_compute.AdaptiveComputationTimeTorso`), which need to
-be threaded through episode accumulation and into the reported metrics.
+Mirrors the feedforward parts of `stoix.evaluator` for actors whose torso also
+reports `compute_time` (and latent-convergence diagnostics), threading those
+through episode accumulation into the reported evaluation metrics.
 """
 
 from typing import Callable, Dict, Optional, Tuple
@@ -104,12 +96,7 @@ def get_ff_evaluator_fn_with_compute_time(
             # Step environment.
             env_state, timestep = env.step(env_state, action.squeeze(0))
 
-            # Log episode metrics. `episode_discounted_return` follows the same
-            # compute-adjusted discounting the actor is trained with (see
-            # `ff_reinforce.get_learner_fn`'s `G_h = gamma^(C_h - 1) * (r_h +
-            # gamma * G_{h+1})`), accumulated forward from the start of the
-            # episode via a running `discount_factor` rather than backward
-            # like the training-time `batch_discounted_returns` recursion.
+            # Log episode metrics.
             episode_return += timestep.reward
             episode_discounted_return += (
                 discount_factor * config.system.gamma ** (compute_time - 1) * timestep.reward
@@ -227,9 +214,8 @@ def evaluator_setup_with_compute_time(
     config: DictConfig,
 ) -> Tuple[EvalFn, EvalFn, Tuple[FrozenDict, chex.Array]]:
     """Like `stoix.evaluator.evaluator_setup`, but wires up
-    `get_ff_evaluator_fn_with_compute_time` so evaluation also reports the
-    actor's mean compute time per action. Only supports feedforward networks
-    (all `ramdp_vpg` uses)."""
+    `get_ff_evaluator_fn_with_compute_time` so evaluation also reports the actor's mean
+    compute time per action."""
     n_devices = len(jax.devices())
     log_solve_rate = hasattr(config.env, "solved_return_threshold")
 

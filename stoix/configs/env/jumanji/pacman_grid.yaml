@@ -4,8 +4,8 @@
 # structure: walls, remaining pellets, remaining power-ups, a one-hot player
 # position, a one-hot(-ish) ghosts position, and a constant scared-timer
 # channel, stacked as six channels - (31, 28, 6) for the default maze - so a
-# CNN-based network (network=cnn_mlp_compute / cnn_mlp_compute_qac /
-# cnn_transformer_compute / cnn_transformer_compute_qac) can operate on the
+# CNN-based network (network=cnn_mlp_compute /
+# cnn_transformer_compute) can operate on the
 # real maze layout, mirroring jumanji's own reference preprocessing
 # (jumanji.training.networks.pac_man.actor_critic.process_image) but as
 # one-hot semantic channels rather than a packed 3-channel RGB image (see

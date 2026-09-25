@@ -14,8 +14,8 @@ ordinally related, which they aren't.
 `SokobanGridObservationWrapper` mirrors the one-hot preprocessing jumanji's
 own `make_sokoban_cnn` network applies (`jumanji.training.networks.sokoban.
 actor_critic.preprocess_input`) so Stoix's CNN networks (network=
-cnn_mlp_compute / cnn_mlp_compute_qac / cnn_transformer_compute /
-cnn_transformer_compute_qac) get the same four semantic channels - agent, box,
+cnn_mlp_compute / cnn_transformer_compute)
+get the same four semantic channels - agent, box,
 wall, target - as one-hot floats, stacked into one
 (num_rows, num_cols, 4) array. "Empty" is left as the implicit all-zero
 background, same as jumanji's version.

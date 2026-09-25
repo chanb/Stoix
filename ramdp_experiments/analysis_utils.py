@@ -1,23 +1,8 @@
 doc_width_pt = 452.9679
 
 def set_size(width_pt, fraction=1, subplots=(1, 1), use_golden_ratio=True):
-    """
-    Reference: https://jwalton.info/Matplotlib-latex-PGF/
-    Set figure dimensions to sit nicely in our document.
-
-    Parameters
-    ----------
-    width_pt: float
-            Document width in points
-    fraction: float, optional
-            Fraction of the width which you wish the figure to occupy
-    subplots: array-like, optional
-            The number of rows and columns of subplots.
-    Returns
-    -------
-    fig_dim: tuple
-            Dimensions of figure in inches
-    """
+    """Reference: https://jwalton.info/Matplotlib-latex-PGF/ Set figure dimensions to sit nicely
+    in our document."""
     # Width of figure (in pts)
     fig_width_pt = width_pt * fraction
     # Convert from pt to inches

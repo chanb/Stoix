@@ -1,24 +1,6 @@
-"""Builds a 4x5 grid of 3D t-SNE plots - row pairs (1, 2) Lights Out, (3, 4)
-sliding puzzle, column i the latent state after the i'th Chain-of-Thought
-transformer step (i = 1..MAX_STEPS=5 for both environments) - showing how
-each actor's own representation of an instance evolves as it "thinks" for
-longer. Within each pair, the first row colours points by that instance's
-(first-step) compute time; the second row re-plots the *same* t-SNE embedding,
-coloured by the instance's shortest path length instead - so each column's
-two stacked panels are literally the same points, just recoloured, letting
-"how long the actor chose to think" be compared against "how hard the
-instance actually was" without re-running t-SNE twice per column. Every row
-is coloured with the same continuous viridis spectrum (compute time just has
-a fixed 1..MAX_STEPS colour range, since it's bounded) and gets its own
-colourbar - a discrete per-value legend for compute time doesn't reuse the
-colourbar machinery already needed for hardness, and ends up harder to fit
-into a narrow margin than one more colourbar.
-
-Pure numpy/sklearn/matplotlib - no JAX/Flax/hydra/checkpoint restore needed.
-Reads `plot_data-lightsout.pkl`/`plot_data-slidingpuzzle.pkl`, produced by the
-"Export plot data for the standalone plotting scripts" cell near the end of
-each notebook - run that cell (in each notebook) at least once before running
-this script.
+"""Builds a 4x5 grid of 3D t-SNE plots of the actor's latent state after each
+Chain-of-Thought step (columns) for Lights Out and sliding puzzle (row pairs),
+coloured by compute time and by shortest-path hardness.
 """
 
 import pickle
@@ -82,15 +64,9 @@ def main():
         step_latents = env["step_latents"]  # (n, max_steps, hidden_dim)
         compute_time = env["tsne_sample_compute_time"]
         hardness = env["tsne_sample_hardness"]
-        # states_history keeps recomputing a "thought" for every example at
-        # every CoT step regardless of when it actually halted (see
-        # TransformerChainOfThoughtTorso's docstring) - those post-halt steps
-        # are a counterfactual continuation the real policy never acts on.
-        # Clamp each example's step index to its own compute_time instead, so
-        # column i shows the state after min(i, compute_time) real steps -
-        # frozen at whatever it was when that example actually halted, for
-        # every later column (column max_steps is then exactly final_state
-        # for every example, since compute_time <= max_steps always).
+        # states_history keeps recomputing a "thought" for every example at every CoT step
+        # regardless of when it actually halted (see TransformerChainOfThoughtTorso's docstring) -
+        # those post-halt steps are a counterfactual continuation the real policy never acts on.
         compute_time_int = np.rint(compute_time).astype(int)
         n = step_latents.shape[0]
         perplexity = perplexity_for(n)
@@ -167,12 +143,10 @@ def main():
             cbar.set_label("Hardness", fontsize=8)
         cbar.ax.tick_params(labelsize=7)
 
-    # Row labels via fig.text at each row's leftmost axis position, not
-    # ax.set_ylabel: on a 3D axes, set_ylabel places a rotated label *inside*
-    # the 3D box along its own y-axis (oriented by the current view angle),
-    # not a conventional row label on the left margin like it would for a 2D
-    # axes - it comes out diagonal and clipped against the next axes. Read
-    # positions after layout is final.
+    # Row labels via fig.text at each row's leftmost axis position, not ax.set_ylabel: on a 3D axes,
+    # set_ylabel places a rotated label *inside* the 3D box along its own y-axis (oriented by the
+    # current view angle), not a conventional row label on the left margin like it would for a 2D
+    # axes - it comes out diagonal and clipped against the next axes.
     for env_idx, env in enumerate(envs):
         for sub_row, coloured_by in [(0, "compute time"), (1, "hardness")]:
             row = 2 * env_idx + sub_row

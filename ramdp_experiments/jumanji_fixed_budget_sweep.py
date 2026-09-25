@@ -1,169 +1,11 @@
 #!/usr/bin/env python
 """Fixed-computation-budget sweep for RAMDP systems on Jumanji environments
-(env=jumanji/<env>), as a MinAtar replacement: sokoban, slidingtile
+(env=jumanji/<env>): sokoban, slidingtile
 (SlidingTilePuzzle), knapsack (Knapsack), maze (Maze) - see
 ramdp_experiments/experiments.md for why (MinAtar games are mostly reactive
 and don't obviously reward per-action "thinking"; these are combinatorial
 tasks with continuous difficulty knobs, closer in spirit to
 lightsout_fixed_budget_sweep.py).
-
-Companion to minatar_fixed_budget_sweep.py/lightsout_fixed_budget_sweep.py:
-instead of letting the actor's compute torso adaptively halt (min_steps=1,
-sampled/learned halting), every job here pins `min_steps == max_steps ==
-budget`, which - per the min_steps mechanism added to the compute torsos
-(see stoix/networks/torso_compute*.py) - forbids halting before `budget`
-steps and forces a halt at exactly `budget` steps. So every example always
-takes exactly `budget` steps of computation, with no adaptivity at all.
-
-This answers "does more computation help on this task?" directly (sweeping
-`budget`) and is also a simpler system to debug against, since compute_time
-is deterministic (== budget) rather than a learned/sampled quantity.
-
-Environments and their difficulty knobs (see stoix/configs/env/jumanji/*.yaml
-and each Jumanji env's own module docstring for the underlying reward/action
-spec):
-  - sokoban:     Sokoban-v0. Observation is a (10, 10, 2) grid (fixed +
-                 variable elements stacked as channels, already bundling
-                 everything needed - see stoix/configs/env/jumanji/sokoban.yaml).
-                 Action: DiscreteArray(4) (up/down/left/right). Reward: +1 per
-                 box newly placed on/off a target, +10 on solving, no per-step
-                 penalty - jumanji's default reward_fn (DenseReward) adds a
-                 constant -0.1/step on top of that, which rewards solving
-                 *fast* rather than just solving; sokoban.yaml/sokoban_grid.yaml
-                 override reward_fn to stoix.envs.sokoban.reward.
-                 DenseRewardNoStepPenalty to drop that term (see that module's
-                 docstring).
-                 Difficulty knob: --sokoban-generator - {default, toy, simple,
-                 unfiltered-train, medium-train, hard} - toy/simple are
-                 network-free tiny fixed levels (good for a pilot / debug
-                 run); unfiltered-train/medium-train/hard are increasingly
-                 hard tiers of DeepMind's Boxoban dataset, downloaded from
-                 HuggingFace Hub on first use (needs network access);
-                 "default" leaves env.kwargs.generator unset, i.e. whatever
-                 sokoban.yaml/the Sokoban class defaults to
-                 (HuggingFaceDeepMindGenerator "unfiltered-train").
-                 Supports CNN architectures (env=jumanji/sokoban_grid,
-                 already a 2-channel grid - no GridObservationWrapper
-                 needed).
-  - slidingtile: SlidingTilePuzzle-v0 (the N-puzzle - 3x3 is the 8-puzzle).
-                 Same puzzle family as Lights Out
-                 (stoix/envs/lightsout/lightsout_env.py), and - like Lights
-                 Out - a sparse terminal-only reward (1.0 on solving, 0.0
-                 otherwise): jumanji's own default here is DenseRewardFn
-                 (+1/-1 per tile that becomes newly correct/incorrect each
-                 step), overridden to SparseRewardFn in
-                 slidingtile.yaml/slidingtile_grid.yaml to match Lights Out's
-                 exploration difficulty instead of making it easier.
-                 Observation: the (N, N) `puzzle` grid alone (the blank
-                 tile's position is always recoverable from it - see
-                 stoix/configs/env/jumanji/slidingtile.yaml). Action:
-                 DiscreteArray(4) (move the blank up/right/down/left, fixed
-                 regardless of grid_size - unlike Lights Out, where the
-                 action count grows with grid_size). Difficulty knobs:
-                 --slidingtile-grid-size (N -> NxN puzzle) and
-                 --slidingtile-num-random-moves (scramble depth from the
-                 solved state - directly analogous to Lights Out's `dist`).
-                 Supports CNN architectures (env=jumanji/slidingtile_grid,
-                 via GridObservationWrapper adding a channel axis to `puzzle`
-                 - see stoix/wrappers/grid_observation.py).
-  - knapsack:    Knapsack-v1. Pick items (one per step) to pack into the bag,
-                 maximizing packed value without exceeding its capacity -
-                 each item packed at most once (0-1 knapsack). Weights/values
-                 are integers (stoix.envs.knapsack.generator.
-                 IntegerRandomGenerator, the classic textbook formulation,
-                 not jumanji's own continuous-[0,1]-weight RandomGenerator),
-                 and the bag's capacity is redrawn every episode from
-                 Uniform{1, ..., max_budget} rather than being one fixed
-                 constant - see stoix/configs/env/jumanji/knapsack.yaml.
-                 Dense reward (value of the item just packed). Observation:
-                 Knapsack's weights/values/packed_items/action_mask fields
-                 all matter together, so unlike sokoban/slidingtile there's
-                 no single attribute to extract - knapsack.yaml omits
-                 observation_attribute and instead uses
-                 stoix.wrappers.concat_observation.ConcatObservationWrapper
-                 to flatten every field into one vector (see
-                 stoix/utils/make_env.py). Action: DiscreteArray(num_items)
-                 (which item to pack next - so, unlike sokoban/slidingtile,
-                 the action count scales with difficulty). Difficulty knobs:
-                 --knapsack-num-items, --knapsack-max-weight,
-                 --knapsack-max-value, --knapsack-max-budget. No CNN variant
-                 (no spatial structure).
-  - maze:        Maze-v0. Navigate from a start cell to a target cell.
-                 Sparse reward (1.0 on reaching the target, 0.0 otherwise).
-                 Observation: agent_position/target_position/walls/
-                 action_mask all matter together (same reasoning as
-                 knapsack) - stoix/configs/env/jumanji/maze.yaml also uses
-                 ConcatObservationWrapper, flattening the nested
-                 `Position(row, col)` NamedTuples too. Action: DiscreteArray(4)
-                 (up/right/down/left; invalid moves - into a wall - are a
-                 no-op). Difficulty knob: --maze-size (num_rows == num_cols).
-                 Supports CNN architectures (env=jumanji/maze_grid): walls
-                 alone isn't a sufficient CNN input (see maze.yaml), so
-                 MazeGridObservationWrapper stacks walls plus one-hot
-                 agent/target positions into a 3-channel grid instead of
-                 dropping them - see stoix/wrappers/maze_grid.py.
-
-Grid axes shared with lightsout_fixed_budget_sweep.py/
-minatar_fixed_budget_sweep.py (see those scripts' docstrings for the full
-system/architecture/PPO-knob descriptions, reproduced here only where this
-script's behavior differs):
-  - env:          jumanji env (env=jumanji/<env>) - subset of JUMANJI_ENVS.
-  - <env>-specific difficulty knobs (see above) - swept independently per
-    env (an axis that doesn't apply to a given env, e.g.
-    --slidingtile-grid-size for a knapsack job, is simply not part of that
-    job's grid - see build_grid()).
-  - system, architecture, budget, hidden_dim, lr, critic_lr, delightful,
-    delightful_eta, epochs, num_minibatches, clip_eps, clip_value_loss,
-    recompute_advantages, critic_before_actor, use_layer_norm, use_input_layer_norm, num_layers,
-    num_heads, mlp_dim, qkv_dim,
-    vocab_size, use_latent_feedback, seed: identical semantics to minatar_fixed_budget_sweep.py,
-    including its
-    five ff_ppo_explicit_* systems (explicit chain-of-thought PPO, trains
-    stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py) and its
-    transformer_explicit_cot/cnn+transformer_explicit_cot architectures (see
-    EXPLICIT_COT_ARCHES/EXPLICIT_COT_SYSTEMS). CNN architectures (including
-    cnn+transformer_explicit_cot) are only valid for env in
-    {sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requesting one for
-    knapsack (no spatial structure) is skipped (not errored), same as
-    requesting an explicit-CoT architecture for a system outside
-    EXPLICIT_COT_SYSTEMS.
-  - qv_critic (--qv-critic, default sweeps both): "shared" or "separate" -
-    whether the Q-V critic's V(s)/Q(s,a,c) heads share one torso or each get
-    their own independently-initialised torso (see QAC_SYSTEMS/
-    QV_CRITIC_CHOICES/Job.command()'s `_qv_network_name`). Only applies to
-    systems with a genuine Q-V critic (every system in SYSTEM_TO_QAC_VARIANT
-    except the "reinforce" variants) - not swept, and omitted from the
-    command/group_tag, for ff_reinforce/ff_ppo_reinforce/
-    ff_ppo_explicit_reinforce (V-only critic).
-  - standardize_advantages: system.standardize_advantages - whether the advantage
-    (Q - V or G - V, depending on qac_variant) is standardized (zero mean, unit
-    variance) across the rollout before being used in the PPO clipped surrogate.
-    ff_ppo_* systems only, see epochs. Unlike the other PPO knobs above, not
-    present in minatar_fixed_budget_sweep.py/lightsout_fixed_budget_sweep.py
-    (added here, mirroring lightsout_sweep.py/jumanji_sweep.py).
-  - gae_lambda:   system.gae_lambda - GAE(lambda) mixing parameter for the critic's
-    regression target (targets/g_targets). 1.0 (the yaml default) recovers the
-    original to-the-end Monte-Carlo return exactly; <1.0 blends in earlier
-    bootstrapped value estimates for a lower-variance, more-biased target.
-    Applies regardless of qac_variant: for the four Q-V variants it only affects
-    what trains V/Q, since their advantage is Q(s,a,c) - V(s) either way; for
-    "reinforce", whose advantage is targets - V(s), this makes the advantage
-    itself GAE(lambda) - see stoix/systems/ramdp_vpg/ff_ppo.py's module
-    docstring. ff_ppo_* systems only, see epochs. Like standardize_advantages
-    above, not present in minatar_fixed_budget_sweep.py.
-
-gamma defaults to 0.99 (system.gamma, applied to every job, not swept):
-every one of these envs has an episode horizon well under a few hundred
-steps (sokoban's 120-step time_limit is the longest), much shorter than
-MinAtar's thousands-of-steps episodes (gamma=0.9999 there) - closer to
-Lights Out's short-episode regime. total_timesteps defaults to 2e7 (a
-reduced sweep budget), matching the other fixed-budget sweep scripts.
-
-Jobs are scheduled across GPUs with a fixed number of concurrent runs per
-GPU (a GPU "slot" queue + thread pool), each run pinned via
-CUDA_VISIBLE_DEVICES and logged to its own file under <output-dir>/logs/ -
-identical mechanism to lightsout_fixed_budget_sweep.py/
-minatar_fixed_budget_sweep.py.
 
 Usage:
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --dry-run                # preview the grid
@@ -181,18 +23,18 @@ Usage:
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs maze --maze-size 5,10,15  # maze-size sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --architectures cnn+mlp,cnn+transformer \\
       --envs sokoban,slidingtile,maze  # CNN-input sweep (sokoban/slidingtile/maze, via jumanji/*_grid)
-  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac,ff_ppo_naive,ff_ppo_reinforce \\
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
       --epochs 4 --num-minibatches 8,16 --clip-eps 0.1,0.2                 # PPO sweep
-  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac \\
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
       --standardize-advantages true,false                 # sweep PPO advantage standardization
-  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_fac \\
+  python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
       --gae-lambda 0.9,0.95,1.0                    # sweep GAE(lambda)
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs sokoban,slidingtile,maze \\
-      --systems ff_ppo_explicit_fac --architectures cnn+transformer_explicit_cot  # CNN-input explicit-CoT sweep
+      --systems ff_ppo_explicit_reinforce --architectures cnn+transformer_explicit_cot_merged  # CNN-input explicit-CoT sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py \\
-      --systems ff_ppo_explicit_fac,ff_ppo_explicit_reinforce   # explicit-CoT PPO sweep (flattened obs)
+      --systems ff_ppo_explicit_reinforce   # explicit-CoT PPO sweep (flattened obs)
 """
 
 from __future__ import annotations
@@ -214,109 +56,27 @@ from typing import List, Tuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SYSTEM_TO_SCRIPT = {
-    "ff_reinforce": "stoix/systems/ramdp_vpg/ff_reinforce.py",
-    "ff_qac_fac": "stoix/systems/ramdp_vpg/ff_qac.py",
-    "ff_qac_naive": "stoix/systems/ramdp_vpg/ff_qac.py",
-    "ff_ppo_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
-    "ff_ppo_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
-    "ff_ppo_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo.py",
-    "ff_ppo_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo.py",
     "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
-    # Explicit-CoT PPO (TransformerExplicitCoTTorso instead of a latent-CoT
-    # torso) - one system per qac_variant, mirroring ff_ppo_fac/ff_ppo_naive/
-    # ff_ppo_cond_naive/ff_ppo_cond_fac/ff_ppo_reinforce above. Architecture
-    # defaults to transformer_explicit_cot (flattened observation) unless
-    # --architectures requests transformer_explicit_cot/
-    # cnn+transformer_explicit_cot explicitly - see EXPLICIT_COT_ARCHES/build_grid.
-    "ff_ppo_explicit_fac": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
-    "ff_ppo_explicit_naive": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
-    "ff_ppo_explicit_cond_naive": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
-    "ff_ppo_explicit_cond_fac": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
+    # Explicit-CoT PPO (TransformerMergedActionCoTTorso instead of a latent-CoT torso): the halting
+    # decision and the environment action are the same draw from one vocabulary - see
+    # stoix/networks/torso_compute_explicit_cot_merged.py.
     "ff_ppo_explicit_reinforce": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
 }
-SYSTEM_TO_QAC_VARIANT = {
-    "ff_qac_fac": "fac",
-    "ff_qac_naive": "naive",
-    "ff_ppo_fac": "fac",
-    "ff_ppo_naive": "naive",
-    "ff_ppo_cond_naive": "cond_naive",
-    "ff_ppo_cond_fac": "cond_fac",
-    "ff_ppo_reinforce": "reinforce",
-    "ff_ppo_explicit_fac": "fac",
-    "ff_ppo_explicit_naive": "naive",
-    "ff_ppo_explicit_cond_naive": "cond_naive",
-    "ff_ppo_explicit_cond_fac": "cond_fac",
-    "ff_ppo_explicit_reinforce": "reinforce",
-}
 PPO_SYSTEMS = (
-    "ff_ppo_fac",
-    "ff_ppo_naive",
-    "ff_ppo_cond_naive",
-    "ff_ppo_cond_fac",
     "ff_ppo_reinforce",
-    "ff_ppo_explicit_fac",
-    "ff_ppo_explicit_naive",
-    "ff_ppo_explicit_cond_naive",
-    "ff_ppo_explicit_cond_fac",
     "ff_ppo_explicit_reinforce",
 )
-# ff_ppo_explicit_* systems whose architecture defaults to
-# transformer_explicit_cot (flattened observation) rather than being picked
-# via --architectures, unless --architectures requests one of
-# EXPLICIT_COT_ARCHES explicitly (e.g. cnn+transformer_explicit_cot) - see
-# build_grid.
-EXPLICIT_COT_PPO_SYSTEMS = (
-    "ff_ppo_explicit_fac",
-    "ff_ppo_explicit_naive",
-    "ff_ppo_explicit_cond_naive",
-    "ff_ppo_explicit_cond_fac",
-    "ff_ppo_explicit_reinforce",
-)
-# PPO_SYSTEMS minus EXPLICIT_COT_PPO_SYSTEMS: the systems trained by
-# ff_ppo.py (implicit/latent CoT) rather than ff_ppo_explicit_cot.py. Only
-# these have a system.latent_kl_coef knob (see stoix/configs/system/ramdp_vpg/
-# ff_ppo.yaml) - an optional trust-region penalty on how far the actor
-# torso's per-step "thought" states (a continuous latent, unlike explicit
-# CoT's discrete tokens) are allowed to drift across a PPO update; see
-# ff_ppo.py's module docstring. ff_ppo_explicit_cot.py's system config has no
-# such knob (its "thoughts" are discrete tokens, already covered by its own
-# per-token PPO clip), so --latent-kl-coef is forced to its first value (and
-# omitted from the command) for EXPLICIT_COT_PPO_SYSTEMS, same as every
-# non-PPO system - see build_grid()/Job.command().
+# Explicit-CoT systems whose architecture defaults to
+# transformer_explicit_cot_merged (flattened observation) rather than being
+# picked via --architectures, unless --architectures requests one of
+# EXPLICIT_COT_ARCHES explicitly (e.g. cnn+transformer_explicit_cot_merged) -
+# see build_grid.
+EXPLICIT_COT_PPO_SYSTEMS = ("ff_ppo_explicit_reinforce",)
+# PPO_SYSTEMS minus EXPLICIT_COT_PPO_SYSTEMS: the systems trained by ff_ppo.py (implicit/latent CoT)
+# rather than ff_ppo_explicit_cot.py.
 LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_PPO_SYSTEMS)
-# Every system with a genuine Q-V critic (a q_head alongside value_head),
-# i.e. every key of SYSTEM_TO_QAC_VARIANT except the "reinforce" variants
-# (ff_ppo_reinforce/ff_ppo_explicit_reinforce use a plain V-only critic, see
-# SYSTEM_TO_QAC_VARIANT) - covers both the non-explicit-CoT systems
-# (ff_qac_fac/ff_qac_naive/ff_ppo_fac/ff_ppo_naive/ff_ppo_cond_naive/
-# ff_ppo_cond_fac) and the four ff_ppo_explicit_* QAC systems. Only these
-# have a shared-vs-separate-torso choice at all (see QV_CRITIC_CHOICES/
-# Job.qv_critic below) - every network in ARCH_TO_NETWORK/
-# EXPLICIT_COT_NETWORK_BY_SYSTEM for these systems is a *shared*-torso base
-# name (matching stoix.networks.base_qac.ValueAndQCritic);
-# `_qv_network_name` appends "_separate_qv" to switch to the separate-torso
-# SeparateValueAndQCritic variant (see
-# stoix/configs/network/*_qac_separate_qv.yaml) when Job.qv_critic ==
-# "separate". Used in Job.command() to also target the right critic network
-# override keys for CNN architectures.
-QAC_SYSTEMS = tuple(
-    system for system, variant in SYSTEM_TO_QAC_VARIANT.items() if variant != "reinforce"
-)
-QV_CRITIC_CHOICES = ("shared", "separate")
-QV_CRITIC_SHORT = {"shared": "sharedqv", "separate": "sepqv"}
-
-
-def _qv_network_name(base_network: str, system: str, qv_critic: str) -> str:
-    """`base_network` is always a shared-torso (ValueAndQCritic) network name
-    - append "_separate_qv" to switch to the separate-torso
-    (SeparateValueAndQCritic) variant, only meaningful (and only ever
-    requested, see build_grid's forcing of qv_critic for non-QAC systems)
-    for `system in QAC_SYSTEMS`."""
-    if system in QAC_SYSTEMS and qv_critic == "separate":
-        return f"{base_network}_separate_qv"
-    return base_network
 ARCH_TO_NETWORK = {
-    "ff_reinforce": {
+    "ff_ppo_reinforce": {
         "mlp": "mlp_compute",
         "transformer": "transformer_compute",
         "gru": "gru_compute",
@@ -326,88 +86,34 @@ ARCH_TO_NETWORK = {
         "cnn+gru": "cnn_gru_compute",
         "cnn+iru": "cnn_iru_compute",
     },
-    "ff_qac_fac": {
-        "mlp": "mlp_compute_qac",
-        "transformer": "transformer_compute_qac",
-        "gru": "gru_compute_qac",
-        "iru": "iru_compute_qac",
-        "cnn+mlp": "cnn_mlp_compute_qac",
-        "cnn+transformer": "cnn_transformer_compute_qac",
-        "cnn+gru": "cnn_gru_compute_qac",
-        "cnn+iru": "cnn_iru_compute_qac",
-    },
-    "ff_qac_naive": {
-        "mlp": "mlp_compute_qac",
-        "transformer": "transformer_compute_qac",
-        "gru": "gru_compute_qac",
-        "iru": "iru_compute_qac",
-        "cnn+mlp": "cnn_mlp_compute_qac",
-        "cnn+transformer": "cnn_transformer_compute_qac",
-        "cnn+gru": "cnn_gru_compute_qac",
-        "cnn+iru": "cnn_iru_compute_qac",
-    },
 }
-ARCH_TO_NETWORK["ff_ppo_fac"] = ARCH_TO_NETWORK["ff_qac_fac"]
-ARCH_TO_NETWORK["ff_ppo_naive"] = ARCH_TO_NETWORK["ff_qac_naive"]
-ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_fac"]
-ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
-ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
 NO_LAYER_NORM_ARCHES = ("transformer", "cnn+transformer", "gru", "cnn+gru", "iru", "cnn+iru")
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
 
-# TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
-# doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
-# it's only trained by a dedicated script per system (ff_ppo_explicit_cot.py
-# for ff_ppo_explicit_*), not the plain ff_ppo.py, so it's handled separately.
-# Two architectures use it: transformer_explicit_cot (flattened observation)
-# and cnn+transformer_explicit_cot (CNNTorso input_layer feeding the same
-# torso, see cnn_transformer_explicit_cot*.yaml) - both listed in
-# CNN_ARCHES/below so the CNN-vs-flatten observation handling in
-# Job.command() applies uniformly.
-EXPLICIT_COT_ARCH = "transformer_explicit_cot"
-CNN_EXPLICIT_COT_ARCH = "cnn+transformer_explicit_cot"
+# TransformerMergedActionCoTTorso (see stoix/networks/torso_compute_explicit_cot_merged.py) doesn't
+# fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup: it's only trained by
+# ff_ppo_explicit_cot.py, not the plain ff_ppo.py, so it's handled separately.
+EXPLICIT_COT_ARCH = "transformer_explicit_cot_merged"
+CNN_EXPLICIT_COT_ARCH = "cnn+transformer_explicit_cot_merged"
 EXPLICIT_COT_ARCHES = (EXPLICIT_COT_ARCH, CNN_EXPLICIT_COT_ARCH)
 EXPLICIT_COT_SCRIPT_BY_SYSTEM = {
     system: "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py" for system in EXPLICIT_COT_PPO_SYSTEMS
 }
-# Network name depends on both system (which qac_variant, or plain V-only for
-# ff_ppo_explicit_reinforce) and arch (flattened observation vs CNN input) -
-# nested the same way ARCH_TO_NETWORK is. Every value here is a shared-torso
-# base name - ff_ppo_explicit_fac/naive/cond_naive/cond_fac (in QAC_SYSTEMS)
-# go through `_qv_network_name` in Job.command() to optionally switch to the
-# separate-torso variant (Job.qv_critic == "separate");
-# ff_ppo_explicit_reinforce uses the plain V-only network unconditionally (no
-# Q-V choice at all, see QAC_SYSTEMS) - see ff_ppo_explicit_cot.py's
-# learner_setup.
+# Network name by arch (flattened observation vs CNN input) - nested the same
+# way ARCH_TO_NETWORK is. Plain V-only critic.
 EXPLICIT_COT_NETWORK_BY_SYSTEM = {
-    "ff_ppo_explicit_fac": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
-    },
-    "ff_ppo_explicit_naive": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
-    },
-    "ff_ppo_explicit_cond_naive": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
-    },
-    "ff_ppo_explicit_cond_fac": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_qac",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_qac",
-    },
     "ff_ppo_explicit_reinforce": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot",
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot_merged",
+        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_merged",
     },
 }
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru", CNN_EXPLICIT_COT_ARCH)
 VALID_ARCHITECTURES = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
 # Short forms for group_tag/run_name (wandb group names get long fast):
-# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
+# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot_merged"
 # -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
@@ -423,7 +129,7 @@ SOKOBAN_TAG_SHORT = {"unfiltered-train": "unfilt-train", "medium-train": "med-tr
 # characters - Job.group_tag_parts enforces this (with room held back for
 # run_name's "-seed_N" suffix, see _SEED_SUFFIX_RESERVE), rather than
 # leaving it to come out under the limit by luck: a handful of extra flags
-# (weight decay, delightful, latent_kl_coef, ...) stacked on top of a
+# (weight decay, latent_kl_coef, ...) stacked on top of a
 # transformer/explicit-CoT run's already-long net/ppo segments can push the
 # un-capped tag past 128.
 MAX_GROUP_TAG_LEN = 128
@@ -471,35 +177,12 @@ ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.it
 # override lightsout/minatar-style jobs use, which would conflict.
 ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": True, "maze": True}
 
-# Per-env CNN architecture - env-specific rather than one shared CNN, since
-# the three CNN-capable envs (see ENV_SUPPORTS_CNN) differ substantially in
-# per-cell channel semantics:
-#   - sokoban:     fixed 10x10 grid, 2 channels bundling walls/boxes/targets/
-#                  player (see stoix/configs/env/jumanji/sokoban_grid.yaml) -
-#                  the richest per-cell semantics of the three, so gets the
-#                  deepest conv stack and widest MLPs (matches
-#                  cnn_mlp_compute.yaml's own defaults throughout).
-#   - slidingtile: small grid (--slidingtile-grid-size, typically 3-5), a
-#                  single channel (tile id, see slidingtile_grid.yaml) - the
-#                  smallest stack/MLPs of the three is enough.
-#   - maze:        --maze-size grid, 3 channels (walls plus one-hot
-#                  agent/target positions, see stoix/wrappers/maze_grid.py) -
-#                  a 2-layer conv stack gives the larger receptive field
-#                  useful for reasoning about paths around walls, with MLPs
-#                  between sokoban's and slidingtile's.
-# nn.Conv uses SAME padding (see stoix/networks/torso.py CNNTorso), so
-# stacking multiple stride-1 layers never shrinks the grid below the kernel
-# size - safe even for slidingtile/maze's smallest configured grid sizes.
-#
-# `hidden_sizes` is the actor input_layer's post-conv MLP (replaces the old
-# hidden_dim-driven value - the CNN's output width is now fixed per env
-# rather than tracking the --hidden-dim sweep, which still separately
-# controls the compute torso's own pondering width via
-# network.actor_network.pre_torso.hidden_dim). `critic_hidden_sizes` is the
-# analogous post-conv MLP on the critic's input_layer(s), and
-# `critic_layer_sizes` is the critic's pre_torso.layer_sizes (or
-# value_pre_torso/q_pre_torso.layer_sizes for the separate-torso Q-V critic,
-# see QAC_SYSTEMS/Job.qv_critic) - the MLP that follows the CNN embedding.
+# Per-env CNN architecture - env-specific rather than one shared CNN, since the three CNN-capable
+# envs (see ENV_SUPPORTS_CNN) differ substantially in per-cell channel semantics: - sokoban: fixed
+# 10x10 grid, 2 channels bundling walls/boxes/targets/ player (see
+# stoix/configs/env/jumanji/sokoban_grid.yaml) - the richest per-cell semantics of the three, so
+# gets the deepest conv stack and widest MLPs (matches cnn_mlp_compute.yaml's own defaults
+# throughout).
 ENV_CNN_ARCH = {
     # "sokoban": {
     #     "channel_sizes": (128, 128),
@@ -590,7 +273,7 @@ SOKOBAN_EVAL_GENERATOR_CHOICES = (
 )
 
 SERVER_MODULES = {
-    "vulcan": ["StdEnv/2023", "cuda/12.2"],
+    "slurm": ["StdEnv/2023", "cuda/12.2"],
 }
 
 
@@ -644,21 +327,9 @@ def _sokoban_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
 
 
 def _slidingtile_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
-    # --slidingtile-time-limit: None (default) leaves env.kwargs.time_limit at
-    # the yaml value (no tag, so run names match pre-flag sweeps); otherwise
-    # each value is swept and overrides the train (and, unless
-    # --slidingtile-eval-time-limit is set, eval) env's time_limit.
-    #
-    # --slidingtile-eval-time-limit: 'same' (default) leaves env.eval_kwargs
-    # untouched, so the eval env's episode length matches the train env's
-    # (env.kwargs.time_limit, see jumanji/slidingtile.yaml/slidingtile_grid.
-    # yaml) - any other value overrides just the eval env's time_limit, the
-    # same env.eval_kwargs mechanism _sokoban_generator_overrides uses (see
-    # stoix/utils/make_env.py's make_jumanji_env).
-    #
-    # --slidingtile-eval-num-random-moves: same mechanism for the eval env's
-    # scramble depth. eval_kwargs replaces `generator` wholesale (not
-    # key-by-key), so the full generator (_target_ + grid_size) is restated.
+    # --slidingtile-time-limit: None (default) leaves env.kwargs.time_limit at the yaml value (no
+    # tag, so run names match pre-flag sweeps); otherwise each value is swept and overrides the
+    # train (and, unless --slidingtile-eval-time-limit is set, eval) env's time_limit.
     eval_time_limit = args.slidingtile_eval_time_limit
     eval_nrm = args.slidingtile_eval_num_random_moves
     eval_overrides = ()
@@ -698,12 +369,10 @@ def _slidingtile_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty
 
 def _knapsack_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
     # Item weights are integers in {1, ..., max_weight} (see
-    # stoix.envs.knapsack.generator.IntegerRandomGenerator), so the maximum
-    # possible total weight is num_items * max_weight - if max_budget is at
-    # least that, the top of the per-episode budget draw (Uniform{1, ...,
-    # max_budget}) can always fit every item, making the hardest episodes in
-    # that combo trivial. Skip those combos, same spirit as the old
-    # continuous-weight num_items < total_budget check.
+    # stoix.envs.knapsack.generator.IntegerRandomGenerator), so the maximum possible total weight is
+    # num_items * max_weight - if max_budget is at least that, the top of the per-episode budget
+    # draw (Uniform{1, ..., max_budget}) can always fit every item, making the hardest episodes in
+    # that combo trivial.
     combos = [
         EnvDifficulty(
             tag=f"ni{ni}-mw{mw}-mv{mv}-mb{mb}",
@@ -771,8 +440,6 @@ class Job:
     critic_weight_decay: float
     ent_coef: float
     max_grad_norm: float
-    delightful: bool
-    delightful_eta: float
     epochs: int
     num_minibatches: int
     clip_eps: float
@@ -798,7 +465,6 @@ class Job:
     use_latent_feedback: bool
     use_sandwich_norm: bool
     use_rmsnorm: bool
-    qv_critic: str
     seed: int
     total_timesteps: float
     total_num_envs: int
@@ -810,22 +476,8 @@ class Job:
 
     @property
     def group_tag_parts(self) -> List[str]:
-        """The group tag broken into semantic chunks - env/difficulty, algo,
-        budget, gamma, network hparams, PPO hparams, misc flags - instead of
-        one flat dash-joined string. Includes gamma even though it's fixed
-        (not swept) per invocation - see the `gamma` field/--gamma - so two
-        separate sweep runs launched with different --gamma still get
-        distinct group tags/run_names/output dirs (and a distinct hash from
-        _cap_tag_length once truncated), instead of silently colliding.
-        `group_tag` still joins these with "-" for run_name/filenames/manifest
-        (unchanged, filesystem-safe); the parts list is for
-        `logger.loggers.wandb.group_tag`, which Neptune stores as a real list
-        of tags (see stoix/utils/logger.py) so each axis stays independently
-        filterable instead of buried in one long string. Capped at
-        MAX_GROUP_TAG_LEN (see _cap_tag_length) so a config with several
-        optional flags set at once can't silently exceed W&B's 128-char
-        group-field limit.
-        """
+        """The group tag broken into semantic chunks - env/difficulty, algo, budget, gamma,
+        network hparams, PPO hparams, misc flags - instead of one flat dash-joined string."""
         system_short = (
             self.system.removeprefix("ff_").replace("explicit", "expl").replace("reinforce", "reinf")
         )
@@ -849,33 +501,26 @@ class Job:
         # any other architecture, see EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
             net += f"-vs{self.vocab_size}"
-        # Only shown for systems with a genuine Q-V critic - meaningless for
-        # the "reinforce" (V-only) systems, see QAC_SYSTEMS/QV_CRITIC_SHORT.
-        if self.system in QAC_SYSTEMS:
-            net += f"-{QV_CRITIC_SHORT[self.qv_critic]}"
         parts.append(net)
 
-        if self.system in PPO_SYSTEMS:
-            ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
-            if self.gae_lambda != 1.0:
-                ppo += f"-gae{self.gae_lambda:g}"
-            if not self.clip_value_loss:
-                ppo += "-l2c"
-            if self.standardize_advantages:
-                ppo += "-stdadv"
-            if self.recompute_advantages:
-                ppo += "-radv"
-            if self.critic_before_actor:
-                ppo += "-cba"
-            if self.use_dpo_loss:
-                ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
-            if self.use_expectile_value_loss:
-                ppo += f"-iql{self.expectile:g}"
-            parts.append(ppo)
+        ppo = f"ep{self.epochs}-mb{self.num_minibatches}-clip{self.clip_eps:g}"
+        if self.gae_lambda != 1.0:
+            ppo += f"-gae{self.gae_lambda:g}"
+        if not self.clip_value_loss:
+            ppo += "-l2c"
+        if self.standardize_advantages:
+            ppo += "-stdadv"
+        if self.recompute_advantages:
+            ppo += "-radv"
+        if self.critic_before_actor:
+            ppo += "-cba"
+        if self.use_dpo_loss:
+            ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
+        if self.use_expectile_value_loss:
+            ppo += f"-iql{self.expectile:g}"
+        parts.append(ppo)
 
         extra = []
-        if self.delightful:
-            extra.append(f"deta{self.delightful_eta:g}")
         if self.latent_kl_coef:
             extra.append(f"lkl{self.latent_kl_coef:g}")
         if not self.clip_halting_head:
@@ -910,11 +555,10 @@ class Job:
     def command(self, python_bin: str) -> List[str]:
         if self.arch in EXPLICIT_COT_ARCHES:
             script = EXPLICIT_COT_SCRIPT_BY_SYSTEM[self.system]
-            base_network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system][self.arch]
+            network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system][self.arch]
         else:
             script = SYSTEM_TO_SCRIPT[self.system]
-            base_network = ARCH_TO_NETWORK[self.system][self.arch]
-        network = _qv_network_name(base_network, self.system, self.qv_critic)
+            network = ARCH_TO_NETWORK[self.system][self.arch]
         is_cnn = self.arch in CNN_ARCHES
         flat_scenario, grid_scenario = ENV_SCENARIOS[self.env]
         if is_cnn:
@@ -951,51 +595,46 @@ class Job:
         ]
         cmd.extend(self.difficulty.overrides)
 
-        if self.system in PPO_SYSTEMS:
-            cmd.append(f"system.epochs={self.epochs}")
-            cmd.append(f"system.num_minibatches={self.num_minibatches}")
-            cmd.append(f"system.clip_eps={self.clip_eps:g}")
-            cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
-            cmd.append(f"system.gae_lambda={self.gae_lambda:g}")
-            cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
-            cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
-            cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
-            if self.system in LATENT_KL_PPO_SYSTEMS:
-                # Latent trust-region penalty - ff_ppo.py (implicit CoT)
-                # only, see LATENT_KL_PPO_SYSTEMS.
-                cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
-            if self.system in LATENT_KL_PPO_SYSTEMS and self.arch in TRANSFORMER_ARCHES:
-                # Whether the halting head's own params are exempt from actor
-                # gradient clipping - only meaningful for the transformer
-                # implicit-CoT torso's separately-named HaltingHead submodule
-                # (see ff_ppo.py's _label_actor_params_by_halting_head), so
-                # gated the same as latent_kl_coef above plus TRANSFORMER_ARCHES.
-                cmd.append(f"system.clip_halting_head={self.clip_halting_head}")
-            # Discovered Policy Optimisation actor surrogate - both ff_ppo.py's
-            # own systems and ff_ppo_explicit_* (unlike latent_kl_coef above,
-            # which only exists on ff_ppo.py's continuous "thought" states) -
-            # see stoix/utils/loss.py's dpo_loss/dpo_surrogate and
-            # ff_ppo.py's/ff_ppo_explicit_cot.py's module docstrings.
-            cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
-            cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
-            cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
-            # Expectile regression for V's loss only (never Q) - both
-            # ff_ppo.py's own systems and ff_ppo_explicit_* (unlike
-            # latent_kl_coef above, same applicability as use_dpo_loss) -
-            # see stoix/utils/loss.py's expectile_loss and ff_ppo.py's/
-            # ff_ppo_explicit_cot.py's module docstrings.
-            cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
-            cmd.append(f"system.expectile={self.expectile:g}")
-        else:
-            cmd.append(f"system.delightful={self.delightful}")
+        cmd.append(f"system.epochs={self.epochs}")
+        cmd.append(f"system.num_minibatches={self.num_minibatches}")
+        cmd.append(f"system.clip_eps={self.clip_eps:g}")
+        cmd.append(f"system.clip_value_loss={self.clip_value_loss}")
+        cmd.append(f"system.gae_lambda={self.gae_lambda:g}")
+        cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
+        cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
+        cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
+        if self.system in LATENT_KL_PPO_SYSTEMS:
+            # Latent trust-region penalty - ff_ppo.py (implicit CoT)
+            # only, see LATENT_KL_PPO_SYSTEMS.
+            cmd.append(f"system.latent_kl_coef={self.latent_kl_coef:g}")
+        if self.system in LATENT_KL_PPO_SYSTEMS and self.arch in TRANSFORMER_ARCHES:
+            # Whether the halting head's own params are exempt from actor
+            # gradient clipping - only meaningful for the transformer
+            # implicit-CoT torso's separately-named HaltingHead submodule
+            # (see ff_ppo.py's _label_actor_params_by_halting_head), so
+            # gated the same as latent_kl_coef above plus TRANSFORMER_ARCHES.
+            cmd.append(f"system.clip_halting_head={self.clip_halting_head}")
+        # Discovered Policy Optimisation actor surrogate - both ff_ppo.py's
+        # own systems and ff_ppo_explicit_* (unlike latent_kl_coef above,
+        # which only exists on ff_ppo.py's continuous "thought" states) -
+        # see stoix/utils/loss.py's dpo_loss/dpo_surrogate and
+        # ff_ppo.py's/ff_ppo_explicit_cot.py's module docstrings.
+        cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
+        cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
+        cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
+        # Expectile regression for V's loss - both
+        # ff_ppo.py's own systems and ff_ppo_explicit_* (unlike
+        # latent_kl_coef above, same applicability as use_dpo_loss) -
+        # see stoix/utils/loss.py's expectile_loss and ff_ppo.py's/
+        # ff_ppo_explicit_cot.py's module docstrings.
+        cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
+        cmd.append(f"system.expectile={self.expectile:g}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
             if self.qkv_dim:
                 # Decouples the Q/K/V projection width from hidden_dim - see
-                # stoix/networks/torso_compute_transformer.py's TransformerBlock
-                # docstring. 0 (unset) omits the override entirely so the torso
-                # falls back to its own qkv_dim == hidden_dim default.
+                # stoix/networks/torso_compute_transformer.py's TransformerBlock docstring.
                 cmd.append(f"++network.actor_network.pre_torso.qkv_dim={self.qkv_dim}")
             # Sandwich LayerNorm placement / RMSNorm instead of LayerNorm - every
             # TransformerBlock-based torso only, same applicability as num_heads/
@@ -1006,11 +645,11 @@ class Job:
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
         if self.arch in EXPLICIT_COT_ARCHES:
-            # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
+            # Thought-token vocabulary size - TransformerMergedActionCoTTorso only,
             # no other architecture has this param.
             cmd.append(f"++network.actor_network.pre_torso.vocab_size={self.vocab_size}")
             # Latent feedback decoding (Full-Bandwidth Transformer, arXiv:2608.08888) -
-            # TransformerExplicitCoTTorso only, see stoix/networks/torso_compute_explicit_cot.py.
+            # TransformerMergedActionCoTTorso only, see stoix/networks/torso_compute_explicit_cot_merged.py.
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
@@ -1023,17 +662,15 @@ class Job:
             # which breaks WandBLogger's "_".join(group_tag).
             quoted_parts = ",".join(f"'{part}'" for part in self.group_tag_parts)
             cmd.append(f"logger.loggers.wandb.group_tag=[{quoted_parts}]")
-        if self.delightful:
-            cmd.append(f"system.delightful_eta={self.delightful_eta:g}")
         # `++` (override-or-add), not `=`: not every network yaml declares
         # use_layer_norm/use_input_layer_norm explicitly, so a plain `=`
         # override can fail with "Key not in struct" for some (system, arch)
         # combos - matches lightsout_fixed_budget_sweep.py/jumanji_sweep.py.
         if self.arch in EXPLICIT_COT_ARCHES or self.arch in NO_LAYER_NORM_ARCHES:
-            # TransformerExplicitCoTTorso only has use_input_layer_norm, not
+            # TransformerMergedActionCoTTorso only has use_input_layer_norm, not
             # use_layer_norm, same as TransformerChainOfThoughtTorso/
             # GRUAdaptiveComputationTimeTorso/IRUAdaptiveComputationTimeTorso
-            # (see stoix/networks/torso_compute_explicit_cot.py and
+            # (see stoix/networks/torso_compute_explicit_cot_merged.py and
             # stoix/networks/torso_compute_transformer.py).
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
@@ -1043,8 +680,6 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
-        if self.system in SYSTEM_TO_QAC_VARIANT:
-            cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
 
         if is_cnn:
             cnn_arch = ENV_CNN_ARCH[self.env]
@@ -1064,25 +699,11 @@ class Job:
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[{kernel_sizes}]")
             cmd.append(f"network.actor_network.input_layer.strides=[{strides}]")
             cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{hidden_sizes}]")
-            if self.system in QAC_SYSTEMS and self.qv_critic == "separate":
-                # Separate-torso Q-V critic (value_input_layer/q_input_layer +
-                # value_pre_torso/q_pre_torso), not a single input_layer/pre_torso.
-                for head in ("value", "q"):
-                    cmd.append(f"network.critic_network.{head}_input_layer.channel_sizes=[{critic_channel_sizes}]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.kernel_sizes=[{critic_kernel_sizes}]")
-                    cmd.append(f"network.critic_network.{head}_input_layer.strides=[{critic_strides}]")
-                    cmd.append(
-                        f"network.critic_network.{head}_input_layer.hidden_sizes=[{critic_hidden_sizes}]"
-                    )
-                    cmd.append(
-                        f"network.critic_network.{head}_pre_torso.layer_sizes=[{critic_layer_sizes}]"
-                    )
-            else:
-                cmd.append(f"network.critic_network.input_layer.channel_sizes=[{critic_channel_sizes}]")
-                cmd.append(f"network.critic_network.input_layer.kernel_sizes=[{critic_kernel_sizes}]")
-                cmd.append(f"network.critic_network.input_layer.strides=[{critic_strides}]")
-                cmd.append(f"network.critic_network.input_layer.hidden_sizes=[{critic_hidden_sizes}]")
-                cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{critic_layer_sizes}]")
+            cmd.append(f"network.critic_network.input_layer.channel_sizes=[{critic_channel_sizes}]")
+            cmd.append(f"network.critic_network.input_layer.kernel_sizes=[{critic_kernel_sizes}]")
+            cmd.append(f"network.critic_network.input_layer.strides=[{critic_strides}]")
+            cmd.append(f"network.critic_network.input_layer.hidden_sizes=[{critic_hidden_sizes}]")
+            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{critic_layer_sizes}]")
         elif not ENV_HAS_BUILTIN_WRAPPER[self.env]:
             # sokoban (non-CNN)/slidingtile: native observation is a single
             # multi-dim array (grid/puzzle) that needs flattening for
@@ -1096,19 +717,9 @@ class Job:
 
 
 def build_grid(args: argparse.Namespace) -> List[Job]:
-    delightful_combos = []
-    for d in args.delightful:
-        if d:
-            for eta in args.delightful_eta:
-                delightful_combos.append((True, eta))
-        else:
-            delightful_combos.append((False, args.delightful_eta[0]))
-    delightful_combos = list(dict.fromkeys(delightful_combos))
-
     # (use_dpo_loss, dpo_alpha, dpo_beta) combos: alpha/beta only matter (and
-    # are only swept) when use_dpo_loss=True, mirroring delightful_combos
-    # above. Forced to a single (False, ..., ...) value for every non-PPO
-    # system in the main product loop below.
+    # are only swept) when use_dpo_loss=True, for the same reason
+    # as ppo_combos above.
     dpo_combos = []
     for use_dpo in args.use_dpo_loss:
         if use_dpo:
@@ -1121,8 +732,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
 
     # (use_expectile_value_loss, expectile) combos: expectile only matters
     # (and is only swept) when use_expectile_value_loss=True, mirroring
-    # dpo_combos above. Forced to a single (False, ...) value for every
-    # non-PPO system in the main product loop below.
+    # dpo_combos above.
     expectile_combos = []
     for use_expectile in args.use_expectile_value_loss:
         if use_expectile:
@@ -1147,14 +757,14 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
     # mlp_dim) combos:
-    #  - transformer_explicit_cot/cnn+transformer_explicit_cot only exist for
+    #  - transformer_explicit_cot_merged/cnn+transformer_explicit_cot_merged only exist for
     #    system in EXPLICIT_COT_SYSTEMS - any other requested (system,
     #    architecture) pair is skipped rather than erroring.
-    #  - ff_ppo_explicit_*'s architecture defaults to transformer_explicit_cot
+    #  - ff_ppo_explicit_*'s architecture defaults to transformer_explicit_cot_merged
     #    (flattened observation, see EXPLICIT_COT_PPO_SYSTEMS) when
     #    --architectures doesn't request either EXPLICIT_COT_ARCHES value;
-    #    requesting cnn+transformer_explicit_cot (optionally alongside
-    #    transformer_explicit_cot) opts into the CNN-input variant instead -
+    #    requesting cnn+transformer_explicit_cot_merged (optionally alongside
+    #    transformer_explicit_cot_merged) opts into the CNN-input variant instead -
     #    see EXPLICIT_COT_NETWORK_BY_SYSTEM.
     #  - num_layers is swept for every arch, including the explicit-CoT arches;
     #    num_heads/mlp_dim are also swept for them (like TRANSFORMER_ARCHES),
@@ -1275,7 +885,6 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             critic_weight_decay,
             ent_coef,
             max_grad_norm,
-            (delightful, delightful_eta),
             (
                 epochs,
                 num_minibatches,
@@ -1290,7 +899,6 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             clip_halting_head,
             (use_dpo_loss, dpo_alpha, dpo_beta),
             (use_expectile_value_loss, expectile),
-            qv_critic,
             seed,
         ) in itertools.product(
             difficulty_combos,
@@ -1303,31 +911,16 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.critic_weight_decay,
             args.ent_coef,
             args.max_grad_norm,
-            delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
             args.clip_halting_head,
             dpo_combos,
             expectile_combos,
-            args.qv_critic,
             range(args.base_seed, args.base_seed + args.seeds),
         ):
             if arch in CNN_ARCHES and not ENV_SUPPORTS_CNN[env]:
                 n_skipped_cnn += 1
                 continue
-            if system in PPO_SYSTEMS:
-                delightful, delightful_eta = False, args.delightful_eta[0]
-            else:
-                (
-                    epochs,
-                    num_minibatches,
-                    clip_eps,
-                    clip_value_loss,
-                    gae_lambda,
-                    standardize_advantages,
-                    recompute_advantages,
-                    critic_before_actor,
-                ) = ppo_combos[0]
             # latent_kl_coef only exists on ff_ppo.py's own systems
             # (LATENT_KL_PPO_SYSTEMS) - forced to the first requested value
             # for every other system (including explicit-CoT PPO systems).
@@ -1339,23 +932,6 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # to the first requested value for every other (system, arch).
             if system not in LATENT_KL_PPO_SYSTEMS or arch not in TRANSFORMER_ARCHES:
                 clip_halting_head = args.clip_halting_head[0]
-            # use_dpo_loss/dpo_alpha/dpo_beta exist on every PPO_SYSTEMS
-            # system (unlike latent_kl_coef above, both ff_ppo.py's own
-            # systems and ff_ppo_explicit_*) - forced to a non-DPO default
-            # for ff_reinforce/ff_qac_*.
-            if system not in PPO_SYSTEMS:
-                use_dpo_loss, dpo_alpha, dpo_beta = False, args.dpo_alpha[0], args.dpo_beta[0]
-            # use_expectile_value_loss/expectile exist on every PPO_SYSTEMS
-            # system (same applicability as use_dpo_loss above) - forced to
-            # a non-expectile default for ff_reinforce/ff_qac_*.
-            if system not in PPO_SYSTEMS:
-                use_expectile_value_loss, expectile = False, args.expectile[0]
-            # qv_critic (shared vs separate-torso Q-V critic) only exists on
-            # systems with a genuine Q-V critic (QAC_SYSTEMS) - forced to the
-            # first requested value for "reinforce" systems (V-only critic,
-            # no shared-vs-separate choice at all).
-            if system not in QAC_SYSTEMS:
-                qv_critic = args.qv_critic[0]
             jobs.append(
                 Job(
                     env=env,
@@ -1370,8 +946,6 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     critic_weight_decay=critic_weight_decay,
                     ent_coef=ent_coef,
                     max_grad_norm=max_grad_norm,
-                    delightful=delightful,
-                    delightful_eta=delightful_eta,
                     epochs=epochs,
                     num_minibatches=num_minibatches,
                     clip_eps=clip_eps,
@@ -1397,7 +971,6 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     use_latent_feedback=use_latent_feedback,
                     use_sandwich_norm=use_sandwich_norm,
                     use_rmsnorm=use_rmsnorm,
-                    qv_critic=qv_critic,
                     seed=seed,
                     total_timesteps=args.total_timesteps,
                     total_num_envs=args.total_num_envs,
@@ -1426,7 +999,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     if n_deduped:
         print(
             f"Deduplicated {n_deduped} job(s) with identical run_name (an axis not applicable "
-            "to that job's system, e.g. delightful for a PPO system)."
+            "to that job's system)."
         )
     return deduped_jobs
 
@@ -1500,24 +1073,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--systems",
-        default="ff_reinforce,ff_qac_fac,ff_qac_naive",
-        help="Comma-separated subset of {ff_reinforce, ff_qac_fac, ff_qac_naive, ff_ppo_fac, "
-        "ff_ppo_naive, ff_ppo_cond_naive, ff_ppo_cond_fac, ff_ppo_reinforce, ff_ppo_explicit_fac, "
-        "ff_ppo_explicit_naive, ff_ppo_explicit_cond_naive, ff_ppo_explicit_cond_fac, "
+        default="ff_ppo_reinforce",
+        help="Comma-separated subset of {ff_ppo_reinforce, "
         "ff_ppo_explicit_reinforce}. See minatar_fixed_budget_sweep.py's module docstring for "
-        "what each means. The five ff_ppo_explicit_* systems train "
-        "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py (explicit chain-of-thought tokens) and "
-        "default to a flattened-observation architecture regardless of --architectures unless it "
-        "requests transformer_explicit_cot/cnn+transformer_explicit_cot explicitly.",
+        "what each means. ff_ppo_explicit_reinforce trains "
+        "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py (explicit chain-of-thought tokens, G - V "
+        "advantage) and defaults to a flattened-observation architecture regardless of --architectures unless it "
+        "requests transformer_explicit_cot_merged/cnn+transformer_explicit_cot_merged explicitly.",
     )
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
         help=f"Comma-separated subset of {{{','.join(VALID_ARCHITECTURES)}}}. CNN architectures "
-        "(including cnn+transformer_explicit_cot) are only valid for env in "
+        "(including cnn+transformer_explicit_cot_merged) are only valid for env in "
         "{sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requested for knapsack, they're "
-        "skipped, not errored. transformer_explicit_cot/cnn+transformer_explicit_cot "
-        f"(TransformerExplicitCoTTorso) are only implemented for system in {EXPLICIT_COT_SYSTEMS} "
+        "skipped, not errored. transformer_explicit_cot_merged/cnn+transformer_explicit_cot_merged "
+        f"(TransformerMergedActionCoTTorso) are only implemented for system in {EXPLICIT_COT_SYSTEMS} "
         "- other (system, architecture) combos requesting them are skipped too.",
     )
     parser.add_argument(
@@ -1553,8 +1124,6 @@ def main() -> None:
         help="Comma-separated system.max_grad_norm values (global gradient-clipping norm, "
         "applied before the optimizer update). Default 0.5, matching the yaml default.",
     )
-    parser.add_argument("--delightful", default="false", help="Comma-separated bools - system.delightful (not PPO).")
-    parser.add_argument("--delightful-eta", default="1.0", help="Comma-separated system.delightful_eta values.")
     parser.add_argument("--epochs", default="4", help="Comma-separated system.epochs values (PPO only).")
     parser.add_argument("--num-minibatches", default="16", help="Comma-separated system.num_minibatches values (PPO only).")
     parser.add_argument("--clip-eps", default="0.2", help="Comma-separated system.clip_eps values (PPO only).")
@@ -1619,8 +1188,7 @@ def main() -> None:
         "dpo_surrogate, Lu et al. 2022, https://arxiv.org/abs/2210.05639) instead of PPO's "
         "clipped surrogate (stoix.utils.loss.ppo_clip_loss). False (default) recovers the "
         "original ppo_clip_loss behaviour exactly. Applies to every system in PPO_SYSTEMS (both "
-        "ff_ppo.py's own systems and ff_ppo_explicit_*, unlike --latent-kl-coef above); forced "
-        "to false for ff_reinforce/ff_qac_*, which have no such config knob.",
+        "ff_ppo.py's own systems and ff_ppo_explicit_*, unlike --latent-kl-coef above).",
     )
     parser.add_argument(
         "--dpo-alpha",
@@ -1628,7 +1196,7 @@ def main() -> None:
         help="Comma-separated system.dpo_alpha values - DPO's positive-advantage drift "
         "coefficient, only used (and only swept) when --use-dpo-loss includes true - paired "
         "with --use-dpo-loss/--dpo-beta via dpo_combos so a sweep isn't needlessly duplicated "
-        "across every use_dpo_loss=false job (mirrors --delightful-eta/--delightful). Default "
+        "across every use_dpo_loss=false job Default "
         "2.0, the value found by Lu et al. (2022)'s meta-optimisation.",
     )
     parser.add_argument(
@@ -1642,13 +1210,12 @@ def main() -> None:
         "--use-expectile-value-loss",
         default="false",
         help="Comma-separated bools (true/false) - system.use_expectile_value_loss: whether V's "
-        "loss (only V, not Q, where it exists) uses expectile regression "
+        "loss uses expectile regression "
         "(stoix.utils.loss.expectile_loss, Kostrikov et al. 2021's Implicit Q-Learning, "
         "https://arxiv.org/abs/2110.06169) instead of PPO's clipped value loss / plain L2 (per "
         "--clip-value-loss). False (default) recovers the original clip_value_loss/L2 "
         "behaviour exactly. Applies to every system in PPO_SYSTEMS (both ff_ppo.py's own "
-        "systems and ff_ppo_explicit_*, same applicability as --use-dpo-loss); forced to false "
-        "for ff_reinforce/ff_qac_*, which have no such config knob.",
+        "systems and ff_ppo_explicit_*, same applicability as --use-dpo-loss).",
     )
     parser.add_argument(
         "--expectile",
@@ -1658,23 +1225,10 @@ def main() -> None:
         "expectile_combos so a sweep isn't needlessly duplicated across every "
         "use_expectile_value_loss=false job (mirrors --dpo-alpha/--use-dpo-loss). <0.5 makes V "
         "deliberately (and persistently, not uncertainty-dependent) underestimate the return "
-        "distribution - for the Q-V systems this softens pruning of tried-but-average actions "
-        "rather than driving directed exploration, and for qac_variant='reinforce' it just "
+        "distribution - with no per-action information in the loss, it just "
         "reinforces whichever action was sampled a bit more; >0.5 would make V overestimate "
         "instead (IQL's usual direction); 0.5 recovers plain squared-error regression. Default "
         "0.1.",
-    )
-    parser.add_argument(
-        "--qv-critic",
-        default="shared",
-        help=f"Comma-separated subset of {{{','.join(QV_CRITIC_CHOICES)}}} - whether the critic's "
-        "V(s) and Q(s,a,c) heads share one torso (stoix.networks.base_qac.ValueAndQCritic) or "
-        "each get their own, independently-initialised torso "
-        "(SeparateValueAndQCritic, see stoix/configs/network/*_qac_separate_qv.yaml). Only "
-        "applies to systems with a genuine Q-V critic (QAC_SYSTEMS - every system in "
-        "SYSTEM_TO_QAC_VARIANT except the 'reinforce' variants); ignored (forced to the first "
-        "value) for ff_reinforce/ff_ppo_reinforce/ff_ppo_explicit_reinforce, which use a plain "
-        "V-only critic with no such choice. Defaults to sweeping both, to directly compare them.",
     )
     parser.add_argument("--use-layer-norm", default="false", help="Comma-separated bools (mlp/cnn+mlp only).")
     parser.add_argument("--use-input-layer-norm", default="false", help="Comma-separated bools.")
@@ -1706,7 +1260,7 @@ def main() -> None:
         help="Comma-separated bools (true/false) - latent feedback decoding "
         "(network.actor_network.pre_torso.use_latent_feedback), the Full-Bandwidth "
         "Transformer's gated hidden-state feedback (arXiv:2608.08888) - see "
-        "stoix/networks/torso_compute_explicit_cot.py. Only applies to the explicit-CoT "
+        "stoix/networks/torso_compute_explicit_cot_merged.py. Only applies to the explicit-CoT "
         "arches (EXPLICIT_COT_ARCHES); ignored (forced to the first value) for every other "
         "architecture. Default false.",
     )
@@ -1867,8 +1421,6 @@ def main() -> None:
     args.critic_weight_decay = [float(x) for x in args.critic_weight_decay.split(",")]
     args.ent_coef = [float(x) for x in args.ent_coef.split(",")]
     args.max_grad_norm = [float(x) for x in args.max_grad_norm.split(",")]
-    args.delightful = [x.strip().lower() in ("1", "true", "yes") for x in args.delightful.split(",")]
-    args.delightful_eta = [float(x) for x in args.delightful_eta.split(",")]
     args.epochs = [int(x) for x in args.epochs.split(",")]
     args.num_minibatches = [int(x) for x in args.num_minibatches.split(",")]
     args.clip_eps = [float(x) for x in args.clip_eps.split(",")]
@@ -1896,7 +1448,6 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.use_expectile_value_loss.split(",")
     ]
     args.expectile = [float(x) for x in args.expectile.split(",")]
-    args.qv_critic = args.qv_critic.split(",")
     args.use_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_layer_norm.split(",")]
     args.use_input_layer_norm = [x.strip().lower() in ("1", "true", "yes") for x in args.use_input_layer_norm.split(",")]
     args.num_layers = [int(x) for x in args.num_layers.split(",")]
@@ -1939,8 +1490,6 @@ def main() -> None:
         assert a in VALID_ARCHITECTURES, f"unknown architecture {a!r}, expected one of {VALID_ARCHITECTURES}"
     for b in args.budget:
         assert b >= 1, f"budget must be >= 1, got {b}"
-    for q in args.qv_critic:
-        assert q in QV_CRITIC_CHOICES, f"unknown qv_critic {q!r}, expected one of {QV_CRITIC_CHOICES}"
     for c in args.sokoban_generator:
         assert c in SOKOBAN_GENERATOR_CHOICES, f"unknown sokoban generator {c!r}, expected one of {SOKOBAN_GENERATOR_CHOICES}"
 
@@ -2007,7 +1556,6 @@ def main() -> None:
         f"  use_expectile_value_loss={args.use_expectile_value_loss} expectile={args.expectile} "
         f"(PPO systems only: {PPO_SYSTEMS})"
     )
-    print(f"  qv_critic={args.qv_critic} (QAC systems only: {QAC_SYSTEMS})")
     print(f"  sokoban_generator={args.sokoban_generator} sokoban_eval_generator={args.sokoban_eval_generator}")
     print(
         f"  slidingtile_grid_size={args.slidingtile_grid_size} "

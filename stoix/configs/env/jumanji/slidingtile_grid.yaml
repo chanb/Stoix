@@ -3,7 +3,7 @@
 # GridObservationWrapper to keep the (grid_size, grid_size) spatial
 # structure, casting to float32 and adding a trailing singleton channel axis
 # - (grid_size, grid_size, 1) - so a CNN-based network (network=cnn_mlp_compute
-# / cnn_mlp_compute_qac / cnn_transformer_compute / cnn_transformer_compute_qac)
+# / cnn_transformer_compute)
 # can operate on the real puzzle layout. The `puzzle` observation attribute
 # alone is sufficient here (the blank tile's position is recoverable from it -
 # see slidingtile.yaml). Plain MLP-based networks (mlp_compute etc.) should
