@@ -134,7 +134,6 @@ def lightsout_filter(c):
     return True
 
 def slidingpuzzle_filter(c):
-    return False
     mn = cfg_get(c, "network.actor_network.pre_torso.min_steps")
     mx = cfg_get(c, "network.actor_network.pre_torso.max_steps")
     if int(mn) == int(mx):
@@ -183,81 +182,6 @@ def sokoban_filter(c):
 def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta]]:
     api = wandb.Api()
     runs = api.runs(project, filters={
-        # lightsout-3x3, IRU
-        # lightsout-iru_unshared-iru_unshared_sweep-qkv
-        # "config.env.scenario.name": "lightsout-3x3",
-        # "config.system.actor_weight_decay": "0.0001",
-        # "config.system.use_expectile_value_loss": "False",
-
-        # lightsout-5x4, iCoT
-        # lightsout-icot-icot_sweep-qkv
-        # "config.env.scenario.name": "lightsout-5x4",
-        # "config.network.actor_network.pre_torso.mlp_dim": "256",
-        # "config.system.actor_weight_decay": "0.1",
-        # "config.system.max_grad_norm": "0.5",
-
-        # lightsout-5x4, eCoT
-        # lightsout-ecot-ecot_sweep-qkv-vulcan
-        # "config.env.scenario.name": "lightsout-5x4",
-        # "config.network.actor_network.pre_torso.mlp_dim": "256",
-        # "config.system.actor_weight_decay": "0.1",
-        # "config.system.ent_coef": "0.01",
-
-
-        # sliding puzzle tile, iCoT
-        # slidingpuzzle-icot_sweep_2 -- current good run, w/ eval 40 timesteps
-        # "config.network.actor_network.pre_torso.mlp_dim": "256",
-        # "config.system.actor_weight_decay": "0.01",
-        # "config.system.gamma": "0.999",
-        # "config.arch.total_num_envs": "256",
-        # "config.system.use_expectile_value_loss": "True",
-        # "config.system.expectile": "0.2",
-        # "config.system.max_grad_norm": "0.5",
-        # "config.env.eval_kwargs.time_limit": None,
-
-        # slidingpuzzle-icot_sweep_2 -- current good run, w/ eval 80 timesteps
-        "config.network.actor_network.pre_torso.mlp_dim": "256",
-        "config.system.actor_weight_decay": "0.02",
-        "config.system.gamma": "0.999",
-        "config.arch.total_num_envs": "256",
-        "config.system.use_expectile_value_loss": "True",
-        "config.system.expectile": "0.2",
-        "config.system.max_grad_norm": "0.5",
-        "config.env.eval_kwargs.time_limit": "80",
-
-        # actor wd = 0.001
-        # "$and": [
-        #     {"config.network.actor_network.pre_torso.mlp_dim": "256"},
-        #     {"config.system.actor_weight_decay": "0.001"},
-        #     {"config.system.gamma": "0.999"},
-        #     {"config.arch.total_num_envs": "256"},
-        #     {"config.system.use_expectile_value_loss": "True"},
-        #     {"config.system.expectile": "0.2"},
-        #     {"config.system.max_grad_norm": "0.5"},
-        #     {
-        #         "$or": [
-        #             {"config.env.eval_kwargs.time_limit": "40"},
-        #             {"config.env.eval_kwargs.time_limit": None},
-        #         ],
-        #     },
-        # ],
-
-        # sokoban
-        # sokoban-shallow_cnn
-        # "$and": [
-        #     {"config.system.actor_weight_decay": "0.001"},
-        #     {"config.system.gamma": "0.999"},
-        #     {"config.system.actor_lr": "0.0003"},
-        #     {"config.system.use_expectile_value_loss": "True"},
-        #     {"config.system.expectile": "0.9"},
-        #     {"config.system.max_grad_norm": "5"},
-        #     {
-        #         "$or": [
-        #             {"config.network.actor_network.pre_torso.halting_hidden_dims": "[]"},
-        #             {"config.network.actor_network.pre_torso.halting_hidden_dims": None},
-        #         ]
-        #     },
-        # ],
         
     })
     out = []
