@@ -61,7 +61,6 @@ ARCH_SHORT = {
     "stoix.networks.torso_compute.UnsharedIRUAdaptiveComputationTimeTorso": "IRU-ACT",
     "stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso": "Transformer-ExplicitCoT",
     "stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso": "Transformer-CoT",
-    "stoix.networks.torso_compute_explicit_cot_merged.TransformerMergedActionCoTTorso": "Transformer-ExplicitCoT",
 }
 
 
