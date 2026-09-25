@@ -12,7 +12,7 @@ Usage:
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures mlp \\
       --use-layer-norm true,false --use-input-layer-norm true,false  # sweep LayerNorm options
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_explicit_reinforce \\
-      --architectures transformer_explicit_cot_merged        # explicit-CoT sweep
+      --architectures transformer_explicit_cot        # explicit-CoT sweep
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --lr 1e-4,3e-4 --critic-lr 1e-3  # decoupled lr sweeps
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --architectures gru,iru  # recurrent-block sweep
   python ramdp_experiments/lightsout_fixed_budget_sweep.py --difficulty-threshold 0.3  # easier training goals
@@ -51,9 +51,9 @@ SYSTEM_TO_SCRIPT = {
     # PPO (ff_ppo.py) with a G - V advantage - see
     # stoix/systems/ramdp_vpg/ff_ppo.py's module docstring.
     "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
-    # Explicit-CoT PPO (TransformerMergedActionCoTTorso): the halting decision and the environment
+    # Explicit-CoT PPO (TransformerExplicitCoTTorso): the halting decision and the environment
     # action are the same draw from one vocabulary - see
-    # stoix/networks/torso_compute_explicit_cot_merged.py's module docstring.
+    # stoix/networks/torso_compute_explicit_cot.py's module docstring.
     "ff_ppo_explicit_reinforce": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
 }
 # Systems trained by ff_ppo.py/ff_ppo_explicit_cot.py (PPO's clipped
@@ -63,13 +63,13 @@ PPO_SYSTEMS = (
     "ff_ppo_reinforce",
     "ff_ppo_explicit_reinforce",
 )
-# Merged-action explicit-CoT systems whose architecture is implied (always
-# transformer_explicit_cot_merged) rather than picked via --architectures -
-# see EXPLICIT_COT_MERGED_ARCH/build_grid.
-EXPLICIT_COT_MERGED_PPO_SYSTEMS = ("ff_ppo_explicit_reinforce",)
-# PPO_SYSTEMS minus EXPLICIT_COT_MERGED_PPO_SYSTEMS: the systems trained by ff_ppo.py
+# Explicit-CoT systems whose architecture is implied (always
+# transformer_explicit_cot) rather than picked via --architectures -
+# see EXPLICIT_COT_ARCH/build_grid.
+EXPLICIT_COT_PPO_SYSTEMS = ("ff_ppo_explicit_reinforce",)
+# PPO_SYSTEMS minus EXPLICIT_COT_PPO_SYSTEMS: the systems trained by ff_ppo.py
 # (implicit/latent CoT) rather than ff_ppo_explicit_cot.py.
-LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_MERGED_PPO_SYSTEMS)
+LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_PPO_SYSTEMS)
 ARCH_TO_NETWORK = {
     "ff_ppo_reinforce": {
         "mlp": "mlp_compute",
@@ -90,7 +90,7 @@ NO_LAYER_NORM_ARCHES = (
     "iru_unshared",
 )
 # Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention heads / transformer
-# feedforward width) - TransformerChainOfThoughtTorso and TransformerMergedActionCoTTorso; every
+# feedforward width) - TransformerChainOfThoughtTorso and TransformerExplicitCoTTorso; every
 # other torso has no such concept.
 TRANSFORMER_ARCHES = ("transformer",)
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
@@ -101,31 +101,31 @@ SERVER_MODULES = {
     "slurm": ["StdEnv/2023", "cuda/12.2"],
 }
 
-# TransformerMergedActionCoTTorso's architecture (see
-# stoix/networks/torso_compute_explicit_cot_merged.py and
-# EXPLICIT_COT_MERGED_PPO_SYSTEMS above) doesn't fit ARCH_TO_NETWORK/
+# TransformerExplicitCoTTorso's architecture (see
+# stoix/networks/torso_compute_explicit_cot.py and
+# EXPLICIT_COT_PPO_SYSTEMS above) doesn't fit ARCH_TO_NETWORK/
 # SYSTEM_TO_SCRIPT's (system, arch) -> network lookup: it's only trained by
 # ff_ppo_explicit_cot.py, not the plain ff_ppo.py, so it's handled separately.
-EXPLICIT_COT_MERGED_ARCH = "transformer_explicit_cot_merged"
+EXPLICIT_COT_ARCH = "transformer_explicit_cot"
 # Explicit-CoT transformer architectures - used wherever a property (vocab_size,
 # use_latent_feedback, no use_layer_norm, ...) applies to explicit CoT.
-EXPLICIT_COT_ARCHES = (EXPLICIT_COT_MERGED_ARCH,)
-EXPLICIT_COT_MERGED_SCRIPT_BY_SYSTEM = {
+EXPLICIT_COT_ARCHES = (EXPLICIT_COT_ARCH,)
+EXPLICIT_COT_SCRIPT_BY_SYSTEM = {
     system: "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py"
-    for system in EXPLICIT_COT_MERGED_PPO_SYSTEMS
+    for system in EXPLICIT_COT_PPO_SYSTEMS
 }
-# transformer_explicit_cot_merged.yaml only wires up the plain V-only critic
+# transformer_explicit_cot.yaml only wires up the plain V-only critic
 # (a plain V-only critic).
-EXPLICIT_COT_MERGED_NETWORK_BY_SYSTEM = {
-    "ff_ppo_explicit_reinforce": EXPLICIT_COT_MERGED_ARCH,
+EXPLICIT_COT_NETWORK_BY_SYSTEM = {
+    "ff_ppo_explicit_reinforce": EXPLICIT_COT_ARCH,
 }
-EXPLICIT_COT_MERGED_SYSTEMS = tuple(EXPLICIT_COT_MERGED_SCRIPT_BY_SYSTEM)
+EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 # Short forms for group_tag/run_name (wandb group names get long fast):
-# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot_merged"
+# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
 # -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru/iru_unshared are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
-    EXPLICIT_COT_MERGED_ARCH: "TF-mCoT",
+    EXPLICIT_COT_ARCH: "TF-eCoT",
 }
 
 # W&B's "group" field (and, in practice, run IDs) are capped at 128
@@ -245,7 +245,7 @@ class Job:
             net += f"-nh{self.num_heads}-md{self.mlp_dim}"
             if self.qkv_dim:
                 net += f"-qkv{self.qkv_dim}"
-        # Only shown for transformer_explicit_cot_merged -
+        # Only shown for transformer_explicit_cot -
         # vocab_size doesn't exist on any other architecture, see
         # EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
@@ -304,9 +304,9 @@ class Job:
         return f"{self.group_tag}-seed_{self.seed}"
 
     def command(self, python_bin: str) -> List[str]:
-        if self.arch == EXPLICIT_COT_MERGED_ARCH:
-            script = EXPLICIT_COT_MERGED_SCRIPT_BY_SYSTEM[self.system]
-            network = EXPLICIT_COT_MERGED_NETWORK_BY_SYSTEM[self.system]
+        if self.arch == EXPLICIT_COT_ARCH:
+            script = EXPLICIT_COT_SCRIPT_BY_SYSTEM[self.system]
+            network = EXPLICIT_COT_NETWORK_BY_SYSTEM[self.system]
         else:
             script = SYSTEM_TO_SCRIPT[self.system]
             network = ARCH_TO_NETWORK[self.system][self.arch]
@@ -381,7 +381,7 @@ class Job:
         cmd.append(f"system.expectile={self.expectile:g}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
-            # TransformerMergedActionCoTTorso/TransformerMergedActionCoTTorso only (see
+            # TransformerExplicitCoTTorso only (see
             # TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES).
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
@@ -398,12 +398,12 @@ class Job:
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
         if self.arch in EXPLICIT_COT_ARCHES:
-            # Thought-token vocabulary size - TransformerMergedActionCoTTorso/
-            # TransformerMergedActionCoTTorso only, no other architecture has this param.
+            # Thought-token vocabulary size - TransformerExplicitCoTTorso/
+            # TransformerExplicitCoTTorso only, no other architecture has this param.
             cmd.append(f"++network.actor_network.pre_torso.vocab_size={self.vocab_size}")
             # Latent feedback decoding (Full-Bandwidth Transformer, arXiv:2608.08888) -
-            # TransformerMergedActionCoTTorso/TransformerMergedActionCoTTorso only, see
-            # stoix/networks/torso_compute_explicit_cot_merged.py/torso_compute_explicit_cot_merged.py.
+            # TransformerExplicitCoTTorso only, see
+            # stoix/networks/torso_compute_explicit_cot.py.
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
@@ -420,11 +420,11 @@ class Job:
             quoted_parts = ",".join(f"'{part}'" for part in self.group_tag_parts)
             cmd.append(f"logger.loggers.wandb.group_tag=[{quoted_parts}]")
         if self.arch in EXPLICIT_COT_ARCHES or self.arch in NO_LAYER_NORM_ARCHES:
-            # TransformerChainOfThoughtTorso, TransformerMergedActionCoTTorso,
-            # TransformerMergedActionCoTTorso, GRUAdaptiveComputationTimeTorso, and
+            # TransformerChainOfThoughtTorso, TransformerExplicitCoTTorso,
+            # TransformerExplicitCoTTorso, GRUAdaptiveComputationTimeTorso, and
             # IRUAdaptiveComputationTimeTorso only have use_input_layer_norm, not use_layer_norm
             # (see stoix/networks/torso_compute_transformer.py,
-            # stoix/networks/torso_compute_explicit_cot_merged.py, and
+            # stoix/networks/torso_compute_explicit_cot.py, and
             # stoix/networks/torso_compute.py).
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
@@ -487,15 +487,15 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     )
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads, mlp_dim) combos: -
-    # transformer_explicit_cot_merged only exists for system in EXPLICIT_COT_MERGED_SYSTEMS - any
+    # transformer_explicit_cot only exists for system in EXPLICIT_COT_SYSTEMS - any
     # other requested (system, architecture) pair is skipped rather than erroring, so e.g. the
     # default `--systems ff_ppo_reinforce` still works if the user adds `--architectures
-    # ...,transformer_explicit_cot_merged`.
+    # ...,transformer_explicit_cot`.
     system_arch_ln_combos = []
     n_skipped_incompatible = 0
     for system in args.systems:
-        if system in EXPLICIT_COT_MERGED_PPO_SYSTEMS:
-            archs = (EXPLICIT_COT_MERGED_ARCH,)
+        if system in EXPLICIT_COT_PPO_SYSTEMS:
+            archs = (EXPLICIT_COT_ARCH,)
         else:
             archs = args.architectures
         for arch in archs:
@@ -518,8 +518,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 args.use_sandwich_norm if is_transformer_arch else [args.use_sandwich_norm[0]]
             )
             use_rmsnorm_options = args.use_rmsnorm if is_transformer_arch else [args.use_rmsnorm[0]]
-            if arch == EXPLICIT_COT_MERGED_ARCH:
-                if system not in EXPLICIT_COT_MERGED_SYSTEMS:
+            if arch == EXPLICIT_COT_ARCH:
+                if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
                     continue
                 ln_options = [(False, uiln) for uiln in args.use_input_layer_norm]
@@ -568,7 +568,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     if n_skipped_incompatible:
         print(
             f"Skipping {n_skipped_incompatible} (system, architecture) combo(s) requesting "
-            f"{EXPLICIT_COT_MERGED_ARCH} (only implemented for {EXPLICIT_COT_MERGED_SYSTEMS})."
+            f"{EXPLICIT_COT_ARCH} (only implemented for {EXPLICIT_COT_SYSTEMS})."
         )
 
     jobs = []
@@ -797,20 +797,20 @@ def main() -> None:
         "(PPO's clipped surrogate, several epochs of minibatch updates per rollout) with a G-V "
         "(REINFORCE-with-baseline) advantage. See --epochs/--num-minibatches/"
         "--clip-eps. ff_ppo_explicit_reinforce uses the same G-V advantage too, but trains stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py instead "
-        "(explicit chain-of-thought tokens, TransformerMergedActionCoTTorso - the halting "
+        "(explicit chain-of-thought tokens, TransformerExplicitCoTTorso - the halting "
         "decision and the environment action are the same draw from one vocabulary); its "
-        "architecture is implied (transformer_explicit_cot_merged) rather than picked via "
-        "--architectures - see EXPLICIT_COT_MERGED_PPO_SYSTEMS.",
+        "architecture is implied (transformer_explicit_cot) rather than picked via "
+        "--architectures - see EXPLICIT_COT_PPO_SYSTEMS.",
     )
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
         help="Comma-separated subset of {mlp, iru_unshared, transformer, gru, iru, "
-        "transformer_explicit_cot_merged}. iru_unshared "
+        "transformer_explicit_cot}. iru_unshared "
         "(UnsharedIRUAdaptiveComputationTimeTorso) is like iru but with no weight sharing across "
         "pondering steps - each step is its own independently-parameterized IRU layer. "
-        "transformer_explicit_cot_merged (TransformerMergedActionCoTTorso) is only "
-        f"implemented for system in {EXPLICIT_COT_MERGED_SYSTEMS} - other (system, architecture) "
+        "transformer_explicit_cot (TransformerExplicitCoTTorso) is only "
+        f"implemented for system in {EXPLICIT_COT_SYSTEMS} - other (system, architecture) "
         "combos requesting it are skipped, not errored.",
     )
     parser.add_argument(
@@ -931,7 +931,7 @@ def main() -> None:
         "of an isotropic Gaussian centered at each step's state - see ff_ppo.py's module "
         "docstring. 0.0 (default) disables it. Swept independently of the other PPO axes. Only "
         "applies to ff_ppo.py's own systems (LATENT_KL_PPO_SYSTEMS, i.e. PPO_SYSTEMS minus "
-        "EXPLICIT_COT_MERGED_PPO_SYSTEMS) - forced to the first value for every other system.",
+        "EXPLICIT_COT_PPO_SYSTEMS) - forced to the first value for every other system.",
     )
     parser.add_argument(
         "--clip-halting-head",
@@ -1006,7 +1006,7 @@ def main() -> None:
         help="Comma-separated bools (true/false) - LayerNorm on the encoded observation before the "
         "initial token/state/recurrent-input projection "
         "(network.actor_network.pre_torso.use_input_layer_norm). Supported by architecture in "
-        "{mlp, transformer, gru, iru, transformer_explicit_cot_merged}.",
+        "{mlp, transformer, gru, iru, transformer_explicit_cot}.",
     )
     parser.add_argument(
         "--num-layers",
@@ -1017,15 +1017,15 @@ def main() -> None:
         "IRU cells for iru (IRUAdaptiveComputationTimeTorso), or transformer layers for "
         "transformer (TransformerChainOfThoughtTorso) - see "
         "stoix/networks/torso_compute*.py. Default 1 sub-layer per step. Also swept for "
-        "transformer_explicit_cot_merged (TransformerMergedActionCoTTorso's yaml default is 2).",
+        "transformer_explicit_cot (TransformerExplicitCoTTorso's yaml default is 2).",
     )
     parser.add_argument(
         "--num-heads",
         default="4",
         help="Comma-separated ints - attention head count "
         "(network.actor_network.pre_torso.num_heads). Only applies to architecture in "
-        "{transformer, transformer_explicit_cot_merged} (TransformerChainOfThoughtTorso/"
-        "TransformerMergedActionCoTTorso); ignored (forced to the first value) for every other "
+        "{transformer, transformer_explicit_cot} (TransformerChainOfThoughtTorso/"
+        "TransformerExplicitCoTTorso); ignored (forced to the first value) for every other "
         "architecture, since those torsos have no such param. Default 4.",
     )
     parser.add_argument(
@@ -1033,7 +1033,7 @@ def main() -> None:
         default="256",
         help="Comma-separated ints - transformer feedforward width "
         "(network.actor_network.pre_torso.mlp_dim). Same applicability as --num-heads: only "
-        "architecture in {transformer, transformer_explicit_cot_merged}; ignored "
+        "architecture in {transformer, transformer_explicit_cot}; ignored "
         "(forced to the first value) for every other architecture. Default 256.",
     )
     parser.add_argument(
@@ -1052,9 +1052,9 @@ def main() -> None:
         default="32",
         help="Comma-separated ints - thought-token vocabulary size "
         "(network.actor_network.pre_torso.vocab_size): how many discrete 'thought' classes "
-        "TransformerMergedActionCoTTorso can emit besides the num_actions halt-with-action classes - see "
-        "stoix/networks/torso_compute_explicit_cot_merged.py. Only applies to architecture "
-        "transformer_explicit_cot_merged (unlike --num-heads/--mlp-dim, NOT swept for plain "
+        "TransformerExplicitCoTTorso can emit besides the num_actions halt-with-action classes - see "
+        "stoix/networks/torso_compute_explicit_cot.py. Only applies to architecture "
+        "transformer_explicit_cot (unlike --num-heads/--mlp-dim, NOT swept for plain "
         "transformer, which has no such param); ignored (forced to the first value) for "
         "every other architecture. Default 32 (the network yaml default).",
     )
@@ -1066,8 +1066,8 @@ def main() -> None:
         "top-layer hidden state into the next scratchpad entry via a gated linear unit, "
         "instead of feeding back only the sampled token's bare embedding (the Full-Bandwidth "
         "Transformer's 'latent feedback decoding', arXiv:2608.08888) - see "
-        "stoix/networks/torso_compute_explicit_cot_merged.py. Only applies to architecture "
-        "transformer_explicit_cot_merged; ignored (forced to the first value) for every other "
+        "stoix/networks/torso_compute_explicit_cot.py. Only applies to architecture "
+        "transformer_explicit_cot; ignored (forced to the first value) for every other "
         "architecture, since those torsos have no such param. Default false.",
     )
     parser.add_argument(
@@ -1077,7 +1077,7 @@ def main() -> None:
         "(network.actor_network.pre_torso.use_sandwich_norm): normalizes each TransformerBlock "
         "sub-layer's residual sum, not just its input as in plain pre-norm - see "
         "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. Only applies "
-        "to architecture in {transformer, transformer_explicit_cot_merged} (every other architecture "
+        "to architecture in {transformer, transformer_explicit_cot} (every other architecture "
         "has no TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
     )
     parser.add_argument(
@@ -1251,7 +1251,7 @@ def main() -> None:
         "transformer",
         "gru",
         "iru",
-        EXPLICIT_COT_MERGED_ARCH,
+        EXPLICIT_COT_ARCH,
     )
     for a in args.architectures:
         assert a in valid_architectures, f"unknown architecture {a!r}, expected one of {valid_architectures}"
@@ -1353,13 +1353,13 @@ def main() -> None:
     print(f"  num_layers={args.num_layers}")
     print(
         f"  num_heads={args.num_heads} mlp_dim={args.mlp_dim} qkv_dim={args.qkv_dim} "
-        f"(transformer/transformer_explicit_cot_merged only)"
+        f"(transformer/transformer_explicit_cot only)"
     )
-    print(f"  vocab_size={args.vocab_size} (transformer_explicit_cot_merged only)")
-    print(f"  use_latent_feedback={args.use_latent_feedback} (transformer_explicit_cot_merged only)")
+    print(f"  vocab_size={args.vocab_size} (transformer_explicit_cot only)")
+    print(f"  use_latent_feedback={args.use_latent_feedback} (transformer_explicit_cot only)")
     print(
         f"  use_sandwich_norm={args.use_sandwich_norm} use_rmsnorm={args.use_rmsnorm} "
-        "(transformer/transformer_explicit_cot_merged only)"
+        "(transformer/transformer_explicit_cot only)"
     )
     print(
         f"  difficulty_threshold={args.difficulty_threshold} "

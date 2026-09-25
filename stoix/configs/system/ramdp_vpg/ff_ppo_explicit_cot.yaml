@@ -1,4 +1,4 @@
-# --- Defaults Merged-Action Explicit-CoT Compute-Time-Aware FF-PPO (RAMDP-PPO, merged-action explicit CoT) ---
+# --- Defaults Explicit-CoT Compute-Time-Aware FF-PPO (RAMDP-PPO, explicit CoT) ---
 
 system_name: ramdp_ff_ppo_explicit_cot # Name of the system.
 
@@ -42,7 +42,7 @@ expectile: 0.1 # V's target expectile when use_expectile_value_loss=True (ignore
 ent_coef: 0.01 # Entropy regularisation term for the whole per-step categorical (thought
   # tokens and the halting-with-action classes together) - covers both the environment
   # action and the halting decision, since here they are the same choice.
-  # See TransformerMergedActionCoTTorso's/ff_ppo_explicit_cot.py's module docstrings.
+  # See TransformerExplicitCoTTorso's/ff_ppo_explicit_cot.py's module docstrings.
 vf_coef: 0.5 # Critic weight.
 recompute_advantages: False # Whether the advantage's V(s) term and the critic's own
   # regression target are recomputed at the end of every PPO epoch from that epoch's

@@ -1,12 +1,15 @@
-# ---Explicit Chain-of-Thought Compute-Time-Aware REINFORCE Networks---
-# The actor's pre_torso is an explicit Chain-of-Thought transformer torso: at
-# each step it samples a discrete token from a learned vocabulary (a genuine,
-# inspectable output of the policy) that has one extra class beyond
-# `vocab_size` meaning "predict the environment action now" - choosing a
-# thought token feeds that token's embedding back in as context for the next
-# step, choosing the extra class halts. The actual (sampled) number of CoT
-# steps taken is reported as `compute_time` (see
-# stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso).
+# ---Explicit Chain-of-Thought Compute-Time-Aware PPO Networks---
+# Same explicit-CoT transformer torso idea as transformer_explicit_cot.yaml,
+# but the environment action is folded into the same vocabulary as the
+# thought tokens instead of being decided by a separate action_head: at each
+# step it samples a discrete token from a learned vocabulary that has
+# `num_actions` extra classes beyond `vocab_size` - one per environment
+# action - so choosing one of them both halts *and* resolves the action in
+# the same draw. `num_actions` is injected at runtime (from the env's action
+# space), same as `action_dim` used to be for action_head - see
+# stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso.
+# No action_head here: the torso is a complete actor on its own (see
+# stoix.networks.base_compute.FeedForwardActorFromTorso).
 actor_network:
   pre_torso:
     _target_: stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso
@@ -23,8 +26,6 @@ actor_network:
       # (arXiv:2608.08888) - fuses the previous step's top-layer hidden state into the
       # next scratchpad entry via a gated linear unit instead of feeding back only the
       # sampled token's bare embedding. See torso_compute_explicit_cot.py.
-  action_head:
-    _target_: stoix.networks.heads.CategoricalHead
 
 critic_network:
   pre_torso:

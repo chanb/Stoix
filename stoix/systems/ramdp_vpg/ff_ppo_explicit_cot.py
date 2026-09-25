@@ -1,8 +1,8 @@
 """Compute-time-aware PPO with an explicit chain of thought whose vocabulary
 merges thought tokens and the environment action (RAMDP-PPO, explicit CoT).
 
-The actor's torso is `TransformerMergedActionCoTTorso` (see
-`stoix.networks.torso_compute_explicit_cot_merged`): at each pondering step it
+The actor's torso is `TransformerExplicitCoTTorso` (see
+`stoix.networks.torso_compute_explicit_cot`): at each pondering step it
 samples a token from a vocabulary with `num_actions` extra classes beyond the
 `vocab_size` thought classes, so choosing one of them both halts and selects
 the environment action. There is therefore a single per-step categorical, one
@@ -37,7 +37,7 @@ from stoix.base_types import (
 from stoix.networks.base import FeedForwardCritic
 from stoix.networks.base_compute import FeedForwardActorFromTorso as Actor
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
-from stoix.systems.ramdp_vpg.explicit_cot_types import PPOMergedActionCoTTransition
+from stoix.systems.ramdp_vpg.explicit_cot_types import PPOExplicitCoTTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
     solved_episode_info,
@@ -57,11 +57,11 @@ from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
 
-def get_merged_action_act_fn_with_compute_time(
+def get_explicit_cot_act_fn_with_compute_time(
     config: DictConfig,
     actor_apply: ActorApply,
 ) -> ComputeAwareActFn:
-    """Act fn for `TransformerMergedActionCoTTorso`: the torso's rollout-mode output already *is*
+    """Act fn for `TransformerExplicitCoTTorso`: the torso's rollout-mode output already *is*
     the resolved `action` - there is no distribution to call `.mode()`/`.sample()` on, since
     `deterministic` already picks the greedy class (thought or halt-with-action) at each step."""
 
@@ -113,7 +113,7 @@ def get_learner_fn(
     ) -> Tuple[RamdpOnPolicyLearnerState, Tuple]:
         def _env_step(
             learner_state: RamdpOnPolicyLearnerState, _: Any
-        ) -> Tuple[RamdpOnPolicyLearnerState, PPOMergedActionCoTTransition]:
+        ) -> Tuple[RamdpOnPolicyLearnerState, PPOExplicitCoTTransition]:
             (
                 params,
                 opt_states,
@@ -171,7 +171,7 @@ def get_learner_fn(
                 "compute_time": compute_time,
             }
 
-            transition = PPOMergedActionCoTTransition(
+            transition = PPOExplicitCoTTransition(
                 done,
                 action,
                 value,
@@ -237,7 +237,7 @@ def get_learner_fn(
 
         def _actor_loss_fn(
             actor_params: FrozenDict,
-            traj_batch: PPOMergedActionCoTTransition,
+            traj_batch: PPOExplicitCoTTransition,
             advantage: chex.Array,
         ) -> Tuple:
             """Calculate the actor loss (see the identical copy nested in
@@ -300,7 +300,7 @@ def get_learner_fn(
 
         def _critic_loss_fn(
             critic_params: FrozenDict,
-            traj_batch: PPOMergedActionCoTTransition,
+            traj_batch: PPOExplicitCoTTransition,
             targets: chex.Array,
         ) -> Tuple:
             """Calculate the critic loss (see the identical copy nested in
@@ -320,7 +320,7 @@ def get_learner_fn(
         def _apply_actor_update(
             params: ActorCriticParams,
             opt_states: ActorCriticOptStates,
-            traj_batch: PPOMergedActionCoTTransition,
+            traj_batch: PPOExplicitCoTTransition,
             advantage: chex.Array,
         ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
             """Actor-only minibatch update - critic params/opt_state pass
@@ -350,7 +350,7 @@ def get_learner_fn(
         def _apply_critic_update(
             params: ActorCriticParams,
             opt_states: ActorCriticOptStates,
-            traj_batch: PPOMergedActionCoTTransition,
+            traj_batch: PPOExplicitCoTTransition,
             targets: chex.Array,
         ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
             """Critic-only minibatch update - actor params/opt_state pass
@@ -480,7 +480,7 @@ def get_learner_fn(
 
                 def _actor_loss_fn(
                     actor_params: FrozenDict,
-                    traj_batch: PPOMergedActionCoTTransition,
+                    traj_batch: PPOExplicitCoTTransition,
                     advantage: chex.Array,
                 ) -> Tuple:
                     """Calculate the actor loss."""
@@ -494,7 +494,7 @@ def get_learner_fn(
 
                     # `cot_log_prob`/`traj_batch.cot_log_prob`: `(*batch, max_steps)`, zeroed past
                     # the step each example actually halted at (see
-                    # `TransformerMergedActionCoTTorso`).
+                    # `TransformerExplicitCoTTorso`).
                     step_idx = jnp.arange(max_steps)
                     valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(
                         jnp.float32
@@ -557,7 +557,7 @@ def get_learner_fn(
 
                 def _critic_loss_fn(
                     critic_params: FrozenDict,
-                    traj_batch: PPOMergedActionCoTTransition,
+                    traj_batch: PPOExplicitCoTTransition,
                     targets: chex.Array,
                 ) -> Tuple:
                     """Calculate the critic loss."""
@@ -749,9 +749,9 @@ def learner_setup(
 
     key, actor_net_key, critic_net_key = keys
 
-    # `num_actions` sizes the torso's merged vocabulary directly (no separate
+    # `num_actions` sizes the torso's vocabulary directly (no separate
     # `action_head` to instantiate with it - see
-    # `TransformerMergedActionCoTTorso`/`FeedForwardActorFromTorso`).
+    # `TransformerExplicitCoTTorso`/`FeedForwardActorFromTorso`).
     actor_torso = hydra.utils.instantiate(
         config.network.actor_network.pre_torso, num_actions=num_actions
     )
@@ -886,7 +886,7 @@ def run_experiment(_config: DictConfig) -> float:
         evaluator_setup_with_compute_time(
             eval_env=eval_env,
             key_e=key_e,
-            eval_act_fn=get_merged_action_act_fn_with_compute_time(config, actor_network.apply),
+            eval_act_fn=get_explicit_cot_act_fn_with_compute_time(config, actor_network.apply),
             params=learner_state.params.actor_params,
             config=config,
         )
@@ -997,8 +997,8 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     eval_performance = run_experiment(cfg)
 
     print(
-        f"{Fore.CYAN}{Style.BRIGHT}Compute-time-aware PPO with merged-action explicit CoT "
-        f"(RAMDP-PPO, merged-action explicit CoT) experiment completed{Style.RESET_ALL}"
+        f"{Fore.CYAN}{Style.BRIGHT}Compute-time-aware PPO with explicit CoT "
+        f"(RAMDP-PPO, explicit CoT) experiment completed{Style.RESET_ALL}"
     )
     return eval_performance
 

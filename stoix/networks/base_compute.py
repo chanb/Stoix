@@ -52,7 +52,7 @@ class FeedForwardActorWithComputeTime(nn.Module):
 class FeedForwardActorFromTorso(nn.Module):
     """Like `FeedForwardActorWithComputeTime`, but for a torso that is
     already a complete actor - e.g.
-    `stoix.networks.torso_compute_explicit_cot_merged.TransformerMergedActionCoTTorso`,
+    `stoix.networks.torso_compute_explicit_cot.TransformerExplicitCoTTorso`,
     whose per-step categorical folds the environment action into the same
     vocabulary as the thought tokens, so choosing a class both halts and
     resolves the action in one draw. There is no continuous embedding left

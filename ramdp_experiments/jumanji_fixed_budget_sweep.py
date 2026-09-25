@@ -31,8 +31,6 @@ Usage:
       --recompute-advantages true,false           # sweep per-epoch advantage/target recompute
   python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce \\
       --gae-lambda 0.9,0.95,1.0                    # sweep GAE(lambda)
-  python ramdp_experiments/jumanji_fixed_budget_sweep.py --envs sokoban,slidingtile,maze \\
-      --systems ff_ppo_explicit_reinforce --architectures cnn+transformer_explicit_cot_merged  # CNN-input explicit-CoT sweep
   python ramdp_experiments/jumanji_fixed_budget_sweep.py \\
       --systems ff_ppo_explicit_reinforce   # explicit-CoT PPO sweep (flattened obs)
 """
@@ -57,20 +55,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SYSTEM_TO_SCRIPT = {
     "ff_ppo_reinforce": "stoix/systems/ramdp_vpg/ff_ppo.py",
-    # Explicit-CoT PPO (TransformerMergedActionCoTTorso instead of a latent-CoT torso): the halting
+    # Explicit-CoT PPO (TransformerExplicitCoTTorso instead of a latent-CoT torso): the halting
     # decision and the environment action are the same draw from one vocabulary - see
-    # stoix/networks/torso_compute_explicit_cot_merged.py.
+    # stoix/networks/torso_compute_explicit_cot.py.
     "ff_ppo_explicit_reinforce": "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py",
 }
 PPO_SYSTEMS = (
     "ff_ppo_reinforce",
     "ff_ppo_explicit_reinforce",
 )
-# Explicit-CoT systems whose architecture defaults to
-# transformer_explicit_cot_merged (flattened observation) rather than being
-# picked via --architectures, unless --architectures requests one of
-# EXPLICIT_COT_ARCHES explicitly (e.g. cnn+transformer_explicit_cot_merged) -
-# see build_grid.
+# Explicit-CoT systems whose architecture is always
+# transformer_explicit_cot (flattened observation) rather than being
+# picked via --architectures - see build_grid.
 EXPLICIT_COT_PPO_SYSTEMS = ("ff_ppo_explicit_reinforce",)
 # PPO_SYSTEMS minus EXPLICIT_COT_PPO_SYSTEMS: the systems trained by ff_ppo.py (implicit/latent CoT)
 # rather than ff_ppo_explicit_cot.py.
@@ -92,34 +88,30 @@ TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
 
-# TransformerMergedActionCoTTorso (see stoix/networks/torso_compute_explicit_cot_merged.py) doesn't
+# TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py) doesn't
 # fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup: it's only trained by
 # ff_ppo_explicit_cot.py, not the plain ff_ppo.py, so it's handled separately.
-EXPLICIT_COT_ARCH = "transformer_explicit_cot_merged"
-CNN_EXPLICIT_COT_ARCH = "cnn+transformer_explicit_cot_merged"
-EXPLICIT_COT_ARCHES = (EXPLICIT_COT_ARCH, CNN_EXPLICIT_COT_ARCH)
+EXPLICIT_COT_ARCH = "transformer_explicit_cot"
+EXPLICIT_COT_ARCHES = (EXPLICIT_COT_ARCH,)
 EXPLICIT_COT_SCRIPT_BY_SYSTEM = {
     system: "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py" for system in EXPLICIT_COT_PPO_SYSTEMS
 }
-# Network name by arch (flattened observation vs CNN input) - nested the same
-# way ARCH_TO_NETWORK is. Plain V-only critic.
+# Network name by arch - nested the same way ARCH_TO_NETWORK is. Plain V-only critic.
 EXPLICIT_COT_NETWORK_BY_SYSTEM = {
     "ff_ppo_explicit_reinforce": {
-        EXPLICIT_COT_ARCH: "transformer_explicit_cot_merged",
-        CNN_EXPLICIT_COT_ARCH: "cnn_transformer_explicit_cot_merged",
+        EXPLICIT_COT_ARCH: "transformer_explicit_cot",
     },
 }
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
-CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru", CNN_EXPLICIT_COT_ARCH)
+CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru")
 VALID_ARCHITECTURES = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
 # Short forms for group_tag/run_name (wandb group names get long fast):
-# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot_merged"
+# "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
 # -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
     "cnn+transformer": "cnn+TF-iCoT",
     EXPLICIT_COT_ARCH: "TF-eCoT",
-    CNN_EXPLICIT_COT_ARCH: "cnn+TF-eCoT",
 }
 # Shortened dataset_name -> group_tag suffix for the longer Boxoban tiers (the
 # override still passes the full HuggingFace dataset_name, only the tag shrinks).
@@ -645,11 +637,11 @@ class Job:
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
         if self.arch in EXPLICIT_COT_ARCHES:
-            # Thought-token vocabulary size - TransformerMergedActionCoTTorso only,
+            # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
             cmd.append(f"++network.actor_network.pre_torso.vocab_size={self.vocab_size}")
             # Latent feedback decoding (Full-Bandwidth Transformer, arXiv:2608.08888) -
-            # TransformerMergedActionCoTTorso only, see stoix/networks/torso_compute_explicit_cot_merged.py.
+            # TransformerExplicitCoTTorso only, see stoix/networks/torso_compute_explicit_cot.py.
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
@@ -667,10 +659,10 @@ class Job:
         # override can fail with "Key not in struct" for some (system, arch)
         # combos - matches lightsout_fixed_budget_sweep.py/jumanji_sweep.py.
         if self.arch in EXPLICIT_COT_ARCHES or self.arch in NO_LAYER_NORM_ARCHES:
-            # TransformerMergedActionCoTTorso only has use_input_layer_norm, not
+            # TransformerExplicitCoTTorso only has use_input_layer_norm, not
             # use_layer_norm, same as TransformerChainOfThoughtTorso/
             # GRUAdaptiveComputationTimeTorso/IRUAdaptiveComputationTimeTorso
-            # (see stoix/networks/torso_compute_explicit_cot_merged.py and
+            # (see stoix/networks/torso_compute_explicit_cot.py and
             # stoix/networks/torso_compute_transformer.py).
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
@@ -757,15 +749,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
 
     # (system, arch, use_layer_norm, use_input_layer_norm, num_layers, num_heads,
     # mlp_dim) combos:
-    #  - transformer_explicit_cot_merged/cnn+transformer_explicit_cot_merged only exist for
-    #    system in EXPLICIT_COT_SYSTEMS - any other requested (system,
-    #    architecture) pair is skipped rather than erroring.
-    #  - ff_ppo_explicit_*'s architecture defaults to transformer_explicit_cot_merged
-    #    (flattened observation, see EXPLICIT_COT_PPO_SYSTEMS) when
-    #    --architectures doesn't request either EXPLICIT_COT_ARCHES value;
-    #    requesting cnn+transformer_explicit_cot_merged (optionally alongside
-    #    transformer_explicit_cot_merged) opts into the CNN-input variant instead -
-    #    see EXPLICIT_COT_NETWORK_BY_SYSTEM.
+    #  - transformer_explicit_cot only exists for system in
+    #    EXPLICIT_COT_SYSTEMS - any other requested (system, architecture) pair
+    #    is skipped rather than erroring.
+    #  - ff_ppo_explicit_*'s architecture is always transformer_explicit_cot
+    #    (flattened observation, see EXPLICIT_COT_PPO_SYSTEMS).
     #  - num_layers is swept for every arch, including the explicit-CoT arches;
     #    num_heads/mlp_dim are also swept for them (like TRANSFORMER_ARCHES),
     #    everything else forced to a single value.
@@ -780,8 +768,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     n_skipped_incompatible = 0
     for system in args.systems:
         if system in EXPLICIT_COT_PPO_SYSTEMS:
-            requested_explicit_cot_archs = [a for a in args.architectures if a in EXPLICIT_COT_ARCHES]
-            archs = requested_explicit_cot_archs or (EXPLICIT_COT_ARCH,)
+            archs = (EXPLICIT_COT_ARCH,)
         else:
             archs = args.architectures
         for arch in archs:
@@ -1078,18 +1065,18 @@ def main() -> None:
         "ff_ppo_explicit_reinforce}. See minatar_fixed_budget_sweep.py's module docstring for "
         "what each means. ff_ppo_explicit_reinforce trains "
         "stoix/systems/ramdp_vpg/ff_ppo_explicit_cot.py (explicit chain-of-thought tokens, G - V "
-        "advantage) and defaults to a flattened-observation architecture regardless of --architectures unless it "
-        "requests transformer_explicit_cot_merged/cnn+transformer_explicit_cot_merged explicitly.",
+        "advantage) and always uses the flattened-observation transformer_explicit_cot "
+        "architecture, regardless of --architectures.",
     )
     parser.add_argument(
         "--architectures",
         default="mlp,transformer",
         help=f"Comma-separated subset of {{{','.join(VALID_ARCHITECTURES)}}}. CNN architectures "
-        "(including cnn+transformer_explicit_cot_merged) are only valid for env in "
+        "are only valid for env in "
         "{sokoban, slidingtile, maze} (see ENV_SUPPORTS_CNN) - requested for knapsack, they're "
-        "skipped, not errored. transformer_explicit_cot_merged/cnn+transformer_explicit_cot_merged "
-        f"(TransformerMergedActionCoTTorso) are only implemented for system in {EXPLICIT_COT_SYSTEMS} "
-        "- other (system, architecture) combos requesting them are skipped too.",
+        "skipped, not errored. transformer_explicit_cot "
+        f"(TransformerExplicitCoTTorso) is only implemented for system in {EXPLICIT_COT_SYSTEMS} "
+        "- other (system, architecture) combos requesting it are skipped too.",
     )
     parser.add_argument(
         "--budget",
@@ -1260,7 +1247,7 @@ def main() -> None:
         help="Comma-separated bools (true/false) - latent feedback decoding "
         "(network.actor_network.pre_torso.use_latent_feedback), the Full-Bandwidth "
         "Transformer's gated hidden-state feedback (arXiv:2608.08888) - see "
-        "stoix/networks/torso_compute_explicit_cot_merged.py. Only applies to the explicit-CoT "
+        "stoix/networks/torso_compute_explicit_cot.py. Only applies to the explicit-CoT "
         "arches (EXPLICIT_COT_ARCHES); ignored (forced to the first value) for every other "
         "architecture. Default false.",
     )
