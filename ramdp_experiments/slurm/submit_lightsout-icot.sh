@@ -6,22 +6,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="${SCRIPT_DIR}/lightsout-icot-run.sh"
 
-project_name=shallow_cnn
+project_name=no_cnn
 gammas=( 0.99 0.995 0.999 0.9995 )
 
-COMMON="--seeds 10 --architectures transformer --hidden-dim 32 --mlp-dim 512 --qkv-dim 128 --num-layers 4 --num-heads 8 --total-timesteps 3e8 --grid-sizes 5x4 --episode-length 10 --eval-episode-length 20 --difficulty-threshold 0.5 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --clip-value-loss false --critic-before-actor false --ent-coef 0.01 --clip-eps 0.2 --actor-weight-decay 0.1 --critic-weight-decay 0.0 --gae-lambda 0.95 --standardize-advantages true --use-rmsnorm true --use-sandwich-norm false --wandb true --wandb-project lightsout-icot-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/lightsout-icot-${project_name} --runs-per-gpu 6 --gpus 0 --yes --server vulcan --no-skip-existing --use-expectile-value-loss true"
+COMMON="--seeds 10 --architectures transformer --hidden-dim 32 --mlp-dim 512 --qkv-dim 128 --num-layers 4 --num-heads 8 --total-timesteps 3e8 --grid-sizes 5x4 --episode-length 10 --eval-episode-length 20 --difficulty-threshold 0.5 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --clip-value-loss false --critic-before-actor false --ent-coef 0.01 --clip-eps 0.2 --actor-weight-decay 0.1 --critic-weight-decay 0.0 --gae-lambda 0.95 --standardize-advantages true --use-rmsnorm true --use-sandwich-norm false --wandb true --wandb-project lightsout-icot-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/lightsout-icot-${project_name} --runs-per-gpu 5 --gpus 0 --yes --no-skip-existing --server vulcan --use-expectile-value-loss true"
 
 # sbatch --export is comma-delimited, so a CMD containing literal commas
 # (e.g. "--budget 1,2,3") gets silently truncated at the first comma.
 # Base64-encode CMD before export and decode it in the run script to avoid this.
 for gamma in "${gammas[@]}"; do
-    CMD="python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --gamma ${gamma} --budget 1,2 ${COMMON}"
+    CMD="python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --gamma ${gamma} --budget 1,2,3 ${COMMON}"
     CMD_B64="$(base64 -w0 <<< "${CMD}")"
     sbatch --export=ALL,CMD_B64="${CMD_B64}" --job-name="lightsout-icot-budget12-gamma${gamma}" "${RUN_SCRIPT}"
-
-    CMD="python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --gamma ${gamma} --budget 3 ${COMMON}"
-    CMD_B64="$(base64 -w0 <<< "${CMD}")"
-    sbatch --export=ALL,CMD_B64="${CMD_B64}" --job-name="lightsout-icot-budget3-gamma${gamma}" "${RUN_SCRIPT}"
 
     CMD="python ramdp_experiments/lightsout_fixed_budget_sweep.py --systems ff_ppo_reinforce --gamma ${gamma} --budget 4 ${COMMON}"
     CMD_B64="$(base64 -w0 <<< "${CMD}")"
