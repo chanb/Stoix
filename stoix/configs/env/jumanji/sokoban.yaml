@@ -12,9 +12,9 @@ scenario:
 # speed rather than just solving - overridden here to drop that term (see
 # stoix/envs/sokoban/reward.py) so the RAMDP compute-budget sweeps aren't
 # conflating "more computation helped" with "the agent solved it faster".
-kwargs:
-  reward_fn:
-    _target_: stoix.envs.sokoban.reward.DenseRewardNoStepPenalty
+# kwargs:
+#   reward_fn:
+#     _target_: stoix.envs.sokoban.reward.DenseRewardNoStepPenalty
 
 # An episode counts as solved if its final step's reward is at least this - the
 # one-off +10 LEVEL_COMPLETE_BONUS (jumanji.environments.routing.sokoban.

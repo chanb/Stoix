@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --account=aip-schuurma
 #SBATCH --time=11:59:00
-#SBATCH --mem=16GB
-#SBATCH --cpus-per-task=6
+#SBATCH --mem=32GB
+#SBATCH --cpus-per-task=5
 #SBATCH --gres=gpu:1
 #SBATCH --output=/home/chanb/scratch/logs/ramdp/Stoix/%x_%j.out
 
