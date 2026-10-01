@@ -165,7 +165,7 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
         linestyle="none" if categorical else "-",
         linewidth=1,
         color=mean_color,
-        label=r"IQM $\pm$ 95\% bootstrap CI",
+        # label=r"IQM $\pm$ 95\% bootstrap CI",
     )
     handles.append(mean_errorbar)
 
@@ -262,15 +262,15 @@ def main():
     for ax in axes:
         for h, l in zip(*ax.get_legend_handles_labels()):
             by_label.setdefault(l, h)
-    fig.legend(
-        list(by_label.values()),
-        list(by_label.keys()),
-        bbox_to_anchor=(0.0, 1.0 + (GROUP_TITLE_GAP_IN + GROUP_TITLE_HEIGHT_IN) / fig_h, 1.0, 0.0),
-        loc="lower center",
-        ncols=len(by_label),
-        borderaxespad=0.0,
-        frameon=True,
-    )
+    # fig.legend(
+    #     list(by_label.values()),
+    #     list(by_label.keys()),
+    #     bbox_to_anchor=(0.0, 1.0 + (GROUP_TITLE_GAP_IN + GROUP_TITLE_HEIGHT_IN) / fig_h, 1.0, 0.0),
+    #     loc="lower center",
+    #     ncols=len(by_label),
+    #     borderaxespad=0.0,
+    #     frameon=True,
+    # )
     out_path = HERE / "analysis-hardness_grid.pdf"
     fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
     print(f"Saved {out_path}")
