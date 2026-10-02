@@ -58,7 +58,12 @@ import numpy as np
 from flax import linen as nn
 from flax.linen.initializers import Initializer, normal, orthogonal
 
-from stoix.networks.torso_compute_transformer import TransformerBlock, _norm_cls, _resolve_qkv_dim
+from stoix.networks.torso_compute_transformer import (
+    TransformerBlock,
+    _norm_cls,
+    _resolve_qkv_dim,
+    init_soft_moe_cache,
+)
 from stoix.networks.utils import parse_activation_fn
 
 _NEG_INF = jnp.finfo(jnp.float32).min
@@ -96,6 +101,11 @@ class _MergedActionCoTBackbone(nn.Module):
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
+    num_experts: int = 0
+    num_experts_per_token: int = 1
+    moe_type: str = "topk"
+    soft_moe_slots_per_expert: int = 1
+    soft_moe_normalize: bool = False
 
     def setup(self) -> None:
         self.pos_embedding = self.param(
@@ -123,6 +133,11 @@ class _MergedActionCoTBackbone(nn.Module):
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
                 self.qkv_dim,
+                self.num_experts,
+                self.num_experts_per_token,
+                self.moe_type,
+                self.soft_moe_slots_per_expert,
+                self.soft_moe_normalize,
             )
             for _ in range(self.num_layers)
         ]
@@ -159,19 +174,27 @@ class _MergedActionCoTBackbone(nn.Module):
         token: chex.Array,
         cached_keys: list,
         cached_values: list,
+        cached_moe_inputs: list,
         step_idx: chex.Array,
-    ) -> Tuple[chex.Array, list, list]:
+    ) -> Tuple[chex.Array, list, list, list]:
         """See `_ExplicitCoTBackbone.step` - identical."""
         x = token + self.pos_embedding[step_idx]
         new_cached_keys = []
         new_cached_values = []
+        new_cached_moe_inputs = []
         for layer_idx, block in enumerate(self.blocks):
-            x, k, v = block.step(
-                x, cached_keys[layer_idx], cached_values[layer_idx], step_idx, self.max_steps
+            x, k, v, m = block.step(
+                x,
+                cached_keys[layer_idx],
+                cached_values[layer_idx],
+                step_idx,
+                self.max_steps,
+                cached_moe_inputs=cached_moe_inputs[layer_idx],
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-        return x, new_cached_keys, new_cached_values
+            new_cached_moe_inputs.append(m)
+        return x, new_cached_keys, new_cached_values, new_cached_moe_inputs
 
 
 class TransformerMergedActionCoTTorso(nn.Module):
@@ -180,7 +203,9 @@ class TransformerMergedActionCoTTorso(nn.Module):
     classes - see module docstring.
 
     `min_steps`/`max_steps`/`use_latent_feedback`/`use_sandwich_norm`/
-    `use_rmsnorm`/`qkv_dim` all mean exactly what they mean on
+    `use_rmsnorm`/`qkv_dim`/`num_experts`/`num_experts_per_token`/`moe_type`/
+    `soft_moe_slots_per_expert`/`soft_moe_normalize` all mean exactly what
+    they mean on
     `TransformerExplicitCoTTorso` - see that class's docstring.
     """
 
@@ -199,6 +224,11 @@ class TransformerMergedActionCoTTorso(nn.Module):
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
+    num_experts: int = 0
+    num_experts_per_token: int = 1
+    moe_type: str = "topk"
+    soft_moe_slots_per_expert: int = 1
+    soft_moe_normalize: bool = False
 
     @nn.compact
     def __call__(
@@ -265,6 +295,11 @@ class TransformerMergedActionCoTTorso(nn.Module):
             self.use_sandwich_norm,
             self.use_rmsnorm,
             self.qkv_dim,
+            self.num_experts,
+            self.num_experts_per_token,
+            self.moe_type,
+            self.soft_moe_slots_per_expert,
+            self.soft_moe_normalize,
         )
 
         # Per-step legality mask (shape `(max_steps, num_classes)`) - see
@@ -324,6 +359,12 @@ class TransformerMergedActionCoTTorso(nn.Module):
         cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
+        cached_moe_inputs = [
+            init_soft_moe_cache(
+                batch_shape, self.max_steps, self.hidden_dim, self.moe_type, self.num_experts
+            )
+            for _ in range(self.num_layers)
+        ]
 
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
@@ -342,6 +383,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
                 current_token,
                 cached_keys,
                 cached_values,
+                cached_moe_inputs,
                 still_running,
                 num_steps_taken,
                 emitted_tokens,
@@ -351,8 +393,8 @@ class TransformerMergedActionCoTTorso(nn.Module):
                 rng,
             ) = carry
 
-            state, cached_keys, cached_values = backbone.step(
-                current_token, cached_keys, cached_values, step_idx
+            state, cached_keys, cached_values, cached_moe_inputs = backbone.step(
+                current_token, cached_keys, cached_values, cached_moe_inputs, step_idx
             )
             token_logits = jnp.where(legal_mask[step_idx], backbone.token_head(state), _NEG_INF)
 
@@ -398,6 +440,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
                 current_token,
                 cached_keys,
                 cached_values,
+                cached_moe_inputs,
                 still_running,
                 num_steps_taken,
                 emitted_tokens,
@@ -408,11 +451,20 @@ class TransformerMergedActionCoTTorso(nn.Module):
             )
             return new_carry, None
 
-        scan_step = nn.scan(step_fn, variable_broadcast="params", split_rngs={"params": False})
+        scan_step = nn.scan(
+            step_fn,
+            variable_broadcast="params",
+            # MoE load-balancing statistics sown per step (see
+            # `stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP`)
+            # are stacked along a leading step axis.
+            variable_axes={"intermediates": 0},
+            split_rngs={"params": False},
+        )
         initial_carry = (
             initial_token,  # current_token
             cached_keys,
             cached_values,
+            cached_moe_inputs,
             still_running,
             num_steps_taken,
             emitted_tokens,
@@ -422,6 +474,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
             step_rng,
         )
         (
+            _,
             _,
             _,
             _,
