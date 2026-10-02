@@ -102,8 +102,6 @@ class _MergedActionCoTBackbone(nn.Module):
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
     num_experts: int = 0
-    num_experts_per_token: int = 1
-    moe_type: str = "topk"
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
 
@@ -134,8 +132,6 @@ class _MergedActionCoTBackbone(nn.Module):
                 self.use_rmsnorm,
                 self.qkv_dim,
                 self.num_experts,
-                self.num_experts_per_token,
-                self.moe_type,
                 self.soft_moe_slots_per_expert,
                 self.soft_moe_normalize,
             )
@@ -203,9 +199,8 @@ class TransformerMergedActionCoTTorso(nn.Module):
     classes - see module docstring.
 
     `min_steps`/`max_steps`/`use_latent_feedback`/`use_sandwich_norm`/
-    `use_rmsnorm`/`qkv_dim`/`num_experts`/`num_experts_per_token`/`moe_type`/
-    `soft_moe_slots_per_expert`/`soft_moe_normalize` all mean exactly what
-    they mean on
+    `use_rmsnorm`/`qkv_dim`/`num_experts`/`soft_moe_slots_per_expert`/
+    `soft_moe_normalize` all mean exactly what they mean on
     `TransformerExplicitCoTTorso` - see that class's docstring.
     """
 
@@ -225,8 +220,6 @@ class TransformerMergedActionCoTTorso(nn.Module):
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
     num_experts: int = 0
-    num_experts_per_token: int = 1
-    moe_type: str = "topk"
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
 
@@ -296,8 +289,6 @@ class TransformerMergedActionCoTTorso(nn.Module):
             self.use_rmsnorm,
             self.qkv_dim,
             self.num_experts,
-            self.num_experts_per_token,
-            self.moe_type,
             self.soft_moe_slots_per_expert,
             self.soft_moe_normalize,
         )
@@ -361,7 +352,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_moe_inputs = [
             init_soft_moe_cache(
-                batch_shape, self.max_steps, self.hidden_dim, self.moe_type, self.num_experts
+                batch_shape, self.max_steps, self.hidden_dim, self.num_experts
             )
             for _ in range(self.num_layers)
         ]
@@ -451,15 +442,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
             )
             return new_carry, None
 
-        scan_step = nn.scan(
-            step_fn,
-            variable_broadcast="params",
-            # MoE load-balancing statistics sown per step (see
-            # `stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP`)
-            # are stacked along a leading step axis.
-            variable_axes={"intermediates": 0},
-            split_rngs={"params": False},
-        )
+        scan_step = nn.scan(step_fn, variable_broadcast="params", split_rngs={"params": False})
         initial_carry = (
             initial_token,  # current_token
             cached_keys,

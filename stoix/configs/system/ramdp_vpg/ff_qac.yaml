@@ -22,10 +22,6 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # bootstrapped return target and the "fac" scaling - the advantage itself is
   # Q(s,a,c) - V(s), with no n-step return involved.
 ent_coef: 0.001 # Entropy regularisation term for loss function.
-moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss on the actor's
-  # mixture-of-experts router(s) (pre_torso.num_experts > 0), keeping tokens spread across
-  # experts - see stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP. 0.0 turns it
-  # off (plain apply, no routing statistics collected); no effect without MoE layers.
 vf_coef: 1.0 # Critic weight in
 delightful: False # Whether to gate the REINFORCE weight by a sigmoid of
   # (advantage * surprisal / delightful_eta), where surprisal = -log_prob of the

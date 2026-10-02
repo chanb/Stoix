@@ -75,10 +75,6 @@ expectile: 0.1 # V's target expectile when use_expectile_value_loss=True (ignore
   # (IQL's usual direction); 0.5 recovers plain squared-error regression. See
   # stoix.utils.loss.expectile_loss and ff_ppo.py's module docstring.
 ent_coef: 0.01 # Entropy regularisation term for the environment action's distribution.
-moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss on the actor's
-  # mixture-of-experts router(s) (pre_torso.num_experts > 0), keeping tokens spread across
-  # experts - see stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP. 0.0 turns it
-  # off (plain apply, no routing statistics collected); no effect without MoE layers.
 halting_ent_coef: 0.0 # Entropy regularisation term for the CoT-step distribution's own
   # entropy (thought tokens and the halting "act now" class together - there's no separate
   # halting probability to isolate, see TransformerExplicitCoTTorso's module docstring),

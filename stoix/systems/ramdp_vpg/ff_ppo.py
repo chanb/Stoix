@@ -245,7 +245,6 @@ from stoix.base_types import (
 from stoix.networks.base import FeedForwardCritic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.networks.base_qac import SeparateValueAndQCritic, ValueAndQCritic
-from stoix.networks.torso_compute_transformer import apply_with_moe_load_balancing_loss
 from stoix.systems.ramdp_vpg.evaluator import evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ff_reinforce import get_distribution_act_fn_with_compute_time
 from stoix.systems.ramdp_vpg.ppo_types import PPOTransition
@@ -526,9 +525,7 @@ def get_learner_fn(
                 new_latent_states,
                 halting_log_prob,
                 per_step_halting_entropy,
-            ), moe_load_balancing_loss = apply_with_moe_load_balancing_loss(
-                actor_apply_fn,
-                config.system.moe_load_balancing_coef > 0,
+            ) = actor_apply_fn(
                 actor_params,
                 traj_batch.obs,
                 torso_kwargs={"target_compute_time": traj_batch.compute_time},
@@ -609,7 +606,6 @@ def get_learner_fn(
                 - config.system.ent_coef * entropy
                 - config.system.halting_ent_coef * halting_entropy
                 + config.system.latent_kl_coef * latent_kl_penalty
-                + config.system.moe_load_balancing_coef * moe_load_balancing_loss
             )
             loss_info = {
                 "actor_loss": loss_actor,
@@ -624,7 +620,6 @@ def get_learner_fn(
                 "action_clip_fraction": action_clip_fraction,
                 "halting_clip_fraction": halting_clip_fraction,
                 "latent_kl_penalty": latent_kl_penalty,
-                "moe_load_balancing_loss": moe_load_balancing_loss,
             }
             return total_loss_actor, loss_info
 
@@ -882,9 +877,7 @@ def get_learner_fn(
                         new_latent_states,
                         halting_log_prob,
                         per_step_halting_entropy,
-                    ), moe_load_balancing_loss = apply_with_moe_load_balancing_loss(
-                        actor_apply_fn,
-                        config.system.moe_load_balancing_coef > 0,
+                    ) = actor_apply_fn(
                         actor_params,
                         traj_batch.obs,
                         torso_kwargs={"target_compute_time": traj_batch.compute_time},
@@ -1002,7 +995,6 @@ def get_learner_fn(
                         - config.system.ent_coef * entropy
                         - config.system.halting_ent_coef * halting_entropy
                         + config.system.latent_kl_coef * latent_kl_penalty
-                        + config.system.moe_load_balancing_coef * moe_load_balancing_loss
                     )
                     loss_info = {
                         "actor_loss": loss_actor,
@@ -1017,7 +1009,6 @@ def get_learner_fn(
                         "action_clip_fraction": action_clip_fraction,
                         "halting_clip_fraction": halting_clip_fraction,
                         "latent_kl_penalty": latent_kl_penalty,
-                        "moe_load_balancing_loss": moe_load_balancing_loss,
                     }
                     return total_loss_actor, loss_info
 

@@ -168,8 +168,6 @@ class _ExplicitCoTBackbone(nn.Module):
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
     num_experts: int = 0
-    num_experts_per_token: int = 1
-    moe_type: str = "topk"
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
 
@@ -200,8 +198,6 @@ class _ExplicitCoTBackbone(nn.Module):
                 self.use_rmsnorm,
                 self.qkv_dim,
                 self.num_experts,
-                self.num_experts_per_token,
-                self.moe_type,
                 self.soft_moe_slots_per_expert,
                 self.soft_moe_normalize,
             )
@@ -220,23 +216,20 @@ class _ExplicitCoTBackbone(nn.Module):
     def token_head(self, state: chex.Array) -> chex.Array:
         return self.token_embed.attend(state)
 
-    def run(self, scratchpad: chex.Array, token_mask: Optional[chex.Array] = None) -> chex.Array:
+    def run(self, scratchpad: chex.Array) -> chex.Array:
         """Runs the transformer over `scratchpad` (`(*batch, max_steps,
         hidden_dim)`) under a causal mask in one call and returns the
         per-position states - used only by the parallel one-shot replay pass
         (`TransformerExplicitCoTTorso.__call__`'s `replaying and not
         use_latent_feedback` branch), which already knows the whole token
         trajectory up front so has no per-step recurrence to cache against.
-        The other paths use `step` instead (see class docstring).
-        `token_mask` (`(*batch, max_steps)` bool) only selects which
-        positions count towards the MoE load-balancing statistics - see
-        `TransformerBlock.__call__`."""
+        The other paths use `step` instead (see class docstring)."""
         seq_len = scratchpad.shape[-2]
         batch_shape = scratchpad.shape[:-2]
         tokens_in = scratchpad + self.pos_embedding[:seq_len]
         causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
         for block in self.blocks:
-            tokens_in = block(tokens_in, mask=causal_mask, token_mask=token_mask)
+            tokens_in = block(tokens_in, mask=causal_mask)
         return tokens_in
 
     def fuse_latent_feedback(self, state: chex.Array, token_emb: chex.Array) -> chex.Array:
@@ -256,7 +249,6 @@ class _ExplicitCoTBackbone(nn.Module):
         cached_values: list,
         cached_moe_inputs: list,
         step_idx: chex.Array,
-        token_mask: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, list, list, list]:
         """Incremental counterpart to `run`, used by the scanned per-step
         body (rollout mode and, when `use_latent_feedback=True`, replay
@@ -276,7 +268,6 @@ class _ExplicitCoTBackbone(nn.Module):
                 cached_values[layer_idx],
                 step_idx,
                 self.max_steps,
-                token_mask=token_mask,
                 cached_moe_inputs=cached_moe_inputs[layer_idx],
             )
             new_cached_keys.append(k)
@@ -317,15 +308,13 @@ class TransformerExplicitCoTTorso(nn.Module):
     Dense layer, the token embedding table, the residual stream, and
     everything else.
 
-    `num_experts` (default `0`, a plain dense MLP) and
-    `num_experts_per_token` are forwarded to every shared `TransformerBlock`:
-    a positive `num_experts` turns each block's MLP into a top-
-    `num_experts_per_token` routed
-    `stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP`.
-    `moe_type="soft"` makes it a causal
+    `num_experts` (default `0`, a plain dense MLP),
+    `soft_moe_slots_per_expert` and `soft_moe_normalize` are forwarded to
+    every shared `TransformerBlock`: a positive `num_experts` turns each
+    block's MLP into a causal
     `stoix.networks.torso_compute_transformer.SoftMoEMLP` over the scratchpad
-    instead (`soft_moe_slots_per_expert`, `soft_moe_normalize`) - causal, so
-    the parallel replay pass and the KV-cached step path still agree.
+    - causal, so the parallel replay pass and the KV-cached step path still
+    agree.
     """
 
     hidden_dim: int
@@ -343,8 +332,6 @@ class TransformerExplicitCoTTorso(nn.Module):
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
     num_experts: int = 0
-    num_experts_per_token: int = 1
-    moe_type: str = "topk"
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
 
@@ -416,8 +403,6 @@ class TransformerExplicitCoTTorso(nn.Module):
             self.use_rmsnorm,
             self.qkv_dim,
             self.num_experts,
-            self.num_experts_per_token,
-            self.moe_type,
             self.soft_moe_slots_per_expert,
             self.soft_moe_normalize,
         )
@@ -473,16 +458,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 )
             else:
                 scratchpad = initial_token[..., None, :]
-            # A step only counts if no earlier step already halted - i.e. its
-            # exclusive running count of "act now" tokens so far is zero.
-            halted = target_tokens == act_token_id
-            earlier_halts = jnp.cumsum(halted.astype(jnp.int32), axis=-1) - halted.astype(
-                jnp.int32
-            )
-            still_running = earlier_halts == 0
-            # (*batch, max_steps, hidden_dim); `token_mask` keeps post-halt
-            # positions out of the MoE load-balancing statistics.
-            states = backbone.run(scratchpad, token_mask=still_running)
+            states = backbone.run(scratchpad)  # (*batch, max_steps, hidden_dim)
 
             # Same masked-logits expression as the scanned path below, so
             # replay scores the exact distribution rollout would have sampled
@@ -494,6 +470,13 @@ class TransformerExplicitCoTTorso(nn.Module):
                 log_token_probs, target_tokens[..., None], axis=-1
             ).squeeze(axis=-1)
 
+            # A step only counts if no earlier step already halted - i.e. its
+            # exclusive running count of "act now" tokens so far is zero.
+            halted = target_tokens == act_token_id
+            earlier_halts = jnp.cumsum(halted.astype(jnp.int32), axis=-1) - halted.astype(
+                jnp.int32
+            )
+            still_running = earlier_halts == 0
             per_step_log_prob = jnp.where(still_running, token_log_prob, 0.0)
             log_prob = jnp.sum(per_step_log_prob, axis=-1)
             # Entropy of the *whole* per-step categorical (thought tokens
@@ -535,7 +518,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_moe_inputs = [
             init_soft_moe_cache(
-                batch_shape, self.max_steps, self.hidden_dim, self.moe_type, self.num_experts
+                batch_shape, self.max_steps, self.hidden_dim, self.num_experts
             )
             for _ in range(self.num_layers)
         ]
@@ -577,7 +560,6 @@ class TransformerExplicitCoTTorso(nn.Module):
                 cached_values,
                 cached_moe_inputs,
                 step_idx,
-                token_mask=still_running,
             )
             token_logits = jnp.where(legal_mask[step_idx], backbone.token_head(state), _NEG_INF)
 
@@ -646,15 +628,7 @@ class TransformerExplicitCoTTorso(nn.Module):
         # passed through explicitly so its params stay shared with the
         # parallel replay path rather than becoming a second, independently
         # -initialized copy scoped under the scan - see `_ExplicitCoTBackbone`.
-        scan_step = nn.scan(
-            step_fn,
-            variable_broadcast="params",
-            # MoE load-balancing statistics sown per step (see
-            # `stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP`)
-            # are stacked along a leading step axis.
-            variable_axes={"intermediates": 0},
-            split_rngs={"params": False},
-        )
+        scan_step = nn.scan(step_fn, variable_broadcast="params", split_rngs={"params": False})
         initial_carry = (
             initial_token,  # current_token
             cached_keys,

@@ -59,7 +59,6 @@ from stoix.base_types import (
 )
 from stoix.networks.base import FeedForwardCritic as Critic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
-from stoix.networks.torso_compute_transformer import apply_with_moe_load_balancing_loss
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
@@ -232,18 +231,8 @@ def get_learner_fn(
             # `per_step_halting_entropy` (only needed for PPO's latent
             # trust-region penalty/per-step clip/halting entropy bonus, see
             # `ff_ppo.py`) are ignored here.
-            # MoE load-balancing loss (see
-            # stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP) - a
-            # no-op (plain apply, zero loss) when moe_load_balancing_coef == 0 or
-            # the actor has no MoE layers.
-            (actor_policy, halting_log_prob, _, _, _), moe_load_balancing_loss = (
-                apply_with_moe_load_balancing_loss(
-                    actor_apply_fn,
-                    config.system.moe_load_balancing_coef > 0,
-                    actor_params,
-                    observations,
-                    torso_kwargs={"target_compute_time": compute_times},
-                )
+            actor_policy, halting_log_prob, _, _, _ = actor_apply_fn(
+                actor_params, observations, torso_kwargs={"target_compute_time": compute_times}
             )
             env_log_prob = actor_policy.log_prob(actions)
             log_prob = env_log_prob + halting_log_prob
@@ -261,11 +250,7 @@ def get_learner_fn(
             loss_actor = -weight * log_prob
             entropy = actor_policy.entropy().mean()
 
-            total_loss_actor = (
-                loss_actor.mean()
-                - config.system.ent_coef * entropy
-                + config.system.moe_load_balancing_coef * moe_load_balancing_loss
-            )
+            total_loss_actor = loss_actor.mean() - config.system.ent_coef * entropy
             loss_info = {
                 "actor_loss": loss_actor,
                 "entropy": entropy,
@@ -273,7 +258,6 @@ def get_learner_fn(
                 "first_convergence_step": first_convergence_steps,
                 "num_close_steps": num_close_steps,
                 "advantage": advantage.mean(),
-                "moe_load_balancing_loss": moe_load_balancing_loss,
             }
             if config.system.delightful:
                 loss_info["delightful_gate"] = gate

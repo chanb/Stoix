@@ -155,7 +155,6 @@ from stoix.base_types import (
 from stoix.networks.base import FeedForwardCritic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.networks.base_qac import SeparateValueAndQCritic, ValueAndQCritic
-from stoix.networks.torso_compute_transformer import apply_with_moe_load_balancing_loss
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.explicit_cot_types import PPOExplicitCoTTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
@@ -460,18 +459,10 @@ def get_learner_fn(
         ) -> Tuple:
             """Calculate the actor loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
-            # MoE load-balancing loss (see
-            # stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP) - a
-            # no-op (plain apply, zero loss) when moe_load_balancing_coef == 0 or
-            # the actor has no MoE layers.
-            (actor_policy, _, cot_log_prob, cot_entropy), moe_load_balancing_loss = (
-                apply_with_moe_load_balancing_loss(
-                    actor_apply_fn,
-                    config.system.moe_load_balancing_coef > 0,
-                    actor_params,
-                    traj_batch.obs,
-                    torso_kwargs={"target_tokens": traj_batch.thought_tokens},
-                )
+            actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
+                actor_params,
+                traj_batch.obs,
+                torso_kwargs={"target_tokens": traj_batch.thought_tokens},
             )
             env_log_prob = actor_policy.log_prob(traj_batch.action)
 
@@ -543,7 +534,6 @@ def get_learner_fn(
                 loss_actor
                 - config.system.ent_coef * entropy
                 - config.system.halting_ent_coef * cot_entropy_bonus
-                + config.system.moe_load_balancing_coef * moe_load_balancing_loss
             )
             loss_info = {
                 "actor_loss": loss_actor,
@@ -555,7 +545,6 @@ def get_learner_fn(
                 "compute_time": traj_batch.compute_time,
                 "action_clip_fraction": action_clip_fraction,
                 "cot_clip_fraction": cot_clip_fraction,
-                "moe_load_balancing_loss": moe_load_balancing_loss,
             }
             return total_loss_actor, loss_info
 
@@ -804,18 +793,10 @@ def get_learner_fn(
                     """
                     # Replay the token trajectory actually taken during
                     # rollout, mirroring log_prob(traj_batch.action) below.
-                    # MoE load-balancing loss (see
-                    # stoix.networks.torso_compute_transformer.MixtureOfExpertsMLP) - a
-                    # no-op (plain apply, zero loss) when moe_load_balancing_coef == 0 or
-                    # the actor has no MoE layers.
-                    (actor_policy, _, cot_log_prob, cot_entropy), moe_load_balancing_loss = (
-                        apply_with_moe_load_balancing_loss(
-                            actor_apply_fn,
-                            config.system.moe_load_balancing_coef > 0,
-                            actor_params,
-                            traj_batch.obs,
-                            torso_kwargs={"target_tokens": traj_batch.thought_tokens},
-                        )
+                    actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
+                        actor_params,
+                        traj_batch.obs,
+                        torso_kwargs={"target_tokens": traj_batch.thought_tokens},
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
 
@@ -912,7 +893,6 @@ def get_learner_fn(
                         loss_actor
                         - config.system.ent_coef * entropy
                         - config.system.halting_ent_coef * cot_entropy_bonus
-                        + config.system.moe_load_balancing_coef * moe_load_balancing_loss
                     )
                     loss_info = {
                         "actor_loss": loss_actor,
@@ -924,7 +904,6 @@ def get_learner_fn(
                         "compute_time": traj_batch.compute_time,
                         "action_clip_fraction": action_clip_fraction,
                         "cot_clip_fraction": cot_clip_fraction,
-                        "moe_load_balancing_loss": moe_load_balancing_loss,
                     }
                     return total_loss_actor, loss_info
 
