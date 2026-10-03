@@ -41,7 +41,8 @@ O(max_steps) total compute rather than O(max_steps^2) for a design that
 recomputed the whole scratchpad from scratch every step.
 """
 
-from typing import Any, Optional, Tuple
+import math
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import chex
 import jax
@@ -91,16 +92,209 @@ def _expert_kernel_init(kernel_init: Initializer) -> Initializer:
     return init
 
 
-def init_soft_moe_cache(
-    batch_shape: Tuple[int, ...], max_steps: int, hidden_dim: int, num_experts: int
+# Name under which `SoftMoEMLP` sows its diagnostics.
+SOFT_MOE_STATS_KEY = "soft_moe_stats"
+
+
+MOE_TYPES = ("soft", "switch")
+
+
+def init_moe_cache(
+    batch_shape: Tuple[int, ...],
+    max_steps: int,
+    hidden_dim: int,
+    num_experts: int,
+    moe_type: str = "soft",
+    switch_capacity_factor: Optional[float] = None,
 ) -> Optional[chex.Array]:
-    """Per-layer cache of past MLP inputs for `SoftMoEMLP.step` (shape
-    `(*batch, max_steps + 1, hidden_dim)`, the soft-MoE analogue of the
-    per-layer KV-cache), or `None` when the block has no soft MoE - pass the
-    result as `TransformerBlock.step`'s `cached_moe_inputs` either way."""
-    if num_experts > 0:
+    """Per-layer cache for `TransformerBlock.step`'s MoE MLP (the MoE
+    analogue of the per-layer KV-cache) - pass the result as its
+    `moe_cache` either way:
+
+      - soft MoE: past MLP inputs, `(*batch, max_steps + 1, hidden_dim)`
+        (see `SoftMoEMLP.step`);
+      - Switch MoE with an expert capacity: per-expert counts of tokens
+        routed so far, `(*batch, num_experts)` (see `SwitchMoEMLP.step`);
+      - otherwise (dense MLP, or Switch without capacity) `None`.
+    """
+    if num_experts > 0 and moe_type == "soft":
         return jnp.zeros(batch_shape + (max_steps + 1, hidden_dim))
+    if num_experts > 0 and moe_type == "switch" and switch_capacity_factor:
+        return jnp.zeros(batch_shape + (num_experts,))
     return None
+
+
+# Name under which `SwitchMoEMLP` sows its routing statistics.
+SWITCH_MOE_STATS_KEY = "switch_moe_stats"
+
+
+class SwitchMoEMLP(nn.Module):
+    """A Switch Transformer layer (Fedus et al., 2021, "Switch Transformers:
+    Scaling to Trillion Parameter Models with Simple and Efficient
+    Sparsity") - a top-1 routed mixture of `num_experts` two-layer MLPs,
+    replacing `TransformerBlock`'s dense MLP (`Dense(mlp_dim) -> activation
+    -> Dense(out_dim)`), with each expert shaped exactly like it.
+
+    Following the paper:
+
+      - Top-1 routing: a linear router gives `p = softmax(W_r x)`; the token
+        goes to expert `i = argmax p` only, and the output is `p_i *
+        E_i(x)` - the gate is the router probability itself, so the router
+        gets gradient from the task loss through it.
+      - Load balancing: `moe_load_balancing_loss` is the paper's auxiliary
+        loss `N * sum_i f_i * P_i` (scaled by
+        `config.system.moe_load_balancing_coef`, the paper's `alpha`,
+        default 0.01).
+      - Selective precision: the router runs in float32 regardless of the
+        input dtype.
+      - Smaller initialization (`init_scale`, default `None`): if set, the
+        router and expert kernels are drawn from a truncated normal with
+        std `sqrt(init_scale / fan_in)` (the paper uses 0.1, i.e. 10x
+        smaller than the default scale 1.0) instead of `kernel_init`.
+      - Expert capacity (`capacity_factor`, default `None` = unlimited): each
+        expert accepts at most `ceil(capacity_factor * seq_len /
+        num_experts)` tokens; overflow tokens skip the expert (output 0, so
+        the block's residual passes them through unchanged), as in the
+        paper. Adapted to the CoT setting: the paper fills capacity across
+        a whole batch, which here would make one example's output depend on
+        which other examples share its (rollout or minibatch) batch - so
+        capacity is per example, over its own scratchpad (`seq_len` =
+        `max_steps`), filled first-come-first-served in step order. That's
+        causal, so `step` (carrying per-expert counts, see
+        `init_moe_cache`) gives exactly what the full-sequence `__call__`
+        gives.
+
+    Not included: the paper's router jitter noise - it randomizes routing
+    at rollout time, which PPO's replay would then score under different
+    routing (the train/rollout routing mismatch Rollout Routing Replay,
+    arXiv:2510.11370, exists to fix).
+
+    Every expert is evaluated for every token and the unselected ones are
+    zero-weighted, rather than dispatching tokens to experts sparsely: at
+    the model sizes used here that's simpler and faster on accelerators
+    than gather/scatter dispatch, and computes exactly the same function -
+    but it also means capacity saves no compute here, only changes the
+    function (token dropping as a regularizer).
+
+    Statistics: every call sows (into the `"intermediates"` collection,
+    under `SWITCH_MOE_STATS_KEY`) per-token `dispatch` (`(..., num_experts)`
+    one-hot of the routed expert, before capacity), `router_prob` (the full
+    router softmax), `kept` (1 unless dropped by capacity), `step` (a
+    one-hot of the token's CoT step / scratchpad position, for the per-step
+    statistics in `switch_moe_metrics`) and `mask`
+    (`token_mask` - which tokens count, e.g. excluding CoT steps past an
+    example's halt; all of them if `None`). `sow` is a no-op unless the
+    caller applies the model with `mutable=["intermediates"]` (see
+    `apply_collecting_moe_stats`), so rollout/eval are untouched.
+    `token_mask` never changes the output.
+    """
+
+    num_experts: int
+    mlp_dim: int
+    out_dim: int
+    activation: str = "relu"
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    capacity_factor: Optional[float] = None
+    init_scale: Optional[float] = None
+    in_dim: Optional[int] = None  # defaults to `out_dim`
+
+    def setup(self) -> None:
+        weight_init = (
+            self.kernel_init
+            if self.init_scale is None
+            else nn.initializers.variance_scaling(self.init_scale, "fan_in", "truncated_normal")
+        )
+        in_dim = self.out_dim if self.in_dim is None else self.in_dim
+        self.router = nn.Dense(
+            self.num_experts, kernel_init=weight_init, dtype=jnp.float32, param_dtype=jnp.float32
+        )
+        expert_init = _expert_kernel_init(weight_init)
+        self.w0 = self.param("w0", expert_init, (self.num_experts, in_dim, self.mlp_dim))
+        self.b0 = self.param("b0", nn.initializers.zeros, (self.num_experts, self.mlp_dim))
+        self.w1 = self.param("w1", expert_init, (self.num_experts, self.mlp_dim, self.out_dim))
+        self.b1 = self.param("b1", nn.initializers.zeros, (self.num_experts, self.out_dim))
+
+    def _capacity(self, seq_len: int) -> int:
+        return max(1, math.ceil(self.capacity_factor * seq_len / self.num_experts))
+
+    def _route(self, x: chex.Array) -> Tuple[chex.Array, chex.Array, chex.Array]:
+        """`(router_prob, one_hot, gate)` - the full router softmax, the
+        routed expert as a one-hot, and its probability (the gate)."""
+        router_prob = jax.nn.softmax(self.router(x.astype(jnp.float32)), axis=-1)
+        one_hot = jax.nn.one_hot(jnp.argmax(router_prob, axis=-1), self.num_experts)
+        gate = jnp.sum(one_hot * router_prob, axis=-1)
+        return router_prob, one_hot, gate
+
+    def _mix(
+        self,
+        x: chex.Array,
+        router_prob: chex.Array,
+        one_hot: chex.Array,
+        gate: chex.Array,
+        kept: chex.Array,
+        step_one_hot: chex.Array,
+        token_mask: Optional[chex.Array],
+    ) -> chex.Array:
+        if token_mask is None:
+            token_mask = jnp.ones(x.shape[:-1], dtype=bool)
+        self.sow(
+            "intermediates",
+            SWITCH_MOE_STATS_KEY,
+            {
+                "dispatch": one_hot,  # (..., E), non-differentiable
+                "router_prob": router_prob,  # (..., E)
+                "kept": kept.astype(jnp.float32),  # (...)
+                "step": step_one_hot,  # (..., num_steps)
+                "mask": jnp.broadcast_to(token_mask, x.shape[:-1]).astype(jnp.float32),
+            },
+        )
+        h = jnp.einsum("...d,edm->...em", x, self.w0) + self.b0
+        h = parse_activation_fn(self.activation)(h)
+        expert_out = jnp.einsum("...em,emo->...eo", h, self.w1) + self.b1
+        routed_out = jnp.einsum("...e,...eo->...o", one_hot.astype(x.dtype), expert_out)
+        return (gate * kept).astype(x.dtype)[..., None] * routed_out
+
+    def __call__(self, x: chex.Array, token_mask: Optional[chex.Array] = None) -> chex.Array:
+        """Full-sequence: `x` is `(..., seq_len, d)` (`seq_len` only matters
+        with a capacity); `token_mask` (optional, `(..., seq_len)`) only
+        affects the sown statistics."""
+        router_prob, one_hot, gate = self._route(x)
+        if self.capacity_factor:
+            # Earlier tokens of the same example routed to the same expert.
+            position_in_expert = jnp.sum((jnp.cumsum(one_hot, axis=-2) - one_hot) * one_hot, -1)
+            kept = position_in_expert < self._capacity(x.shape[-2])
+        else:
+            kept = jnp.ones(x.shape[:-1], dtype=bool)
+        seq_len = x.shape[-2]
+        step_one_hot = jnp.broadcast_to(
+            jnp.eye(seq_len, dtype=jnp.float32), x.shape[:-1] + (seq_len,)
+        )
+        return self._mix(x, router_prob, one_hot, gate, kept, step_one_hot, token_mask)
+
+    def step(
+        self,
+        x: chex.Array,
+        expert_counts: Optional[chex.Array],
+        step_idx: chex.Array,
+        max_steps: int,
+        token_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, Optional[chex.Array]]:
+        """Incremental counterpart to `__call__` for one new token `x`
+        (`(..., d)`) at CoT step `step_idx`: with a capacity, `expert_counts` (`(..., num_experts)`,
+        see `init_moe_cache`) holds how many earlier tokens of this example
+        went to each expert, and is returned updated; without one it's
+        `None`, passed through. Returns `(output, expert_counts)`."""
+        router_prob, one_hot, gate = self._route(x)
+        if self.capacity_factor:
+            kept = jnp.sum(expert_counts * one_hot, axis=-1) < self._capacity(max_steps)
+            expert_counts = expert_counts + one_hot
+        else:
+            kept = jnp.ones(x.shape[:-1], dtype=bool)
+        step_one_hot = jnp.broadcast_to(
+            jax.nn.one_hot(step_idx, max_steps), x.shape[:-1] + (max_steps,)
+        )
+        out = self._mix(x, router_prob, one_hot, gate, kept, step_one_hot, token_mask)
+        return out, expert_counts
 
 
 class SoftMoEMLP(nn.Module):
@@ -135,6 +329,15 @@ class SoftMoEMLP(nn.Module):
     feature axis and `Phi` along its input axis, times a learned scalar
     (init 1) - when computing the logits; they recommend it for large model
     widths and found it makes little difference for small ones.
+
+    Diagnostics: every call sows (into the `"intermediates"` collection,
+    under `SOFT_MOE_STATS_KEY`) the per-token combine weights, the per-token
+    dispatch entropy, and the per-token `token_mask` (which tokens count -
+    e.g. excluding CoT steps past an example's halt; all of them if `None`).
+    `sow` is a no-op unless the caller applies the model with
+    `mutable=["intermediates"]`, so rollout/eval are untouched - see
+    `apply_collecting_moe_stats`, `soft_moe_metrics` and
+    `moe_drift_metrics`. `token_mask` never changes the output.
     """
 
     num_experts: int
@@ -146,11 +349,19 @@ class SoftMoEMLP(nn.Module):
     normalize: bool = False
 
     @nn.compact
-    def _mix(self, queries: chex.Array, keys: chex.Array, key_mask: chex.Array) -> chex.Array:
+    def _mix(
+        self,
+        queries: chex.Array,
+        keys: chex.Array,
+        key_mask: chex.Array,
+        query_mask: Optional[chex.Array] = None,
+    ) -> chex.Array:
         """queries: `(..., Q, d)` - the tokens to produce outputs for.
         keys: `(..., K, d)` - the tokens slots are built from.
         key_mask: broadcastable to `(..., Q, K)` - which keys each query's
             slots may mix (its causal past).
+        query_mask: optional `(..., Q)` bool - which queries count towards
+            the sown diagnostics (see class docstring).
         Returns `(..., Q, out_dim)`."""
         in_dim = keys.shape[-1]
         num_slots = self.num_experts * self.slots_per_expert
@@ -192,29 +403,312 @@ class SoftMoEMLP(nn.Module):
 
         # Combine: per query, a softmax over all slots.
         combine = jax.nn.softmax(jnp.einsum("...qd,ds->...qs", logit_queries, phi), axis=-1)
+
+        # Mean (over slots) entropy of each query's dispatch distribution over
+        # its causal past; masked-out keys have weight exactly 0, so the
+        # `where` only guards 0 * log(0).
+        dispatch_entropy = -jnp.sum(
+            jnp.where(dispatch > 0, dispatch * jnp.log(jnp.maximum(dispatch, 1e-30)), 0.0),
+            axis=-2,
+        ).mean(axis=-1)
+        if query_mask is None:
+            query_mask = jnp.ones(combine.shape[:-1], dtype=bool)
+        self.sow(
+            "intermediates",
+            SOFT_MOE_STATS_KEY,
+            {
+                "combine": combine,  # (..., Q, S)
+                "dispatch_entropy": dispatch_entropy,  # (..., Q)
+                "mask": jnp.broadcast_to(query_mask, combine.shape[:-1]).astype(combine.dtype),
+            },
+        )
         return jnp.einsum("...qs,...qso->...qo", combine, slot_out)
 
-    def __call__(self, x: chex.Array) -> chex.Array:
-        """Full-sequence, causal: `x` is `(..., seq_len, d)`."""
+    def __call__(self, x: chex.Array, token_mask: Optional[chex.Array] = None) -> chex.Array:
+        """Full-sequence, causal: `x` is `(..., seq_len, d)`; `token_mask`
+        (optional, `(..., seq_len)`) only affects the sown diagnostics."""
         seq_len = x.shape[-2]
         causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
-        return self._mix(x, x, causal)
+        return self._mix(x, x, causal, token_mask)
 
     def step(
-        self, x: chex.Array, cached_inputs: chex.Array, step_idx: chex.Array, max_steps: int
+        self,
+        x: chex.Array,
+        cached_inputs: chex.Array,
+        step_idx: chex.Array,
+        max_steps: int,
+        token_mask: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, chex.Array]:
         """Incremental counterpart to `__call__` for one new token `x`
         (`(..., d)`) at position `step_idx`: writes it into `cached_inputs`
-        (`(..., max_steps + 1, d)`, see `init_soft_moe_cache`) and mixes only
-        positions written so far. Returns `(output, updated_cache)`."""
+        (`(..., max_steps + 1, d)`, see `init_moe_cache`) and mixes only
+        positions written so far. `token_mask` (optional, `(...)`) only
+        affects the sown diagnostics. Returns `(output, updated_cache)`."""
         cached_inputs = cached_inputs.at[..., step_idx, :].set(x)
         key_mask = (jnp.arange(max_steps + 1) <= step_idx)[None, :]
-        out = self._mix(x[..., None, :], cached_inputs, key_mask)
+        query_mask = None if token_mask is None else token_mask[..., None]
+        out = self._mix(x[..., None, :], cached_inputs, key_mask, query_mask)
         return out[..., 0, :], cached_inputs
 
 
 def _l2_normalize(x: chex.Array, axis: int = -1, eps: float = 1e-6) -> chex.Array:
     return x * jax.lax.rsqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
+
+
+def _moe_layer_stats(
+    intermediates: Mapping[str, Any], stats_key: str
+) -> List[Dict[str, chex.Array]]:
+    """One entry per MoE layer that sowed under `stats_key` (in a fixed tree
+    order, so two applies of the same model line up): that layer's sown
+    per-token stats from every call, concatenated and flattened to `(N,)`
+    (per-token scalars, like `mask`) or `(N, D)` (per-token vectors, like
+    combine/dispatch weights). Works regardless of layout (a scan's leading
+    step axis, a full-sequence call's trailing one), since every field of a
+    call shares `mask`'s leading shape."""
+    layers = []
+
+    def flatten(x: chex.Array, token_ndim: int) -> chex.Array:
+        return x.reshape(-1) if x.ndim == token_ndim else x.reshape(-1, x.shape[-1])
+
+    def visit(tree: Any) -> None:
+        if not isinstance(tree, Mapping):
+            return
+        for key in sorted(tree):
+            value = tree[key]
+            if key != stats_key:
+                visit(value)
+                continue
+            layers.append(
+                {
+                    field: jnp.concatenate(
+                        [flatten(call[field], call["mask"].ndim) for call in value]
+                    )
+                    for field in value[0]
+                }
+            )
+
+    visit(intermediates)
+    return layers
+
+
+def _masked_mean(x: chex.Array, mask: chex.Array) -> chex.Array:
+    return jnp.sum(x * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+
+def _entropy(probs: chex.Array, axis: int = -1) -> chex.Array:
+    return -jnp.sum(probs * jnp.log(jnp.maximum(probs, 1e-30)), axis=axis)
+
+
+def _kl(p: chex.Array, q: chex.Array, axis: int = -1) -> chex.Array:
+    return jnp.sum(
+        p * (jnp.log(jnp.maximum(p, 1e-30)) - jnp.log(jnp.maximum(q, 1e-30))), axis=axis
+    )
+
+
+def _average_over_layers(per_layer: List[Dict[str, chex.Array]]) -> Dict[str, chex.Array]:
+    if not per_layer:
+        return {}
+    return {key: sum(m[key] for m in per_layer) / len(per_layer) for key in per_layer[0]}
+
+
+def soft_moe_metrics(intermediates: Mapping[str, Any]) -> Dict[str, chex.Array]:
+    """Soft MoE health diagnostics from an `apply(..., mutable=
+    ["intermediates"])`'s `"intermediates"`, each averaged over masked-in
+    tokens and then over layers (empty dict if the model has no soft MoE):
+
+      - `soft_moe_combine_entropy`: per-token entropy of the combine
+        weights over slots, divided by `log(num_slots)` - 1 = uniform
+        mixing, 0 = each token reads a single slot (saturated, i.e. hard
+        top-1-like routing).
+      - `soft_moe_combine_max`: per-token largest combine weight.
+      - `soft_moe_slot_usage_entropy`: entropy of the combine weights
+        averaged over tokens, divided by `log(num_slots)` - low means some
+        slots are barely read by any token.
+      - `soft_moe_dispatch_entropy`: per-token mean (over slots) entropy of
+        the dispatch weights over the causal past, in nats (unnormalized:
+        the number of past tokens varies by position; 0 at step 0).
+    """
+    per_layer = []
+    for layer in _moe_layer_stats(jax.lax.stop_gradient(intermediates), SOFT_MOE_STATS_KEY):
+        combine, mask = layer["combine"], layer["mask"]
+        log_slots = jnp.log(combine.shape[-1])
+        usage = jnp.sum(combine * mask[:, None], axis=0) / jnp.maximum(jnp.sum(mask), 1.0)
+        per_layer.append(
+            {
+                "soft_moe_combine_entropy": _masked_mean(_entropy(combine), mask) / log_slots,
+                "soft_moe_combine_max": _masked_mean(jnp.max(combine, axis=-1), mask),
+                "soft_moe_slot_usage_entropy": _entropy(usage) / log_slots,
+                "soft_moe_dispatch_entropy": _masked_mean(layer["dispatch_entropy"], mask),
+            }
+        )
+    return _average_over_layers(per_layer)
+
+
+def _switch_expert_fractions(layer: Dict[str, chex.Array]) -> Tuple[chex.Array, chex.Array]:
+    """`(f, P)`: fraction of (masked-in) tokens routed to each expert
+    (before capacity, as in the paper; sums to 1), and each expert's mean
+    router probability."""
+    mask = layer["mask"][:, None]
+    dispatch = jnp.sum(layer["dispatch"] * mask, axis=0)
+    f = dispatch / jnp.maximum(jnp.sum(dispatch), 1.0)
+    P = jnp.sum(layer["router_prob"] * mask, axis=0) / jnp.maximum(jnp.sum(mask), 1.0)
+    return f, P
+
+
+def moe_load_balancing_loss(intermediates: Mapping[str, Any]) -> chex.Array:
+    """Switch Transformer load-balancing loss (Fedus et al., 2021) from the
+    statistics every `SwitchMoEMLP` sowed into `intermediates`
+    (differentiable through the router probabilities - don't stop-gradient
+    `intermediates` before calling this).
+
+    Per layer: `num_experts * sum_i f_i * P_i`, with `f_i`/`P_i` from
+    `_switch_expert_fractions`, pooled over every call of that layer (all
+    CoT steps, all batch elements) and masked to tokens that count. It
+    equals 1 when routing is perfectly uniform and grows as it
+    concentrates. Averaged over layers; `0.0` without Switch MoE (dense or
+    soft), so it's safe to add unconditionally."""
+    losses = []
+    for layer in _moe_layer_stats(intermediates, SWITCH_MOE_STATS_KEY):
+        f, P = _switch_expert_fractions(layer)
+        losses.append(f.shape[-1] * jnp.sum(jax.lax.stop_gradient(f) * P))
+    if not losses:
+        return jnp.zeros(())
+    return sum(losses) / len(losses)
+
+
+def switch_moe_metrics(intermediates: Mapping[str, Any]) -> Dict[str, chex.Array]:
+    """Switch MoE routing diagnostics, averaged over layers (empty dict
+    without Switch MoE). Entropies are divided by `log(num_experts)`, so 1 =
+    uniform, 0 = a single expert:
+
+      - `switch_moe_expert_usage_entropy`: entropy of the distribution over
+        *chosen* experts (fraction of tokens routed to each) - the load
+        balance actually achieved.
+      - `switch_moe_max_expert_fraction`: largest fraction of tokens routed
+        to one expert (`1 / num_experts` balanced, 1 collapsed).
+      - `switch_moe_dead_expert_fraction`: fraction of experts no masked-in
+        token was routed to.
+      - `switch_moe_router_entropy`: per-token entropy of the full router
+        softmax - how decisive the router is for an individual token.
+      - `switch_moe_router_usage_entropy`: entropy of the router
+        probabilities averaged over tokens (what the load-balancing loss
+        pushes on, through `P`).
+      - `switch_moe_gate`: per-token router probability of the chosen
+        expert (the gate value) - near 1 means confident, near
+        `1 / num_experts` near-arbitrary routing.
+      - `switch_moe_dropped_fraction`: fraction of tokens dropped by the
+        expert capacity (always 0 without one).
+      - `switch_moe_step_expert_usage_entropy`: the expert-usage entropy
+        computed separately at each CoT step (fraction of that step's tokens
+        routed to each expert), averaged over steps weighted by each step's
+        number of tokens - low means routing is near-deterministic *given
+        the step*, even if balanced overall.
+      - `switch_moe_step_expert_mi`: mutual information between the chosen
+        expert and the CoT step, `I(expert; step) = H(f) - sum_t w_t H(f_t)`
+        (divided by `log(num_experts)`, so it's exactly
+        `switch_moe_expert_usage_entropy -
+        switch_moe_step_expert_usage_entropy`) - 0 means routing doesn't
+        depend on the step at all; large means experts specialize by step
+        (e.g. one expert per step), which the pooled load-balancing loss
+        can't see.
+    """
+    per_layer = []
+    for layer in _moe_layer_stats(jax.lax.stop_gradient(intermediates), SWITCH_MOE_STATS_KEY):
+        mask, router_prob = layer["mask"], layer["router_prob"]
+        log_experts = jnp.log(router_prob.shape[-1])
+        f, P = _switch_expert_fractions(layer)
+        # (num_steps, num_experts) routed-token counts per CoT step.
+        step_counts = jnp.einsum("nt,ne->te", layer["step"] * mask[:, None], layer["dispatch"])
+        step_tokens = jnp.sum(step_counts, axis=-1)
+        step_weight = step_tokens / jnp.maximum(jnp.sum(step_tokens), 1.0)
+        step_f = step_counts / jnp.maximum(step_tokens, 1.0)[:, None]
+        step_usage_entropy = jnp.sum(step_weight * _entropy(step_f)) / log_experts
+        usage_entropy = _entropy(f) / log_experts
+        per_layer.append(
+            {
+                "switch_moe_expert_usage_entropy": usage_entropy,
+                "switch_moe_step_expert_usage_entropy": step_usage_entropy,
+                "switch_moe_step_expert_mi": usage_entropy - step_usage_entropy,
+                "switch_moe_max_expert_fraction": jnp.max(f),
+                "switch_moe_dead_expert_fraction": jnp.mean((f <= 0.0).astype(jnp.float32)),
+                "switch_moe_router_entropy": _masked_mean(_entropy(router_prob), mask)
+                / log_experts,
+                "switch_moe_router_usage_entropy": _entropy(P) / log_experts,
+                "switch_moe_gate": _masked_mean(
+                    jnp.sum(layer["dispatch"] * router_prob, axis=-1), mask
+                ),
+                "switch_moe_dropped_fraction": _masked_mean(1.0 - layer["kept"], mask),
+            }
+        )
+    return _average_over_layers(per_layer)
+
+
+def moe_metrics(intermediates: Mapping[str, Any]) -> Dict[str, chex.Array]:
+    """`soft_moe_metrics` and `switch_moe_metrics` together - whichever kind
+    of MoE the model has (empty dict for a dense MLP)."""
+    return {**soft_moe_metrics(intermediates), **switch_moe_metrics(intermediates)}
+
+
+def moe_drift_metrics(
+    old_intermediates: Mapping[str, Any], new_intermediates: Mapping[str, Any]
+) -> Dict[str, chex.Array]:
+    """How far the routing moved between two applies of the same model on
+    the same inputs (e.g. before vs. after a PPO update, replaying the same
+    trajectory), masked by the old apply's `token_mask` and averaged over
+    layers (empty dict for a dense MLP):
+
+      - `soft_moe_combine_kl`: per-token `KL(old || new)` of the soft-MoE
+        combine weights.
+      - `switch_moe_router_kl`: per-token `KL(old || new)` of the Switch
+        router softmax.
+      - `switch_moe_routing_change`: fraction of tokens routed to a
+        different expert - the discrete routing flips that make per-token
+        PPO ratios unreliable for hard-routed MoE (cf. Rollout Routing
+        Replay, arXiv:2510.11370).
+    """
+    old_intermediates = jax.lax.stop_gradient(old_intermediates)
+    new_intermediates = jax.lax.stop_gradient(new_intermediates)
+    metrics = {}
+    soft = [
+        _masked_mean(_kl(old["combine"], new["combine"]), old["mask"])
+        for old, new in zip(
+            _moe_layer_stats(old_intermediates, SOFT_MOE_STATS_KEY),
+            _moe_layer_stats(new_intermediates, SOFT_MOE_STATS_KEY),
+        )
+    ]
+    if soft:
+        metrics["soft_moe_combine_kl"] = sum(soft) / len(soft)
+    switch = [
+        {
+            "switch_moe_router_kl": _masked_mean(
+                _kl(old["router_prob"], new["router_prob"]), old["mask"]
+            ),
+            "switch_moe_routing_change": _masked_mean(
+                jnp.any(old["dispatch"] != new["dispatch"], axis=-1).astype(jnp.float32),
+                old["mask"],
+            ),
+        }
+        for old, new in zip(
+            _moe_layer_stats(old_intermediates, SWITCH_MOE_STATS_KEY),
+            _moe_layer_stats(new_intermediates, SWITCH_MOE_STATS_KEY),
+        )
+    ]
+    metrics.update(_average_over_layers(switch))
+    return metrics
+
+
+def apply_collecting_moe_stats(
+    apply_fn: Callable, enabled: bool, *args: Any, **kwargs: Any
+) -> Tuple[Any, Mapping[str, Any]]:
+    """`apply_fn(*args, **kwargs)` plus the MoE statistics it sowed (the
+    `"intermediates"` collection) - for `moe_load_balancing_loss` (which
+    needs their gradient), `moe_metrics` and `moe_drift_metrics` (which
+    stop-gradient them). With `enabled=False` it's exactly the plain call
+    and the stats are `{}`."""
+    if not enabled:
+        return apply_fn(*args, **kwargs), {}
+    outputs, state = apply_fn(*args, mutable=["intermediates"], **kwargs)
+    return outputs, dict(state.get("intermediates", {}))
 
 
 class TransformerBlock(nn.Module):
@@ -275,12 +769,15 @@ class TransformerBlock(nn.Module):
     `num_experts` (default `0`, meaning a plain dense MLP) replaces the MLP
     sub-layer with a `SoftMoEMLP` - causal Soft MoE over the scratchpad - of
     that many experts (each `mlp_dim` wide), with `soft_moe_slots_per_expert`
-    slots per expert and optional `soft_moe_normalize`. Only the MLP changes:
+    slots per expert and optional `soft_moe_normalize` - or, with
+    `moe_type="switch"`, a `SwitchMoEMLP` (a Switch Transformer layer:
+    top-1 routing, optional `switch_capacity_factor` and
+    `switch_init_scale`) instead. Only the MLP changes:
     attention, norms and the residual are untouched. With `num_experts=0`
     the parameter tree is exactly what it was before, so existing
     checkpoints and configs are unaffected. Soft MoE's `step` needs a cache
-    of past MLP inputs (`cached_moe_inputs`, allocate with
-    `init_soft_moe_cache`); without it that's `None`, passed straight
+    of past MLP inputs (`moe_cache`, allocate with
+    `init_moe_cache`); for every other MLP it's `None`, passed straight
     through.
     """
 
@@ -295,8 +792,17 @@ class TransformerBlock(nn.Module):
     num_experts: int = 0
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
+    moe_type: str = "soft"
+    switch_capacity_factor: Optional[float] = None
+    switch_init_scale: Optional[float] = None
+
+    @property
+    def _uses_soft_moe(self) -> bool:
+        return self.num_experts > 0 and self.moe_type == "soft"
 
     def setup(self) -> None:
+        if self.moe_type not in MOE_TYPES:
+            raise ValueError(f"moe_type must be one of {MOE_TYPES}, got {self.moe_type!r}.")
         qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
         assert qkv_dim % self.num_heads == 0, (
             f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
@@ -314,7 +820,7 @@ class TransformerBlock(nn.Module):
         norm_cls = _norm_cls(self.use_rmsnorm)
         self.attn_norm = norm_cls()
         self.mlp_norm = norm_cls()
-        if self.num_experts > 0:
+        if self._uses_soft_moe:
             self.mlp_moe = SoftMoEMLP(
                 self.num_experts,
                 self.soft_moe_slots_per_expert,
@@ -323,6 +829,16 @@ class TransformerBlock(nn.Module):
                 self.activation,
                 self.kernel_init,
                 self.soft_moe_normalize,
+            )
+        elif self.num_experts > 0:
+            self.mlp_moe = SwitchMoEMLP(
+                self.num_experts,
+                self.mlp_dim,
+                self.hidden_dim,
+                self.activation,
+                self.kernel_init,
+                self.switch_capacity_factor,
+                self.switch_init_scale,
             )
         else:
             self.mlp_dense_0 = nn.Dense(self.mlp_dim, kernel_init=self.kernel_init)
@@ -345,7 +861,11 @@ class TransformerBlock(nn.Module):
         self,
         tokens: chex.Array,
         mask: Optional[chex.Array] = None,
+        token_mask: Optional[chex.Array] = None,
     ) -> chex.Array:
+        """`token_mask` (optional, `(*batch, seq_len)` bool) only selects
+        which tokens count towards the MoE statistics (see `SoftMoEMLP`/
+        `SwitchMoEMLP`); it never changes the output."""
         y = self.attn_norm(tokens)
         q, k, v = self.query_proj(y), self.key_proj(y), self.value_proj(y)
         head_dim = q.shape[-1]
@@ -361,7 +881,7 @@ class TransformerBlock(nn.Module):
         y = self.mlp_norm(tokens)
         # Soft MoE is always causal over `seq_len` (see `SoftMoEMLP`) - the
         # only way this block is ever run over a full sequence here.
-        mlp_out = self.mlp_moe(y) if self.num_experts > 0 else self._dense_mlp(y)
+        mlp_out = self.mlp_moe(y, token_mask) if self.num_experts > 0 else self._dense_mlp(y)
         return self._mlp_residual(tokens, mlp_out)
 
     def step(
@@ -371,7 +891,8 @@ class TransformerBlock(nn.Module):
         cached_values: chex.Array,
         step_idx: chex.Array,
         max_steps: int,
-        cached_moe_inputs: Optional[chex.Array] = None,
+        moe_cache: Optional[chex.Array] = None,
+        token_mask: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, chex.Array, chex.Array, Optional[chex.Array]]:
         """
         token: `(*batch, hidden_dim)` - this layer's input at this step.
@@ -379,9 +900,10 @@ class TransformerBlock(nn.Module):
             head_dim)` - this layer's cache (positions > step_idx are
             not-yet-written).
         step_idx: traced scalar - the position to write/attend through.
-        cached_moe_inputs: `(*batch, max_steps + 1, hidden_dim)` cache of
+        moe_cache: `(*batch, max_steps + 1, hidden_dim)` cache of
             past MLP inputs if this block uses soft MoE, else `None` - see
-            `init_soft_moe_cache`.
+            `init_moe_cache`.
+        token_mask: optional `(*batch,)` bool - see `__call__`.
 
         Returns `(new_token, updated_keys, updated_values,
         updated_moe_inputs)` (the last is `None` without soft MoE).
@@ -406,13 +928,15 @@ class TransformerBlock(nn.Module):
         if self.use_sandwich_norm:
             token = self.attn_post_norm(token)
         y = self.mlp_norm(token)
-        if self.num_experts > 0:
-            mlp_out, cached_moe_inputs = self.mlp_moe.step(
-                y, cached_moe_inputs, step_idx, max_steps
+        if self._uses_soft_moe:
+            mlp_out, moe_cache = self.mlp_moe.step(
+                y, moe_cache, step_idx, max_steps, token_mask
             )
+        elif self.num_experts > 0:
+            mlp_out, moe_cache = self.mlp_moe.step(y, moe_cache, step_idx, max_steps, token_mask)
         else:
             mlp_out = self._dense_mlp(y)
-        return self._mlp_residual(token, mlp_out), cached_keys, cached_values, cached_moe_inputs
+        return self._mlp_residual(token, mlp_out), cached_keys, cached_values, moe_cache
 
 
 class HaltingHead(nn.Module):
@@ -477,6 +1001,9 @@ class _CoTStep(nn.Module):
     num_experts: int = 0
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
+    moe_type: str = "soft"
+    switch_capacity_factor: Optional[float] = None
+    switch_init_scale: Optional[float] = None
 
     @nn.compact
     def __call__(
@@ -486,7 +1013,7 @@ class _CoTStep(nn.Module):
             current_token,
             cached_keys,
             cached_values,
-            cached_moe_inputs,
+            moe_cache,
             still_running,
             num_steps_taken,
             halting_log_prob,
@@ -519,6 +1046,9 @@ class _CoTStep(nn.Module):
                 self.num_experts,
                 self.soft_moe_slots_per_expert,
                 self.soft_moe_normalize,
+                self.moe_type,
+                self.switch_capacity_factor,
+                self.switch_init_scale,
             )
             for _ in range(self.num_layers)
         ]
@@ -529,7 +1059,7 @@ class _CoTStep(nn.Module):
         x = current_token + pos_embedding[step_idx]
         new_cached_keys = []
         new_cached_values = []
-        new_cached_moe_inputs = []
+        new_moe_cache = []
         for layer_idx, block in enumerate(blocks):
             x, k, v, m = block.step(
                 x,
@@ -537,15 +1067,18 @@ class _CoTStep(nn.Module):
                 cached_values[layer_idx],
                 step_idx,
                 self.max_steps,
-                cached_moe_inputs=cached_moe_inputs[layer_idx],
+                moe_cache=moe_cache[layer_idx],
+                # Pre-update `still_running`: keeps steps past an example's
+                # halt out of the MoE statistics.
+                token_mask=still_running,
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-            new_cached_moe_inputs.append(m)
+            new_moe_cache.append(m)
         state = x
         cached_keys = new_cached_keys
         cached_values = new_cached_values
-        cached_moe_inputs = new_cached_moe_inputs
+        moe_cache = new_moe_cache
         if self.replaying:
             # Only ever populated when replaying - see
             # `TransformerChainOfThoughtTorso`'s docstring for `states_history`.
@@ -641,7 +1174,7 @@ class _CoTStep(nn.Module):
             current_token,
             cached_keys,
             cached_values,
-            cached_moe_inputs,
+            moe_cache,
             still_running,
             num_steps_taken,
             halting_log_prob,
@@ -753,7 +1286,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `num_experts` (default `0`, a plain dense MLP),
     `soft_moe_slots_per_expert` and `soft_moe_normalize` are forwarded to
     every shared `TransformerBlock`: a positive `num_experts` turns each
-    block's MLP into a causal `SoftMoEMLP` - see `TransformerBlock`.
+    block's MLP into a causal `SoftMoEMLP`, or - with `moe_type="switch"` - a
+    `SwitchMoEMLP` Switch Transformer layer (`switch_capacity_factor`,
+    `switch_init_scale`) - see `TransformerBlock`.
     """
 
     hidden_dim: int
@@ -775,6 +1310,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
     num_experts: int = 0
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
+    moe_type: str = "soft"
+    switch_capacity_factor: Optional[float] = None
+    switch_init_scale: Optional[float] = None
 
     @nn.compact
     def __call__(
@@ -840,9 +1378,14 @@ class TransformerChainOfThoughtTorso(nn.Module):
         cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
-        cached_moe_inputs = [
-            init_soft_moe_cache(
-                batch_shape, self.max_steps, self.hidden_dim, self.num_experts
+        moe_cache = [
+            init_moe_cache(
+                batch_shape,
+                self.max_steps,
+                self.hidden_dim,
+                self.num_experts,
+                self.moe_type,
+                self.switch_capacity_factor,
             )
             for _ in range(self.num_layers)
         ]
@@ -865,6 +1408,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
         cot_step = nn.scan(
             _CoTStep,
             variable_broadcast="params",
+            # MoE statistics sown per step (see `SoftMoEMLP`/
+            # `SwitchMoEMLP`) are stacked along a leading step axis.
+            variable_axes={"intermediates": 0},
             split_rngs={"params": False},
         )(
             self.hidden_dim,
@@ -887,13 +1433,16 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.num_experts,
             self.soft_moe_slots_per_expert,
             self.soft_moe_normalize,
+            self.moe_type,
+            self.switch_capacity_factor,
+            self.switch_init_scale,
         )
 
         initial_carry = (
             initial_token,  # current_token
             cached_keys,
             cached_values,
-            cached_moe_inputs,
+            moe_cache,
             still_running,
             num_steps_taken,
             halting_log_prob,

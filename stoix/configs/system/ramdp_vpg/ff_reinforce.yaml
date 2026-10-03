@@ -13,6 +13,11 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
   # controls both the usual reward horizon and the cost of pondering longer.
 ent_coef: 0.001 # Entropy regularisation term for loss function.
+moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss (the paper's alpha)
+  # on the actor's Switch MoE router(s) (pre_torso.num_experts > 0, moe_type=switch),
+  # keeping tokens spread across experts - see stoix.networks.torso_compute_transformer.
+  # SwitchMoEMLP. 0.0 turns the loss off (routing statistics are still logged); no effect
+  # with soft MoE or a dense MLP.
 vf_coef: 1.0 # Critic weight in
 delightful: False # Whether to gate the REINFORCE weight by a sigmoid of
   # (advantage * surprisal / delightful_eta), where surprisal = -log_prob of the

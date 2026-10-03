@@ -155,6 +155,12 @@ from stoix.base_types import (
 from stoix.networks.base import FeedForwardCritic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.networks.base_qac import SeparateValueAndQCritic, ValueAndQCritic
+from stoix.networks.torso_compute_transformer import (
+    apply_collecting_moe_stats,
+    moe_drift_metrics,
+    moe_load_balancing_loss,
+    moe_metrics,
+)
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.explicit_cot_types import PPOExplicitCoTTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
@@ -226,6 +232,14 @@ def get_learner_fn(
 
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
+
+    # MoE statistics (see stoix.networks.torso_compute_transformer's
+    # `apply_collecting_moe_stats`) - collected only when the actor's
+    # transformer blocks use MoE (soft or Switch), for the Switch
+    # load-balancing loss (`config.system.moe_load_balancing_coef`) and the
+    # `moe_metrics`/`moe_drift_metrics` logging; otherwise every apply below
+    # is exactly the plain call.
+    collect_moe_stats = config.network.actor_network.pre_torso.get("num_experts", 0) > 0
 
     # Needed to build the "was this CoT step actually taken" mask used by
     # the per-step clip below - see `_actor_loss_fn`.
@@ -459,10 +473,14 @@ def get_learner_fn(
         ) -> Tuple:
             """Calculate the actor loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
-            actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
-                actor_params,
-                traj_batch.obs,
-                torso_kwargs={"target_tokens": traj_batch.thought_tokens},
+            (actor_policy, _, cot_log_prob, cot_entropy), moe_stats = (
+                apply_collecting_moe_stats(
+                    actor_apply_fn,
+                    collect_moe_stats,
+                    actor_params,
+                    traj_batch.obs,
+                    torso_kwargs={"target_tokens": traj_batch.thought_tokens},
+                )
             )
             env_log_prob = actor_policy.log_prob(traj_batch.action)
 
@@ -530,10 +548,13 @@ def get_learner_fn(
             loss_actor = action_loss + cot_loss
             entropy = actor_policy.entropy().mean()
 
+            # Switch-Transformer router load balancing - 0 unless Switch MoE.
+            load_balancing_loss = moe_load_balancing_loss(moe_stats)
             total_loss_actor = (
                 loss_actor
                 - config.system.ent_coef * entropy
                 - config.system.halting_ent_coef * cot_entropy_bonus
+                + config.system.moe_load_balancing_coef * load_balancing_loss
             )
             loss_info = {
                 "actor_loss": loss_actor,
@@ -546,6 +567,10 @@ def get_learner_fn(
                 "action_clip_fraction": action_clip_fraction,
                 "cot_clip_fraction": cot_clip_fraction,
             }
+            # MoE routing/combine statistics, masked to steps actually
+            # taken - empty without MoE.
+            loss_info["moe_load_balancing_loss"] = load_balancing_loss
+            loss_info.update(moe_metrics(moe_stats))
             return total_loss_actor, loss_info
 
         def _critic_loss_fn(
@@ -793,10 +818,14 @@ def get_learner_fn(
                     """
                     # Replay the token trajectory actually taken during
                     # rollout, mirroring log_prob(traj_batch.action) below.
-                    actor_policy, _, cot_log_prob, cot_entropy = actor_apply_fn(
-                        actor_params,
-                        traj_batch.obs,
-                        torso_kwargs={"target_tokens": traj_batch.thought_tokens},
+                    (actor_policy, _, cot_log_prob, cot_entropy), moe_stats = (
+                        apply_collecting_moe_stats(
+                            actor_apply_fn,
+                            collect_moe_stats,
+                            actor_params,
+                            traj_batch.obs,
+                            torso_kwargs={"target_tokens": traj_batch.thought_tokens},
+                        )
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
 
@@ -889,10 +918,13 @@ def get_learner_fn(
                     loss_actor = action_loss + cot_loss
                     entropy = actor_policy.entropy().mean()
 
+                    # Switch-Transformer router load balancing - 0 unless Switch MoE.
+                    load_balancing_loss = moe_load_balancing_loss(moe_stats)
                     total_loss_actor = (
                         loss_actor
                         - config.system.ent_coef * entropy
                         - config.system.halting_ent_coef * cot_entropy_bonus
+                        + config.system.moe_load_balancing_coef * load_balancing_loss
                     )
                     loss_info = {
                         "actor_loss": loss_actor,
@@ -905,6 +937,10 @@ def get_learner_fn(
                         "action_clip_fraction": action_clip_fraction,
                         "cot_clip_fraction": cot_clip_fraction,
                     }
+                    # MoE routing/combine statistics, masked to steps actually
+                    # taken - empty without MoE.
+                    loss_info["moe_load_balancing_loss"] = load_balancing_loss
+                    loss_info.update(moe_metrics(moe_stats))
                     return total_loss_actor, loss_info
 
                 def _critic_loss_fn(
@@ -1117,6 +1153,9 @@ def get_learner_fn(
             )
             return update_state, loss_info
 
+        # Kept for the MoE drift diagnostics below.
+        pre_update_actor_params = params.actor_params
+
         if config.system.critic_before_actor:
             # Phase 1: `epochs` epochs of critic-only updates (see module
             # docstring). `advantages` isn't threaded through here - unused
@@ -1170,6 +1209,34 @@ def get_learner_fn(
             running_discounted_return,
             episode_discounted_return,
         )
+        if collect_moe_stats:
+            # How far this update moved the MoE routing (soft: combine-weight
+            # KL; Switch: router KL and the fraction of tokens routed to a
+            # different expert), replaying the whole rollout batch under the pre-
+            # and post-update parameters (masked to steps actually taken) -
+            # see `moe_drift_metrics`. Two extra forward passes per update,
+            # only with MoE.
+            def _flatten(x: chex.Array) -> chex.Array:
+                return x.reshape(-1, *x.shape[2:])
+
+            flat_obs = jax.tree.map(_flatten, traj_batch.obs)
+            replay_kwargs = {"target_tokens": _flatten(traj_batch.thought_tokens)}
+            _, pre_update_stats = apply_collecting_moe_stats(
+                actor_apply_fn,
+                True,
+                pre_update_actor_params,
+                flat_obs,
+                torso_kwargs=replay_kwargs,
+            )
+            _, post_update_stats = apply_collecting_moe_stats(
+                actor_apply_fn,
+                True,
+                params.actor_params,
+                flat_obs,
+                torso_kwargs=replay_kwargs,
+            )
+            loss_info.update(moe_drift_metrics(pre_update_stats, post_update_stats))
+
         metric = traj_batch.info
         return learner_state, (metric, loss_info)
 

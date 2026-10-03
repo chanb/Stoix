@@ -62,7 +62,7 @@ from stoix.networks.torso_compute_transformer import (
     TransformerBlock,
     _norm_cls,
     _resolve_qkv_dim,
-    init_soft_moe_cache,
+    init_moe_cache,
 )
 from stoix.networks.utils import parse_activation_fn
 
@@ -104,6 +104,9 @@ class _MergedActionCoTBackbone(nn.Module):
     num_experts: int = 0
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
+    moe_type: str = "soft"
+    switch_capacity_factor: Optional[float] = None
+    switch_init_scale: Optional[float] = None
 
     def setup(self) -> None:
         self.pos_embedding = self.param(
@@ -134,6 +137,9 @@ class _MergedActionCoTBackbone(nn.Module):
                 self.num_experts,
                 self.soft_moe_slots_per_expert,
                 self.soft_moe_normalize,
+                self.moe_type,
+                self.switch_capacity_factor,
+                self.switch_init_scale,
             )
             for _ in range(self.num_layers)
         ]
@@ -170,14 +176,14 @@ class _MergedActionCoTBackbone(nn.Module):
         token: chex.Array,
         cached_keys: list,
         cached_values: list,
-        cached_moe_inputs: list,
+        moe_cache: list,
         step_idx: chex.Array,
     ) -> Tuple[chex.Array, list, list, list]:
         """See `_ExplicitCoTBackbone.step` - identical."""
         x = token + self.pos_embedding[step_idx]
         new_cached_keys = []
         new_cached_values = []
-        new_cached_moe_inputs = []
+        new_moe_cache = []
         for layer_idx, block in enumerate(self.blocks):
             x, k, v, m = block.step(
                 x,
@@ -185,12 +191,12 @@ class _MergedActionCoTBackbone(nn.Module):
                 cached_values[layer_idx],
                 step_idx,
                 self.max_steps,
-                cached_moe_inputs=cached_moe_inputs[layer_idx],
+                moe_cache=moe_cache[layer_idx],
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-            new_cached_moe_inputs.append(m)
-        return x, new_cached_keys, new_cached_values, new_cached_moe_inputs
+            new_moe_cache.append(m)
+        return x, new_cached_keys, new_cached_values, new_moe_cache
 
 
 class TransformerMergedActionCoTTorso(nn.Module):
@@ -200,7 +206,8 @@ class TransformerMergedActionCoTTorso(nn.Module):
 
     `min_steps`/`max_steps`/`use_latent_feedback`/`use_sandwich_norm`/
     `use_rmsnorm`/`qkv_dim`/`num_experts`/`soft_moe_slots_per_expert`/
-    `soft_moe_normalize` all mean exactly what they mean on
+    `soft_moe_normalize`/`moe_type`/`switch_capacity_factor`/
+    `switch_init_scale` all mean exactly what they mean on
     `TransformerExplicitCoTTorso` - see that class's docstring.
     """
 
@@ -222,6 +229,9 @@ class TransformerMergedActionCoTTorso(nn.Module):
     num_experts: int = 0
     soft_moe_slots_per_expert: int = 1
     soft_moe_normalize: bool = False
+    moe_type: str = "soft"
+    switch_capacity_factor: Optional[float] = None
+    switch_init_scale: Optional[float] = None
 
     @nn.compact
     def __call__(
@@ -291,6 +301,9 @@ class TransformerMergedActionCoTTorso(nn.Module):
             self.num_experts,
             self.soft_moe_slots_per_expert,
             self.soft_moe_normalize,
+            self.moe_type,
+            self.switch_capacity_factor,
+            self.switch_init_scale,
         )
 
         # Per-step legality mask (shape `(max_steps, num_classes)`) - see
@@ -350,9 +363,14 @@ class TransformerMergedActionCoTTorso(nn.Module):
         cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
-        cached_moe_inputs = [
-            init_soft_moe_cache(
-                batch_shape, self.max_steps, self.hidden_dim, self.num_experts
+        moe_cache = [
+            init_moe_cache(
+                batch_shape,
+                self.max_steps,
+                self.hidden_dim,
+                self.num_experts,
+                self.moe_type,
+                self.switch_capacity_factor,
             )
             for _ in range(self.num_layers)
         ]
@@ -374,7 +392,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
                 current_token,
                 cached_keys,
                 cached_values,
-                cached_moe_inputs,
+                moe_cache,
                 still_running,
                 num_steps_taken,
                 emitted_tokens,
@@ -384,8 +402,8 @@ class TransformerMergedActionCoTTorso(nn.Module):
                 rng,
             ) = carry
 
-            state, cached_keys, cached_values, cached_moe_inputs = backbone.step(
-                current_token, cached_keys, cached_values, cached_moe_inputs, step_idx
+            state, cached_keys, cached_values, moe_cache = backbone.step(
+                current_token, cached_keys, cached_values, moe_cache, step_idx
             )
             token_logits = jnp.where(legal_mask[step_idx], backbone.token_head(state), _NEG_INF)
 
@@ -431,7 +449,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
                 current_token,
                 cached_keys,
                 cached_values,
-                cached_moe_inputs,
+                moe_cache,
                 still_running,
                 num_steps_taken,
                 emitted_tokens,
@@ -447,7 +465,7 @@ class TransformerMergedActionCoTTorso(nn.Module):
             initial_token,  # current_token
             cached_keys,
             cached_values,
-            cached_moe_inputs,
+            moe_cache,
             still_running,
             num_steps_taken,
             emitted_tokens,

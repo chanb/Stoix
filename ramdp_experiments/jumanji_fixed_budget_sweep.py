@@ -115,7 +115,7 @@ script's behavior differs):
   - system, architecture, budget, hidden_dim, lr, critic_lr, delightful,
     delightful_eta, epochs, num_minibatches, clip_eps, clip_value_loss,
     recompute_advantages, critic_before_actor, use_layer_norm, use_input_layer_norm, num_layers,
-    num_heads, mlp_dim, qkv_dim, num_experts, soft_moe_slots_per_expert, soft_moe_normalize,
+    num_heads, mlp_dim, qkv_dim, num_experts, moe_type, soft_moe_slots_per_expert, soft_moe_normalize, switch_capacity_factor, switch_init_scale, moe_load_balancing_coef,
     vocab_size, use_latent_feedback, seed: identical semantics to minatar_fixed_budget_sweep.py,
     including its
     five ff_ppo_explicit_* systems (explicit chain-of-thought PPO, trains
@@ -799,8 +799,12 @@ class Job:
     use_sandwich_norm: bool
     use_rmsnorm: bool
     num_experts: int
+    moe_load_balancing_coef: float
+    moe_type: str
     soft_moe_slots_per_expert: int
     soft_moe_normalize: bool
+    switch_capacity_factor: float
+    switch_init_scale: float
     qv_critic: str
     seed: int
     total_timesteps: float
@@ -848,10 +852,16 @@ class Job:
             net += f"-nh{self.num_heads}-md{self.mlp_dim}"
             if self.qkv_dim:
                 net += f"-qkv{self.qkv_dim}"
-            if self.num_experts:
+            if self.num_experts and self.moe_type == "soft":
                 net += f"-smoe{self.num_experts}s{self.soft_moe_slots_per_expert}"
                 if self.soft_moe_normalize:
                     net += "n"
+            elif self.num_experts:
+                net += f"-sw{self.num_experts}lb{self.moe_load_balancing_coef:g}"
+                if self.switch_capacity_factor:
+                    net += f"c{self.switch_capacity_factor:g}"
+                if self.switch_init_scale:
+                    net += f"i{self.switch_init_scale:g}"
         # Only shown for the explicit-CoT arches - vocab_size doesn't exist on
         # any other architecture, see EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
@@ -1013,19 +1023,44 @@ class Job:
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
             if self.num_experts:
-                # Causal Soft MoE MLP in every TransformerBlock - see
-                # stoix/networks/torso_compute_transformer.py's SoftMoEMLP. 0
-                # (dense MLP) omits every override so the torso falls back to
+                # Mixture-of-experts MLP in every TransformerBlock - see
+                # stoix/networks/torso_compute_transformer.py's
+                # SoftMoEMLP (causal Soft MoE) / SwitchMoEMLP (Switch layer).
+                # 0 (dense MLP) omits every override so the torso falls back to
                 # its own dense-MLP default.
                 cmd.append(f"++network.actor_network.pre_torso.num_experts={self.num_experts}")
-                cmd.append(
-                    "++network.actor_network.pre_torso.soft_moe_slots_per_expert="
-                    f"{self.soft_moe_slots_per_expert}"
-                )
-                cmd.append(
-                    "++network.actor_network.pre_torso.soft_moe_normalize="
-                    f"{self.soft_moe_normalize}"
-                )
+                if self.moe_type == "soft":
+                    cmd.append("++network.actor_network.pre_torso.moe_type=soft")
+                    cmd.append(
+                        "++network.actor_network.pre_torso.soft_moe_slots_per_expert="
+                        f"{self.soft_moe_slots_per_expert}"
+                    )
+                    cmd.append(
+                        "++network.actor_network.pre_torso.soft_moe_normalize="
+                        f"{self.soft_moe_normalize}"
+                    )
+                    # Soft MoE has no router to balance - the loss is always 0,
+                    # so skip collecting its (empty) statistics.
+                    cmd.append("system.moe_load_balancing_coef=0")
+                else:
+                    # Explicit - the torsos default to moe_type=soft.
+                    cmd.append("++network.actor_network.pre_torso.moe_type=switch")
+                    if self.switch_capacity_factor:
+                        # 0 (unset) omits it: unlimited expert capacity.
+                        cmd.append(
+                            "++network.actor_network.pre_torso.switch_capacity_factor="
+                            f"{self.switch_capacity_factor:g}"
+                        )
+                    if self.switch_init_scale:
+                        # 0 (unset) omits it: the network's usual kernel_init.
+                        cmd.append(
+                            "++network.actor_network.pre_torso.switch_init_scale="
+                            f"{self.switch_init_scale:g}"
+                        )
+                    # Router load-balancing loss weight - a system.* key in every
+                    # system that can run a transformer torso (ff_reinforce,
+                    # ff_qac, ff_ppo, ff_ppo_explicit_cot); 0 turns it off.
+                    cmd.append(f"system.moe_load_balancing_coef={self.moe_load_balancing_coef:g}")
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
@@ -1215,21 +1250,61 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 args.use_sandwich_norm if is_transformer_arch else [args.use_sandwich_norm[0]]
             )
             use_rmsnorm_options = args.use_rmsnorm if is_transformer_arch else [args.use_rmsnorm[0]]
-            # (num_experts, soft_moe_slots_per_expert, soft_moe_normalize) -
-            # also TransformerBlock-only, so non-transformer arches are pinned to
-            # the dense MLP. The Soft MoE knobs are meaningless for a dense MLP
-            # (num_experts=0), so they're collapsed to fixed placeholders there
-            # (no duplicate dense jobs).
-            dense_moe_option = (0, 1, False)
+            # (num_experts, moe_type, soft_moe_slots_per_expert,
+            # soft_moe_normalize, switch_capacity_factor, switch_init_scale,
+            # moe_load_balancing_coef) - also TransformerBlock-only, so
+            # non-transformer arches are pinned to the dense MLP. Knobs
+            # meaningless for a given MoE kind are collapsed to fixed
+            # placeholders (no duplicate jobs): everything for the dense MLP
+            # (num_experts=0), the Switch knobs (capacity, init scale,
+            # load-balancing coef) for soft MoE, and the soft-MoE knobs for
+            # Switch.
+            dense_moe_option = (0, "soft", 1, False, 0.0, 0.0, 0.0)
+
+            def _moe_option(
+                num_experts,
+                moe_type,
+                soft_moe_slots_per_expert,
+                soft_moe_normalize,
+                switch_capacity_factor,
+                switch_init_scale,
+                moe_load_balancing_coef,
+            ):
+                if not num_experts:
+                    return dense_moe_option
+                if moe_type == "soft":
+                    return (
+                        num_experts,
+                        "soft",
+                        soft_moe_slots_per_expert,
+                        soft_moe_normalize,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                return (
+                    num_experts,
+                    "switch",
+                    1,
+                    False,
+                    switch_capacity_factor,
+                    switch_init_scale,
+                    moe_load_balancing_coef,
+                )
+
             moe_options = (
                 list(
                     dict.fromkeys(
-                        (num_experts, soft_moe_slots_per_expert, soft_moe_normalize)
-                        if num_experts
-                        else dense_moe_option
-                        for num_experts in args.num_experts
-                        for soft_moe_slots_per_expert in args.soft_moe_slots_per_expert
-                        for soft_moe_normalize in args.soft_moe_normalize
+                        _moe_option(*combo)
+                        for combo in itertools.product(
+                            args.num_experts,
+                            args.moe_type,
+                            args.soft_moe_slots_per_expert,
+                            args.soft_moe_normalize,
+                            args.switch_capacity_factor,
+                            args.switch_init_scale,
+                            args.moe_load_balancing_coef,
+                        )
                     )
                 )
                 if is_transformer_arch
@@ -1259,7 +1334,15 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                     use_latent_feedback,
                                     use_sandwich_norm,
                                     use_rmsnorm,
-                                    (num_experts, soft_moe_slots_per_expert, soft_moe_normalize),
+                                    (
+                                        num_experts,
+                                        moe_type,
+                                        soft_moe_slots_per_expert,
+                                        soft_moe_normalize,
+                                        switch_capacity_factor,
+                                        switch_init_scale,
+                                        moe_load_balancing_coef,
+                                    ),
                                 ) in itertools.product(
                                     vocab_size_options,
                                     use_latent_feedback_options,
@@ -1282,8 +1365,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                                             use_sandwich_norm,
                                             use_rmsnorm,
                                             num_experts,
+                                            moe_type,
                                             soft_moe_slots_per_expert,
                                             soft_moe_normalize,
+                                            switch_capacity_factor,
+                                            switch_init_scale,
+                                            moe_load_balancing_coef,
                                         )
                                     )
     system_arch_ln_combos = list(dict.fromkeys(system_arch_ln_combos))
@@ -1313,8 +1400,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 use_sandwich_norm,
                 use_rmsnorm,
                 num_experts,
+                moe_type,
                 soft_moe_slots_per_expert,
                 soft_moe_normalize,
+                switch_capacity_factor,
+                switch_init_scale,
+                moe_load_balancing_coef,
             ),
             budget,
             hidden_dim,
@@ -1447,8 +1538,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     use_sandwich_norm=use_sandwich_norm,
                     use_rmsnorm=use_rmsnorm,
                     num_experts=num_experts,
+                    moe_load_balancing_coef=moe_load_balancing_coef,
+                    moe_type=moe_type,
                     soft_moe_slots_per_expert=soft_moe_slots_per_expert,
                     soft_moe_normalize=soft_moe_normalize,
+                    switch_capacity_factor=switch_capacity_factor,
+                    switch_init_scale=switch_init_scale,
                     qv_critic=qv_critic,
                     seed=seed,
                     total_timesteps=args.total_timesteps,
@@ -1785,17 +1880,36 @@ def main() -> None:
         "--num-experts",
         default="0",
         help="Comma-separated ints - network.actor_network.pre_torso.num_experts: replaces "
-        "every TransformerBlock's MLP with a causal Soft MoE (Puigcerver et al.) over the CoT "
-        "scratchpad with this many experts (each --mlp-dim wide) - see "
-        "stoix/networks/torso_compute_transformer.py's SoftMoEMLP. 0 (default) means a plain "
-        "dense MLP and omits the override. Same applicability as --use-sandwich-norm.",
+        "every TransformerBlock's MLP with a mixture of this many experts (each --mlp-dim "
+        "wide), of the kind set by --moe-type - see stoix/networks/torso_compute_transformer.py's "
+        "SoftMoEMLP/SwitchMoEMLP. 0 (default) means a plain dense MLP and omits the "
+        "override. Same applicability as --use-sandwich-norm.",
+    )
+    parser.add_argument(
+        "--moe-load-balancing-coef",
+        default="0.01",
+        help="Comma-separated floats - system.moe_load_balancing_coef: weight of the "
+        "Switch-Transformer load-balancing loss (the paper's alpha) on the Switch MoE router(s), "
+        "added to the actor loss - see stoix/networks/torso_compute_transformer.py's "
+        "SwitchMoEMLP. 0 turns it off. Only for --moe-type switch. Default 0.01.",
+    )
+    parser.add_argument(
+        "--moe-type",
+        default="soft",
+        help="Comma-separated, each soft or switch - network.actor_network.pre_torso.moe_type: "
+        "the kind of mixture used when --num-experts > 0. soft = SoftMoEMLP, Puigcerver et "
+        "al.'s Soft MoE made causal over the CoT scratchpad (uses --soft-moe-slots-per-expert/"
+        "--soft-moe-normalize); switch = SwitchMoEMLP, a Switch Transformer layer with top-1 "
+        "routing (uses --switch-capacity-factor/--switch-init-scale/--moe-load-balancing-coef) - "
+        "see stoix/networks/torso_compute_transformer.py. Crossed with --num-experts. Default "
+        "soft.",
     )
     parser.add_argument(
         "--soft-moe-slots-per-expert",
         default="1",
         help="Comma-separated ints - network.actor_network.pre_torso.soft_moe_slots_per_expert: "
         "slots each Soft MoE expert processes (each a learned weighted average of the causal "
-        "scratchpad). Crossed with --num-experts; ignored for --num-experts 0. Default 1.",
+        "scratchpad). Only for --moe-type soft. Default 1.",
     )
     parser.add_argument(
         "--soft-moe-normalize",
@@ -1803,7 +1917,23 @@ def main() -> None:
         help="Comma-separated bools (true/false) - "
         "network.actor_network.pre_torso.soft_moe_normalize: Puigcerver et al.'s l2 "
         "normalization of tokens and slot parameters (with a learned scale) in the Soft MoE "
-        "logits. Crossed with --num-experts; ignored for --num-experts 0. Default false.",
+        "logits. Only for --moe-type soft. Default false.",
+    )
+    parser.add_argument(
+        "--switch-capacity-factor",
+        default="0",
+        help="Comma-separated floats - network.actor_network.pre_torso.switch_capacity_factor: "
+        "Switch expert capacity, ceil(factor * max_steps / num_experts) tokens per expert per "
+        "example (overflow tokens skip the expert) - see SwitchMoEMLP. 0 (default) means "
+        "unlimited capacity and omits the override. Only for --moe-type switch.",
+    )
+    parser.add_argument(
+        "--switch-init-scale",
+        default="0",
+        help="Comma-separated floats - network.actor_network.pre_torso.switch_init_scale: the "
+        "Switch paper's reduced initialization, truncated normal with std sqrt(scale / fan_in) "
+        "for the router and experts (the paper uses 0.1). 0 (default) means the network's "
+        "usual kernel_init and omits the override. Only for --moe-type switch.",
     )
 
     parser.add_argument(
@@ -1990,12 +2120,18 @@ def main() -> None:
         x.strip().lower() in ("1", "true", "yes") for x in args.use_rmsnorm.split(",")
     ]
     args.num_experts = [int(x) for x in args.num_experts.split(",")]
+    args.moe_load_balancing_coef = [float(x) for x in args.moe_load_balancing_coef.split(",")]
+    args.moe_type = [x.strip() for x in args.moe_type.split(",")]
+    if not set(args.moe_type) <= {"soft", "switch"}:
+        parser.error(f"--moe-type values must be soft or switch, got {args.moe_type}.")
     args.soft_moe_slots_per_expert = [int(x) for x in args.soft_moe_slots_per_expert.split(",")]
     if min(args.soft_moe_slots_per_expert) < 1:
         parser.error("--soft-moe-slots-per-expert values must be >= 1.")
     args.soft_moe_normalize = [
         x.strip().lower() in ("1", "true", "yes") for x in args.soft_moe_normalize.split(",")
     ]
+    args.switch_capacity_factor = [float(x) for x in args.switch_capacity_factor.split(",")]
+    args.switch_init_scale = [float(x) for x in args.switch_init_scale.split(",")]
     args.sokoban_generator = args.sokoban_generator.split(",")
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]

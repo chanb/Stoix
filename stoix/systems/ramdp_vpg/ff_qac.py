@@ -71,6 +71,11 @@ from stoix.base_types import (
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.networks.base_qac import SeparateValueAndQCritic
 from stoix.networks.base_qac import ValueAndQCritic as Critic
+from stoix.networks.torso_compute_transformer import (
+    apply_collecting_moe_stats,
+    moe_load_balancing_loss,
+    moe_metrics,
+)
 from stoix.systems.ramdp_vpg.evaluator import evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ff_reinforce import get_distribution_act_fn_with_compute_time
 from stoix.systems.ramdp_vpg.qac_types import Transition
@@ -98,6 +103,14 @@ def get_learner_fn(
 
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
+
+    # MoE statistics (see stoix.networks.torso_compute_transformer's
+    # `apply_collecting_moe_stats`) - collected only when the actor's
+    # transformer blocks use MoE (soft or Switch), for the Switch
+    # load-balancing loss (`config.system.moe_load_balancing_coef`) and the
+    # `moe_metrics` logging; otherwise the actor loss's apply is exactly the
+    # plain call.
+    collect_moe_stats = config.network.actor_network.pre_torso.get("num_experts", 0) > 0
 
     qac_variant = config.system.qac_variant
     assert qac_variant in ("naive", "fac"), f"Unknown qac_variant: {qac_variant}"
@@ -244,8 +257,14 @@ def get_learner_fn(
             # `per_step_halting_entropy` (only needed for PPO's latent
             # trust-region penalty/per-step clip/halting entropy bonus, see
             # `ff_ppo.py`) are ignored here.
-            actor_policy, halting_log_prob, _, _, _ = actor_apply_fn(
-                actor_params, observations, torso_kwargs={"target_compute_time": compute_times}
+            (actor_policy, halting_log_prob, _, _, _), moe_stats = (
+                apply_collecting_moe_stats(
+                    actor_apply_fn,
+                    collect_moe_stats,
+                    actor_params,
+                    observations,
+                    torso_kwargs={"target_compute_time": compute_times},
+                )
             )
             env_log_prob = actor_policy.log_prob(actions)
             log_prob = env_log_prob + halting_log_prob
@@ -262,7 +281,13 @@ def get_learner_fn(
             loss_actor = -weight * log_prob
             entropy = actor_policy.entropy().mean()
 
-            total_loss_actor = loss_actor.mean() - config.system.ent_coef * entropy
+            # Switch-Transformer router load balancing - 0 unless Switch MoE.
+            load_balancing_loss = moe_load_balancing_loss(moe_stats)
+            total_loss_actor = (
+                loss_actor.mean()
+                - config.system.ent_coef * entropy
+                + config.system.moe_load_balancing_coef * load_balancing_loss
+            )
             loss_info = {
                 "actor_loss": loss_actor,
                 "entropy": entropy,
@@ -270,6 +295,10 @@ def get_learner_fn(
                 "first_convergence_step": first_convergence_steps,
                 "num_close_steps": num_close_steps,
                 "advantage": advantage.mean(),
+                "moe_load_balancing_loss": load_balancing_loss,
+                # MoE routing/combine statistics, masked to steps actually
+                # taken - empty without MoE.
+                **moe_metrics(moe_stats),
             }
             if config.system.delightful:
                 loss_info["delightful_gate"] = gate
