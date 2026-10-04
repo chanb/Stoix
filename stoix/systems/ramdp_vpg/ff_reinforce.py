@@ -63,8 +63,8 @@ from stoix.networks.torso_compute_transformer import (
     apply_collecting_moe_stats,
     moe_load_balancing_loss,
     moe_metrics,
-    switch_router_weight_decay_mask,
 )
+from stoix.networks.weight_decay import make_weight_decay_mask
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
@@ -425,14 +425,14 @@ def learner_setup(
     actor_lr = make_learning_rate(config.system.actor_lr, config, 1, 1)
     critic_lr = make_learning_rate(config.system.critic_lr, config, 1, 1)
 
-    # Exempt the Switch MoE router(s) from the actor's weight decay (see
-    # stoix.networks.torso_compute_transformer.switch_router_weight_decay_mask)
-    # - a no-op without a Switch MoE; None (the default) decays every actor
-    # parameter, the original behaviour.
-    actor_weight_decay_mask = (
-        switch_router_weight_decay_mask
-        if config.system.get("moe_router_weight_decay_exempt", False)
-        else None
+    # Which actor parameters weight decay applies to (see
+    # stoix.networks.weight_decay): "all" (the default) decays every one -
+    # the original behaviour - except the Switch MoE router(s) when
+    # moe_router_weight_decay_exempt is set; "standard" also exempts biases,
+    # normalization parameters and positional embeddings. None = decay all.
+    actor_weight_decay_mask = make_weight_decay_mask(
+        config.system.get("actor_weight_decay_mask", "all"),
+        exempt_moe_router=config.system.get("moe_router_weight_decay_exempt", False),
     )
     actor_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),

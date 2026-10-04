@@ -6,6 +6,11 @@ system_name: ramdp_ff_reinforce # Name of the system.
 actor_lr: 3e-4 # Learning rate for actor network
 critic_lr: 3e-4 # Learning rate for critic network
 actor_weight_decay: 0.0 # AdamW weight decay coefficient for the actor. 0.0 recovers plain Adam.
+actor_weight_decay_mask: all # Which actor parameters actor_weight_decay applies to (see
+  # stoix.networks.weight_decay): "all" (default, the original behaviour) decays every one,
+  # except the Switch MoE router(s) if moe_router_weight_decay_exempt; "standard" decays only
+  # the weight matrices - biases, LayerNorm/RMSNorm parameters, pos_embedding and the Switch
+  # router(s) are exempt.
 critic_weight_decay: 0.0 # AdamW weight decay coefficient for the critic. 0.0 recovers plain Adam.
 rollout_length: 32 # Number of environment steps per vectorised environment.
 gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition that

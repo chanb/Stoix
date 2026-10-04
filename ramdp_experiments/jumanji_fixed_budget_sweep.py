@@ -769,6 +769,7 @@ class Job:
     critic_lr: float
     actor_weight_decay: float
     critic_weight_decay: float
+    actor_weight_decay_mask: str
     ent_coef: float
     max_grad_norm: float
     delightful: bool
@@ -903,7 +904,10 @@ class Job:
         if not self.clip_halting_head:
             extra.append("nch")
         if self.actor_weight_decay:
-            extra.append(f"wd{self.actor_weight_decay:g}")
+            # "s" marks the "standard" weight-decay mask (biases/norms/
+            # pos_embedding/router exempt - see stoix/networks/weight_decay.py).
+            wd_mask_tag = "s" if self.actor_weight_decay_mask == "standard" else ""
+            extra.append(f"wd{self.actor_weight_decay:g}{wd_mask_tag}")
         if self.critic_weight_decay:
             extra.append(f"cwd{self.critic_weight_decay:g}")
         if self.use_layer_norm:
@@ -965,6 +969,8 @@ class Job:
             f"system.actor_lr={self.lr:g}",
             f"system.critic_lr={self.critic_lr:g}",
             f"system.actor_weight_decay={self.actor_weight_decay:g}",
+            # Which actor parameters it decays - see stoix/networks/weight_decay.py.
+            f"system.actor_weight_decay_mask={self.actor_weight_decay_mask}",
             f"system.critic_weight_decay={self.critic_weight_decay:g}",
             f"system.ent_coef={self.ent_coef:g}",
             f"system.max_grad_norm={self.max_grad_norm:g}",
@@ -1560,6 +1566,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     seed=seed,
                     total_timesteps=args.total_timesteps,
                     moe_router_weight_decay_exempt=args.moe_router_weight_decay_exempt,
+                    actor_weight_decay_mask=args.actor_weight_decay_mask,
                     total_num_envs=args.total_num_envs,
                     rollout_length=args.rollout_length,
                     gamma=args.gamma,
@@ -1698,6 +1705,18 @@ def main() -> None:
         "--actor-weight-decay", default="0.0",
         help="Comma-separated system.actor_weight_decay values (AdamW weight decay for the actor; "
         "0.0 recovers plain Adam), swept independently of --critic-weight-decay.",
+    )
+    parser.add_argument(
+        "--actor-weight-decay-mask",
+        default="standard",
+        choices=("all", "standard"),
+        help="system.actor_weight_decay_mask - which actor parameters --actor-weight-decay "
+        "applies to; see stoix/networks/weight_decay.py. all = every parameter (the original "
+        "behaviour, except the Switch router if --moe-router-weight-decay-exempt); standard = "
+        "weight matrices only (biases, LayerNorm/RMSNorm parameters, pos_embedding and the "
+        "Switch router exempt). Not swept. Default standard; runs using it are tagged with an "
+        "'s' after their actor weight decay (e.g. wd0.1s), so they don't collide with earlier "
+        "all-decayed runs.",
     )
     parser.add_argument(
         "--critic-weight-decay", default="0.0",
@@ -2233,7 +2252,7 @@ def main() -> None:
         f"  lr={args.lr} critic_lr={args.critic_lr} ent_coef={args.ent_coef} "
         f"max_grad_norm={args.max_grad_norm}"
     )
-    print(f"  actor_weight_decay={args.actor_weight_decay} critic_weight_decay={args.critic_weight_decay}")
+    print(f"  actor_weight_decay={args.actor_weight_decay} (mask={args.actor_weight_decay_mask}) critic_weight_decay={args.critic_weight_decay}")
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
