@@ -80,6 +80,12 @@ moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss (the pape
   # keeping tokens spread across experts - see stoix.networks.torso_compute_transformer.
   # SwitchMoEMLP. 0.0 turns the loss off (routing statistics are still logged); no effect
   # with soft MoE or a dense MLP.
+moe_router_weight_decay_exempt: False # True exempts the Switch MoE router(s) from
+  # actor_weight_decay (stoix.networks.torso_compute_transformer.
+  # switch_router_weight_decay_mask): decay flattens the router softmax towards uniform,
+  # making routing near-arbitrary/unstable and invisible to the load-balancing loss. False
+  # (the default) decays every actor parameter, the original behaviour. No effect without a
+  # Switch MoE.
 halting_ent_coef: 0.0 # Entropy regularisation term for the CoT-step distribution's own
   # entropy (thought tokens and the halting "act now" class together - there's no separate
   # halting probability to isolate, see TransformerExplicitCoTTorso's module docstring),

@@ -27,6 +27,12 @@ moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss (the pape
   # keeping tokens spread across experts - see stoix.networks.torso_compute_transformer.
   # SwitchMoEMLP. 0.0 turns the loss off (routing statistics are still logged); no effect
   # with soft MoE or a dense MLP.
+moe_router_weight_decay_exempt: False # True exempts the Switch MoE router(s) from
+  # actor_weight_decay (stoix.networks.torso_compute_transformer.
+  # switch_router_weight_decay_mask): decay flattens the router softmax towards uniform,
+  # making routing near-arbitrary/unstable and invisible to the load-balancing loss. False
+  # (the default) decays every actor parameter, the original behaviour. No effect without a
+  # Switch MoE.
 vf_coef: 1.0 # Critic weight in
 delightful: False # Whether to gate the REINFORCE weight by a sigmoid of
   # (advantage * surprisal / delightful_eta), where surprisal = -log_prob of the

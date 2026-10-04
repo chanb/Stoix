@@ -250,6 +250,7 @@ from stoix.networks.torso_compute_transformer import (
     moe_drift_metrics,
     moe_load_balancing_loss,
     moe_metrics,
+    switch_router_weight_decay_mask,
 )
 from stoix.systems.ramdp_vpg.evaluator import evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ff_reinforce import get_distribution_act_fn_with_compute_time
@@ -1497,10 +1498,24 @@ def learner_setup(
         or halting_weight_decay_cfg is not None
     )
 
+    # Exempt the Switch MoE router(s) from the actor's weight decay (see
+    # stoix.networks.torso_compute_transformer.switch_router_weight_decay_mask)
+    # - a no-op without a Switch MoE; None (the default) decays every actor
+    # parameter, the original behaviour.
+    actor_weight_decay_mask = (
+        switch_router_weight_decay_mask
+        if config.system.get("moe_router_weight_decay_exempt", False)
+        else None
+    )
     if not needs_halting_split:
         actor_optim = optax.chain(
             optax.clip_by_global_norm(config.system.max_grad_norm),
-            optax.adamw(actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay),
+            optax.adamw(
+                actor_lr,
+                eps=1e-5,
+                weight_decay=config.system.actor_weight_decay,
+                mask=actor_weight_decay_mask,
+            ),
         )
     else:
         halting_lr = (
@@ -1529,7 +1544,10 @@ def learner_setup(
                 "default": optax.chain(
                     optax.clip_by_global_norm(config.system.max_grad_norm),
                     optax.adamw(
-                        actor_lr, eps=1e-5, weight_decay=config.system.actor_weight_decay
+                        actor_lr,
+                        eps=1e-5,
+                        weight_decay=config.system.actor_weight_decay,
+                        mask=actor_weight_decay_mask,
                     ),
                 ),
                 "halting_head": optax.chain(*halting_components),

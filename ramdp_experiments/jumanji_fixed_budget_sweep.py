@@ -805,6 +805,7 @@ class Job:
     soft_moe_normalize: bool
     switch_capacity_factor: float
     switch_init_scale: float
+    moe_router_weight_decay_exempt: bool
     qv_critic: str
     seed: int
     total_timesteps: float
@@ -862,6 +863,10 @@ class Job:
                     net += f"c{self.switch_capacity_factor:g}"
                 if self.switch_init_scale:
                     net += f"i{self.switch_init_scale:g}"
+                # Only marked when it changes anything (actor weight decay on),
+                # so wd=0 runs keep their pre-exemption tags/run names.
+                if self.moe_router_weight_decay_exempt and self.actor_weight_decay:
+                    net += "xr"
         # Only shown for the explicit-CoT arches - vocab_size doesn't exist on
         # any other architecture, see EXPLICIT_COT_ARCHES/build_grid.
         if self.arch in EXPLICIT_COT_ARCHES:
@@ -1057,6 +1062,13 @@ class Job:
                             "++network.actor_network.pre_torso.switch_init_scale="
                             f"{self.switch_init_scale:g}"
                         )
+                    # Exempt the router from actor weight decay - see
+                    # stoix.networks.torso_compute_transformer's
+                    # switch_router_weight_decay_mask.
+                    cmd.append(
+                        "system.moe_router_weight_decay_exempt="
+                        f"{self.moe_router_weight_decay_exempt}"
+                    )
                     # Router load-balancing loss weight - a system.* key in every
                     # system that can run a transformer torso (ff_reinforce,
                     # ff_qac, ff_ppo, ff_ppo_explicit_cot); 0 turns it off.
@@ -1547,6 +1559,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     qv_critic=qv_critic,
                     seed=seed,
                     total_timesteps=args.total_timesteps,
+                    moe_router_weight_decay_exempt=args.moe_router_weight_decay_exempt,
                     total_num_envs=args.total_num_envs,
                     rollout_length=args.rollout_length,
                     gamma=args.gamma,
@@ -1928,6 +1941,17 @@ def main() -> None:
         "unlimited capacity and omits the override. Only for --moe-type switch.",
     )
     parser.add_argument(
+        "--moe-router-weight-decay-exempt",
+        default="true",
+        choices=("true", "false"),
+        help="system.moe_router_weight_decay_exempt for --moe-type switch jobs: exempt the "
+        "Switch router(s) from actor weight decay (decay flattens the router softmax to "
+        "near-uniform, making routing near-arbitrary and invisible to the load-balancing loss "
+        "- see switch_router_weight_decay_mask). Not swept. Default true; such runs are tagged "
+        "'xr' when actor weight decay is on, so they don't collide with earlier runs that "
+        "decayed the router.",
+    )
+    parser.add_argument(
         "--switch-init-scale",
         default="0",
         help="Comma-separated floats - network.actor_network.pre_torso.switch_init_scale: the "
@@ -2132,6 +2156,7 @@ def main() -> None:
     ]
     args.switch_capacity_factor = [float(x) for x in args.switch_capacity_factor.split(",")]
     args.switch_init_scale = [float(x) for x in args.switch_init_scale.split(",")]
+    args.moe_router_weight_decay_exempt = args.moe_router_weight_decay_exempt == "true"
     args.sokoban_generator = args.sokoban_generator.split(",")
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]

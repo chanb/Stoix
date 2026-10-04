@@ -697,6 +697,26 @@ def moe_drift_metrics(
     return metrics
 
 
+def switch_router_weight_decay_mask(params: Any) -> Any:
+    """Weight-decay mask (for `optax.adamw(..., mask=...)`): `False` for
+    every `SwitchMoEMLP` router parameter (its kernel and bias, under an
+    `mlp_moe/router` path), `True` for everything else - i.e. exempts the
+    Switch router(s) from weight decay. Decoupled weight decay shrinks the
+    router logits towards 0, flattening the router softmax to near-uniform:
+    routing is then decided by near-ties (unstable, prone to dead experts),
+    and the load-balancing loss can't correct it, since `N * sum_i f_i P_i`
+    is exactly 1 for uniform `P` whatever the routing `f`. A no-op (all
+    `True`) for models without a Switch MoE."""
+
+    def _decay(path: Tuple[Any, ...], _leaf: Any) -> bool:
+        keys = [getattr(entry, "key", None) for entry in path]
+        return not any(
+            first == "mlp_moe" and second == "router" for first, second in zip(keys, keys[1:])
+        )
+
+    return jax.tree_util.tree_map_with_path(_decay, params)
+
+
 def apply_collecting_moe_stats(
     apply_fn: Callable, enabled: bool, *args: Any, **kwargs: Any
 ) -> Tuple[Any, Mapping[str, Any]]:
