@@ -328,6 +328,14 @@ class TransformerExplicitCoTTorso(nn.Module):
     agree - or, with `moe_type="switch"`, a
     `stoix.networks.torso_compute_transformer.SwitchMoEMLP` Switch Transformer
     layer (`switch_capacity_factor`, `switch_init_scale`).
+
+    `action_input_norm` (default `False`) normalizes the returned embedding
+    (`final_state`, what the action head reads) - `nn.RMSNorm` if
+    `use_rmsnorm` else `nn.LayerNorm`, applied identically on every path
+    (rollout, parallel replay, scanned replay); see
+    `stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso`
+    for why. The thought-token head (`token_head`, tied to the token
+    embedding) still reads the unnormalized state.
     """
 
     hidden_dim: int
@@ -350,6 +358,7 @@ class TransformerExplicitCoTTorso(nn.Module):
     moe_type: str = "soft"
     switch_capacity_factor: Optional[float] = None
     switch_init_scale: Optional[float] = None
+    action_input_norm: bool = False
 
     @nn.compact
     def __call__(
@@ -517,7 +526,12 @@ class TransformerExplicitCoTTorso(nn.Module):
                 states, halt_step[..., None, None], axis=-2
             ).squeeze(axis=-2)
 
-            return final_state, log_prob, per_step_log_prob, per_step_entropy
+            return (
+                self._action_input(final_state),
+                log_prob,
+                per_step_log_prob,
+                per_step_entropy,
+            )
 
         # KV-cached step-by-step build, shared by rollout mode and (when
         # `use_latent_feedback=True`) replay mode: with latent feedback, each
@@ -696,5 +710,17 @@ class TransformerExplicitCoTTorso(nn.Module):
         ), _ = scan_step(backbone, initial_carry, jnp.arange(self.max_steps))
 
         if replaying:
-            return final_state, log_prob, per_step_log_prob, per_step_entropy
-        return final_state, num_steps_taken, emitted_tokens
+            return (
+                self._action_input(final_state),
+                log_prob,
+                per_step_log_prob,
+                per_step_entropy,
+            )
+        return self._action_input(final_state), num_steps_taken, emitted_tokens
+
+    def _action_input(self, final_state: chex.Array) -> chex.Array:
+        """`final_state`, normalized if `action_input_norm` - see class
+        docstring. Called once per `__call__` (one return path per call)."""
+        if not self.action_input_norm:
+            return final_state
+        return _norm_cls(self.use_rmsnorm)(name="action_input_norm")(final_state)

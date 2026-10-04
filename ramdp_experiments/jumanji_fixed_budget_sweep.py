@@ -770,6 +770,7 @@ class Job:
     actor_weight_decay: float
     critic_weight_decay: float
     actor_weight_decay_mask: str
+    action_input_norm: bool
     ent_coef: float
     max_grad_norm: float
     delightful: bool
@@ -920,6 +921,10 @@ class Job:
             extra.append("sn")
         if self.use_rmsnorm:
             extra.append("rms")
+        if self.action_input_norm and (
+            self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
+        ):
+            extra.append("ain")
         if extra:
             parts.append("-".join(extra))
 
@@ -1079,6 +1084,18 @@ class Job:
                     # system that can run a transformer torso (ff_reinforce,
                     # ff_qac, ff_ppo, ff_ppo_explicit_cot); 0 turns it off.
                     cmd.append(f"system.moe_load_balancing_coef={self.moe_load_balancing_coef:g}")
+        # Optional norms before the action head (latent- and explicit-CoT
+        # transformers) / the halting head (latent CoT only - explicit CoT
+        # halts via its tied token head) - see
+        # stoix.networks.torso_compute_transformer's
+        # TransformerChainOfThoughtTorso/HaltingHead and
+        # torso_compute_explicit_cot's TransformerExplicitCoTTorso. Only
+        # emitted when on, so runs without them get exactly their previous
+        # command.
+        if self.action_input_norm and (
+            self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
+        ):
+            cmd.append("++network.actor_network.pre_torso.action_input_norm=True")
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
@@ -1567,6 +1584,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     total_timesteps=args.total_timesteps,
                     moe_router_weight_decay_exempt=args.moe_router_weight_decay_exempt,
                     actor_weight_decay_mask=args.actor_weight_decay_mask,
+                    action_input_norm=args.action_input_norm,
                     total_num_envs=args.total_num_envs,
                     rollout_length=args.rollout_length,
                     gamma=args.gamma,
@@ -1900,6 +1918,15 @@ def main() -> None:
         "TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
     )
     parser.add_argument(
+        "--action-input-norm",
+        default="false",
+        choices=("true", "false"),
+        help="network.actor_network.pre_torso.action_input_norm: normalize the CoT transformer's "
+        "final thought before the action head (a final LayerNorm/RMSNorm, per --use-rmsnorm) - "
+        "see TransformerChainOfThoughtTorso/TransformerExplicitCoTTorso. TRANSFORMER_ARCHES and "
+        "EXPLICIT_COT_ARCHES only. Not swept. Default false; runs with it are tagged 'ain'.",
+    )
+    parser.add_argument(
         "--use-rmsnorm",
         default="false",
         help="Comma-separated bools (true/false) - RMSNorm instead of LayerNorm "
@@ -2176,6 +2203,7 @@ def main() -> None:
     args.switch_capacity_factor = [float(x) for x in args.switch_capacity_factor.split(",")]
     args.switch_init_scale = [float(x) for x in args.switch_init_scale.split(",")]
     args.moe_router_weight_decay_exempt = args.moe_router_weight_decay_exempt == "true"
+    args.action_input_norm = args.action_input_norm == "true"
     args.sokoban_generator = args.sokoban_generator.split(",")
     args.slidingtile_grid_size = [int(x) for x in args.slidingtile_grid_size.split(",")]
     args.slidingtile_num_random_moves = [int(x) for x in args.slidingtile_num_random_moves.split(",")]

@@ -969,14 +969,27 @@ class HaltingHead(nn.Module):
     final linear readout to logit space, giving the halting decision a
     nonlinear MLP instead of a single linear projection of the shared
     transformer state.
+
+    `input_norm` (default `False`) first normalizes the input (`nn.RMSNorm`
+    if `use_rmsnorm` else `nn.LayerNorm`, see `_norm_cls`) - with pre-norm
+    blocks the thought is the raw residual stream, whose magnitude varies
+    across (weight-tied) CoT steps and over training, which otherwise acts as
+    an uncontrolled, step-dependent temperature on the halting logit. Being
+    part of this module, the norm's parameters are halting-head parameters
+    (trained only by the halting loss when `stop_gradient_halting_input`;
+    covered by `halting_lr`/`halting_weight_decay`/`clip_halting_head`).
     """
 
     hidden_dims: Tuple[int, ...] = ()
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    input_norm: bool = False
+    use_rmsnorm: bool = False
 
     @nn.compact
     def __call__(self, x: chex.Array) -> chex.Array:
+        if self.input_norm:
+            x = _norm_cls(self.use_rmsnorm)()(x)
         for dim in self.hidden_dims:
             x = nn.Dense(dim, kernel_init=self.kernel_init)(x)
             x = parse_activation_fn(self.activation)(x)
@@ -1024,6 +1037,7 @@ class _CoTStep(nn.Module):
     moe_type: str = "soft"
     switch_capacity_factor: Optional[float] = None
     switch_init_scale: Optional[float] = None
+    halting_input_norm: bool = False
 
     @nn.compact
     def __call__(
@@ -1073,7 +1087,11 @@ class _CoTStep(nn.Module):
             for _ in range(self.num_layers)
         ]
         halting_head = HaltingHead(
-            self.halting_hidden_dims, self.activation, self.kernel_init
+            self.halting_hidden_dims,
+            self.activation,
+            self.kernel_init,
+            input_norm=self.halting_input_norm,
+            use_rmsnorm=self.use_rmsnorm,
         )
 
         x = current_token + pos_embedding[step_idx]
@@ -1309,6 +1327,16 @@ class TransformerChainOfThoughtTorso(nn.Module):
     block's MLP into a causal `SoftMoEMLP`, or - with `moe_type="switch"` - a
     `SwitchMoEMLP` Switch Transformer layer (`switch_capacity_factor`,
     `switch_init_scale`) - see `TransformerBlock`.
+
+    `halting_input_norm` (default `False`) normalizes the halting head's
+    input (inside `HaltingHead`, after `stop_gradient_halting_input`'s
+    detach) - see `HaltingHead`. `action_input_norm` (default `False`)
+    normalizes the returned embedding (`final_state`, what the action head
+    reads), like the final norm (GPT-2's `ln_f`) before a pre-norm
+    transformer's output head: with pre-norm blocks (and no sandwich norm)
+    the thought is the raw, unnormalized residual stream. Both use
+    `nn.RMSNorm` if `use_rmsnorm` else `nn.LayerNorm`, and are applied
+    identically in rollout and replay. `states_history` stays unnormalized.
     """
 
     hidden_dim: int
@@ -1333,6 +1361,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
     moe_type: str = "soft"
     switch_capacity_factor: Optional[float] = None
     switch_init_scale: Optional[float] = None
+    halting_input_norm: bool = False
+    action_input_norm: bool = False
 
     @nn.compact
     def __call__(
@@ -1456,6 +1486,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.moe_type,
             self.switch_capacity_factor,
             self.switch_init_scale,
+            self.halting_input_norm,
         )
 
         initial_carry = (
@@ -1494,6 +1525,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
             per_step_halting_log_prob,
             per_step_halting_entropy,
         ), _ = cot_step(initial_carry, jnp.arange(self.max_steps))
+
+        if self.action_input_norm:
+            final_state = _norm_cls(self.use_rmsnorm)(name="action_input_norm")(final_state)
 
         if replaying:
             return (
