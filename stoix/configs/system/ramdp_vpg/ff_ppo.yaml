@@ -94,6 +94,14 @@ moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss (the pape
   # keeping tokens spread across experts - see stoix.networks.torso_compute_transformer.
   # SwitchMoEMLP. 0.0 turns the loss off (routing statistics are still logged); no effect
   # with soft MoE or a dense MLP.
+forced_compute_prob: 0.0 # Random forced-compute rollouts: with this probability, an
+  # environment step's rollout forbids halting before a random CoT step m ~ U{2..max_steps},
+  # so the backbone/action head also train on deep states (TransformerChainOfThoughtTorso
+  # only). Forced halting steps are excluded from the halting PPO ratios/entropy; the env
+  # action's ratio is conditional on the compute used - see ff_ppo.py's module docstring.
+  # 0.0 (default) is the original behaviour.
+forced_compute_value_mask: True # With forced compute on, exclude forced samples from the V
+  # loss, so V estimates the unforced policy's value (Q(s,a,c) always trains on them).
 moe_router_weight_decay_exempt: False # True exempts the Switch MoE router(s) from
   # actor_weight_decay (stoix.networks.torso_compute_transformer.
   # switch_router_weight_decay_mask): decay flattens the router softmax towards uniform,

@@ -216,11 +216,35 @@ ratio instead.
 
 This file intentionally duplicates most of `ff_reinforce.py`/`ff_qac.py`
 rather than modifying them, so those systems are left untouched.
+
+Random forced-compute rollouts (`config.system.forced_compute_prob`, default
+0 = off): with that probability, each environment step's rollout gets a
+forced floor `m ~ U{2..max_steps}` - the halting head may not stop before
+CoT step `m` - so the backbone and action head also train on deep "thought"
+states the halting policy would rarely reach on its own (see
+`TransformerChainOfThoughtTorso`'s `forced_min_steps`). The floor is stored
+in the transition (`forced_min_steps`) and passed again on every replay.
+Importance sampling, since forced samples come from a different behaviour
+policy:
+
+  - Halting decisions below the floor were not sampled from the rollout
+    halting policy (behaviour probability 1), so they are excluded from the
+    per-step halting ratios, the halting entropy bonus and their averages -
+    exactly like steps below the static `min_steps`. Decisions from step `m`
+    on were sampled from the rollout policy, so their usual per-step ratio
+    `pi_new / pi_old` is the correct importance weight (the state-
+    distribution shift is ignored, as everywhere in PPO).
+  - The environment action's ratio `pi_new(a | s, c) / pi_old(a | s, c)` is
+    conditional on the compute `c` actually used, so forced samples are
+    on-policy for it and train the action head at every depth.
+  - V(s) estimates the value of the *unforced* policy, so forced samples are
+    excluded from the V loss when `forced_compute_value_mask` (default True);
+    Q(s, a, c) conditions on `c`, so they always train Q.
 """
 
 import copy
 import time
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import chex
 import flax
@@ -303,6 +327,35 @@ def get_learner_fn(
     # by the optional latent KL penalty below - see `_actor_loss_fn`.
     max_steps = config.network.actor_network.pre_torso.max_steps
 
+    # Random forced-compute rollouts - see the module docstring.
+    forced_compute_prob = float(config.system.get("forced_compute_prob", 0.0))
+    use_forced_compute = forced_compute_prob > 0.0
+    if use_forced_compute:
+        torso_target = str(config.network.actor_network.pre_torso.get("_target_", ""))
+        if not torso_target.endswith("TransformerChainOfThoughtTorso"):
+            raise ValueError(
+                "config.system.forced_compute_prob > 0 is only supported for "
+                "TransformerChainOfThoughtTorso actors (its forced_min_steps), got "
+                f"{torso_target!r}."
+            )
+        if max_steps < 2:
+            raise ValueError("forced_compute_prob > 0 needs max_steps >= 2 to force anything.")
+    mask_forced_from_value = use_forced_compute and bool(
+        config.system.get("forced_compute_value_mask", True)
+    )
+
+    def _forced_kwargs(forced_min_steps: chex.Array) -> dict:
+        """torso_kwargs adding the forced floor - empty when forced compute
+        is off, so every apply is then exactly the original call."""
+        return {"forced_min_steps": forced_min_steps} if use_forced_compute else {}
+
+    def _value_loss_weights(traj_batch: PPOTransition) -> Optional[chex.Array]:
+        """Per-sample V-loss weights: 0 for forced-compute samples when
+        `forced_compute_value_mask`, else None (unweighted)."""
+        if not mask_forced_from_value:
+            return None
+        return (traj_batch.forced_min_steps <= 1.0).astype(jnp.float32)
+
     qac_variant = config.system.qac_variant
     assert qac_variant in (
         "naive",
@@ -360,13 +413,35 @@ def get_learner_fn(
         return q_sa  # "cond_naive"
 
     def _value_loss_fn(
-        pred: chex.Array, behavior: chex.Array, targets: chex.Array, use_expectile: bool = False
+        pred: chex.Array,
+        behavior: chex.Array,
+        targets: chex.Array,
+        use_expectile: bool = False,
+        weights: Optional[chex.Array] = None,
     ) -> chex.Array:
         """PPO's clipped value loss against `behavior`, plain L2 to
         `targets`, or (when `use_expectile=True` - only ever passed for V,
         never Q, see `config.system.use_expectile_value_loss` and the module
         docstring) expectile regression to `targets`
-        (`stoix.utils.loss.expectile_loss`) at `config.system.expectile`."""
+        (`stoix.utils.loss.expectile_loss`) at `config.system.expectile`.
+        `weights` (optional, per-sample) turns each into a weighted mean -
+        e.g. 0 for forced-compute samples, see `_value_loss_weights`."""
+        if weights is not None:
+            diff = targets - pred
+            if use_expectile:
+                per_sample = jnp.where(
+                    diff > 0, config.system.expectile, 1.0 - config.system.expectile
+                ) * jnp.square(diff)
+            elif config.system.clip_value_loss:
+                pred_clipped = behavior + (pred - behavior).clip(
+                    -config.system.clip_eps, config.system.clip_eps
+                )
+                per_sample = 0.5 * jnp.maximum(
+                    jnp.square(pred - targets), jnp.square(pred_clipped - targets)
+                )
+            else:
+                per_sample = 0.5 * jnp.square(diff)
+            return jnp.sum(per_sample * weights) / jnp.maximum(jnp.sum(weights), 1.0)
         if use_expectile:
             return expectile_loss(pred, targets, config.system.expectile)
         if config.system.clip_value_loss:
@@ -391,10 +466,22 @@ def get_learner_fn(
             ) = learner_state
 
             key, policy_key, halting_key = jax.random.split(key, 3)
+            batch_shape = last_timestep.reward.shape
+            if use_forced_compute:
+                # With prob forced_compute_prob, forbid halting before a
+                # uniformly random step m in 2..max_steps (see module
+                # docstring); 1 = no floor. Only splits extra keys when on,
+                # so runs without it keep their exact RNG stream.
+                key, force_key, floor_key = jax.random.split(key, 3)
+                forced = jax.random.bernoulli(force_key, forced_compute_prob, batch_shape)
+                floor = jax.random.randint(floor_key, batch_shape, 2, max_steps + 1)
+                forced_min_steps = jnp.where(forced, floor, 1).astype(jnp.float32)
+            else:
+                forced_min_steps = jnp.ones(batch_shape, dtype=jnp.float32)
             actor_policy, compute_time, first_convergence_step, num_close_steps = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
-                torso_kwargs={"rng": halting_key},
+                torso_kwargs={"rng": halting_key, **_forced_kwargs(forced_min_steps)},
             )
             action = actor_policy.sample(seed=policy_key)
             env_log_prob = actor_policy.log_prob(action)
@@ -409,7 +496,10 @@ def get_learner_fn(
             _, _, old_latent_states, halting_log_prob, _ = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
-                torso_kwargs={"target_compute_time": compute_time},
+                torso_kwargs={
+                    "target_compute_time": compute_time,
+                    **_forced_kwargs(forced_min_steps),
+                },
             )
 
             if is_qac:
@@ -461,6 +551,7 @@ def get_learner_fn(
                 env_log_prob,
                 halting_log_prob,
                 old_latent_states,
+                forced_min_steps,
             )
             learner_state = RamdpOnPolicyLearnerState(
                 params,
@@ -545,7 +636,10 @@ def get_learner_fn(
                 collect_moe_stats,
                 actor_params,
                 traj_batch.obs,
-                torso_kwargs={"target_compute_time": traj_batch.compute_time},
+                torso_kwargs={
+                    "target_compute_time": traj_batch.compute_time,
+                    **_forced_kwargs(traj_batch.forced_min_steps),
+                },
             )
             env_log_prob = actor_policy.log_prob(traj_batch.action)
 
@@ -570,6 +664,14 @@ def get_learner_fn(
             step_idx = jnp.arange(max_steps)
             valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(jnp.float32)
             num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
+            # Halting decisions actually sampled from the rollout policy: steps
+            # below a forced-compute floor had behaviour probability 1, so they
+            # stay out of the halting ratio/entropy averages (see module
+            # docstring). Identical to valid_step without forced compute.
+            valid_decision = valid_step * (
+                step_idx + 1 >= traj_batch.forced_min_steps[..., None]
+            ).astype(jnp.float32)
+            num_valid_decisions = jnp.maximum(jnp.sum(valid_decision), 1.0)
 
             halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
             advantage_per_step = advantage[..., None]
@@ -590,13 +692,13 @@ def get_learner_fn(
                     * advantage_per_step
                 )
                 halting_per_step_loss = -jnp.minimum(halting_surrogate1, halting_surrogate2)
-            halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
+            halting_loss = jnp.sum(halting_per_step_loss * valid_decision) / num_valid_decisions
             halting_clip_fraction = (
                 jnp.sum(
                     (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
-                    * valid_step
+                    * valid_decision
                 )
-                / num_valid_steps
+                / num_valid_decisions
             )
             # Entropy bonus on the halting decision itself, mirroring
             # `entropy` above for the environment action - `ent_coef` alone
@@ -604,12 +706,14 @@ def get_learner_fn(
             # only the environment action's distribution), so without this
             # nothing keeps the halting policy from collapsing to a
             # degenerate, non-adaptive compute-time before it discovers any
-            # genuine per-example structure. Same `valid_step` masking as
+            # genuine per-example structure. Same `valid_decision` masking as
             # `halting_loss` above - `per_step_halting_entropy` is already
             # zeroed at forced steps (before `min_steps`, or the forced halt
             # at `max_steps`) and past each example's actual halt, see the
             # torso's docstring.
-            halting_entropy = jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
+            halting_entropy = (
+                jnp.sum(per_step_halting_entropy * valid_decision) / num_valid_decisions
+            )
 
             loss_actor = action_loss + halting_loss
 
@@ -644,6 +748,13 @@ def get_learner_fn(
             # MoE routing/combine statistics, masked to steps actually
             # taken - empty without MoE.
             loss_info["moe_load_balancing_loss"] = load_balancing_loss
+            if use_forced_compute:
+                unforced = (traj_batch.forced_min_steps <= 1.0).astype(jnp.float32)
+                loss_info["forced_compute_fraction"] = 1.0 - unforced.mean()
+                # The halting policy's own compute, on samples it fully chose.
+                loss_info["unforced_compute_time"] = jnp.sum(
+                    traj_batch.compute_time * unforced
+                ) / jnp.maximum(jnp.sum(unforced), 1.0)
             loss_info.update(moe_metrics(moe_stats))
             return total_loss_actor, loss_info
 
@@ -661,6 +772,7 @@ def get_learner_fn(
                     traj_batch.value,
                     targets,
                     use_expectile=config.system.use_expectile_value_loss,
+                    weights=_value_loss_weights(traj_batch),
                 )
 
                 q_output = _q_output(critic_params, traj_batch.obs, traj_batch.compute_time)
@@ -685,6 +797,7 @@ def get_learner_fn(
                     traj_batch.value,
                     targets,
                     use_expectile=config.system.use_expectile_value_loss,
+                    weights=_value_loss_weights(traj_batch),
                 )
 
                 critic_total_loss = config.system.vf_coef * value_loss
@@ -906,7 +1019,10 @@ def get_learner_fn(
                         collect_moe_stats,
                         actor_params,
                         traj_batch.obs,
-                        torso_kwargs={"target_compute_time": traj_batch.compute_time},
+                        torso_kwargs={
+                            "target_compute_time": traj_batch.compute_time,
+                            **_forced_kwargs(traj_batch.forced_min_steps),
+                        },
                     )
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
 
@@ -945,6 +1061,14 @@ def get_learner_fn(
                         jnp.float32
                     )
                     num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
+                    # Halting decisions actually sampled from the rollout policy: steps
+                    # below a forced-compute floor had behaviour probability 1, so they
+                    # stay out of the halting ratio/entropy averages (see module
+                    # docstring). Identical to valid_step without forced compute.
+                    valid_decision = valid_step * (
+                        step_idx + 1 >= traj_batch.forced_min_steps[..., None]
+                    ).astype(jnp.float32)
+                    num_valid_decisions = jnp.maximum(jnp.sum(valid_decision), 1.0)
 
                     halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
                     advantage_per_step = advantage[..., None]
@@ -974,15 +1098,17 @@ def get_learner_fn(
                     # averaged over examples), so trajectories with more
                     # valid steps don't get down-weighted relative to
                     # shorter ones.
-                    halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
+                    halting_loss = (
+                        jnp.sum(halting_per_step_loss * valid_decision) / num_valid_decisions
+                    )
                     halting_clip_fraction = (
                         jnp.sum(
                             (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(
                                 jnp.float32
                             )
-                            * valid_step
+                            * valid_decision
                         )
-                        / num_valid_steps
+                        / num_valid_decisions
                     )
                     # Entropy bonus on the halting decision itself, mirroring
                     # `entropy` above for the environment action - `ent_coef`
@@ -991,14 +1117,14 @@ def get_learner_fn(
                     # action's distribution), so without this nothing keeps
                     # the halting policy from collapsing to a degenerate,
                     # non-adaptive compute-time before it discovers any
-                    # genuine per-example structure. Same `valid_step`
+                    # genuine per-example structure. Same `valid_decision`
                     # masking as `halting_loss` above -
                     # `per_step_halting_entropy` is already zeroed at forced
                     # steps (before `min_steps`, or the forced halt at
                     # `max_steps`) and past each example's actual halt, see
                     # the torso's docstring.
                     halting_entropy = (
-                        jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
+                        jnp.sum(per_step_halting_entropy * valid_decision) / num_valid_decisions
                     )
 
                     loss_actor = action_loss + halting_loss
@@ -1042,6 +1168,13 @@ def get_learner_fn(
                     # MoE routing/combine statistics, masked to steps actually
                     # taken - empty without MoE.
                     loss_info["moe_load_balancing_loss"] = load_balancing_loss
+                    if use_forced_compute:
+                        unforced = (traj_batch.forced_min_steps <= 1.0).astype(jnp.float32)
+                        loss_info["forced_compute_fraction"] = 1.0 - unforced.mean()
+                        # The halting policy's own compute, on samples it fully chose.
+                        loss_info["unforced_compute_time"] = jnp.sum(
+                            traj_batch.compute_time * unforced
+                        ) / jnp.maximum(jnp.sum(unforced), 1.0)
                     loss_info.update(moe_metrics(moe_stats))
                     return total_loss_actor, loss_info
 
@@ -1058,6 +1191,7 @@ def get_learner_fn(
                             traj_batch.value,
                             targets,
                             use_expectile=config.system.use_expectile_value_loss,
+                            weights=_value_loss_weights(traj_batch),
                         )
 
                         q_output = _q_output(
@@ -1097,6 +1231,7 @@ def get_learner_fn(
                             traj_batch.value,
                             targets,
                             use_expectile=config.system.use_expectile_value_loss,
+                            weights=_value_loss_weights(traj_batch),
                         )
 
                         critic_total_loss = config.system.vf_coef * value_loss
@@ -1322,7 +1457,10 @@ def get_learner_fn(
                 return x.reshape(-1, *x.shape[2:])
 
             flat_obs = jax.tree.map(_flatten, traj_batch.obs)
-            replay_kwargs = {"target_compute_time": _flatten(traj_batch.compute_time)}
+            replay_kwargs = {
+                "target_compute_time": _flatten(traj_batch.compute_time),
+                **_forced_kwargs(_flatten(traj_batch.forced_min_steps)),
+            }
             _, pre_update_stats = apply_collecting_moe_stats(
                 actor_apply_fn,
                 True,

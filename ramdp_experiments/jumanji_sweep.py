@@ -736,6 +736,7 @@ class Job:
     actor_weight_decay_mask: str
     action_input_norm: bool
     input_injection: str
+    forced_compute_prob: float
     halting_input_norm: bool
     ent_coef: float
     max_grad_norm: float
@@ -915,12 +916,24 @@ class Job:
             self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
         ):
             extra.append(f"inj{self.input_injection}")
+        if self._uses_forced_compute:
+            extra.append(f"fc{self.forced_compute_prob:g}")
         if self.halting_input_norm and self.arch in TRANSFORMER_ARCHES:
             extra.append("hin")
         if extra:
             parts.append("-".join(extra))
 
         return _cap_tag_length(parts, MAX_GROUP_TAG_LEN - _SEED_SUFFIX_RESERVE)
+
+    @property
+    def _uses_forced_compute(self) -> bool:
+        """Random forced-compute rollouts only exist in ff_ppo.py, for the
+        latent-CoT transformer torso - see its module docstring."""
+        return (
+            self.forced_compute_prob > 0
+            and SYSTEM_TO_SCRIPT.get(self.system, "").endswith("/ff_ppo.py")
+            and self.arch in TRANSFORMER_ARCHES
+        )
 
     @property
     def group_tag(self) -> str:
@@ -1105,6 +1118,10 @@ class Job:
             self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
         ):
             cmd.append("++network.actor_network.pre_torso.action_input_norm=True")
+        if self._uses_forced_compute:
+            # Random forced-compute rollouts (forced halting steps excluded
+            # from the halting PPO ratios) - see ff_ppo.py's module docstring.
+            cmd.append(f"system.forced_compute_prob={self.forced_compute_prob:g}")
         if self.input_injection != "none" and (
             self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
         ):
@@ -1696,6 +1713,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     actor_weight_decay_mask=args.actor_weight_decay_mask,
                     action_input_norm=args.action_input_norm,
                     input_injection=args.input_injection,
+                    forced_compute_prob=args.forced_compute_prob,
                     halting_input_norm=args.halting_input_norm,
                     total_num_envs=args.total_num_envs,
                     rollout_length=args.rollout_length,
@@ -2113,6 +2131,17 @@ def main() -> None:
         "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. Only applies "
         "to TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES (every other architecture has no "
         "TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
+    )
+    parser.add_argument(
+        "--forced-compute-prob",
+        default=0.0,
+        type=float,
+        help="system.forced_compute_prob: probability that an environment step's rollout "
+        "forbids halting before a random CoT step m ~ U{2..max_steps}, so the backbone/action "
+        "head train on deep states too (forced halting steps are excluded from the halting PPO "
+        "ratios) - see stoix/systems/ramdp_vpg/ff_ppo.py. ff_ppo.py systems x "
+        "TRANSFORMER_ARCHES only. Not swept. Default 0 (off, omitted); runs with it are tagged "
+        "'fc<prob>'.",
     )
     parser.add_argument(
         "--input-injection",

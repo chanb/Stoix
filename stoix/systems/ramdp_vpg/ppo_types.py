@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import chex
 from typing_extensions import NamedTuple
@@ -57,3 +57,6 @@ class PPOTransition(NamedTuple):
     env_log_prob: chex.Array
     halting_log_prob: chex.Array
     old_latent_states: chex.Array
+    # Forced-compute floor this step was rolled out with (1 = none) - see
+    # ff_ppo.py's module docstring. Optional (None) for callers without it.
+    forced_min_steps: Optional[chex.Array] = None

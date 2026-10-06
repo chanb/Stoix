@@ -1105,6 +1105,7 @@ class _CoTStep(nn.Module):
             per_step_halting_log_prob,
             per_step_halting_entropy,
             observation_embedding,
+            min_steps_per_example,
         ) = carry
 
         pos_embedding = self.param(
@@ -1182,7 +1183,9 @@ class _CoTStep(nn.Module):
 
         step_count = step_idx + 1
         is_final_step = step_count == self.max_steps
-        can_halt = step_count >= self.min_steps
+        # Per-example floor: `self.min_steps`, raised by a forced-compute
+        # rollout's `forced_min_steps` (see TransformerChainOfThoughtTorso).
+        can_halt = step_count >= min_steps_per_example
 
         if not self.replaying:
             # Only meaningful from the second step on (step 0 has no
@@ -1218,7 +1221,7 @@ class _CoTStep(nn.Module):
         # Halting is forced (not a free policy choice) before min_steps or at
         # max_steps - stop-gradient halting_prob there so REINFORCE doesn't
         # credit/blame the halting head for an outcome it didn't control.
-        is_forced_step = (step_count < self.min_steps) | is_final_step
+        is_forced_step = (step_count < min_steps_per_example) | is_final_step
         halting_prob_for_log = jnp.where(
             is_forced_step, jax.lax.stop_gradient(halting_prob), halting_prob
         )
@@ -1277,6 +1280,7 @@ class _CoTStep(nn.Module):
             per_step_halting_log_prob,
             per_step_halting_entropy,
             observation_embedding,
+            min_steps_per_example,
         )
         return new_carry, None
 
@@ -1430,6 +1434,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         rng: Optional[chex.PRNGKey] = None,
         target_compute_time: Optional[chex.Array] = None,
         deterministic: bool = False,
+        forced_min_steps: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, ...]:
         """
         Args:
@@ -1446,6 +1451,18 @@ class TransformerChainOfThoughtTorso(nn.Module):
             deterministic: if True (and `target_compute_time` is None), halt
                 as soon as the halting probability crosses 0.5 instead of
                 sampling. Useful for greedy evaluation.
+            forced_min_steps: optional per-example floor on the number of CoT
+                steps (`(*batch,)`), on top of `min_steps` - halting is
+                forbidden before `max(min_steps, forced_min_steps)`. Steps
+                below the floor are *forced* exactly like those below
+                `min_steps`: no halting decision is sampled there, and they
+                contribute nothing to `halting_log_prob`/
+                `per_step_halting_log_prob`/`per_step_halting_entropy` (their
+                behaviour probability is 1, not the halting policy's, so they
+                must not enter an importance ratio). Pass the same value when
+                replaying a trajectory that was rolled out with it, so the
+                replay's forced steps match. Used for random forced-compute
+                rollouts (see `stoix.systems.ramdp_vpg.ff_ppo`).
 
         Returns:
             `(embedding, compute_time, first_convergence_step,
@@ -1476,6 +1493,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
             raise ValueError(
                 f"input_injection must be one of {INPUT_INJECTION_MODES}, "
                 f"got {self.input_injection!r}."
+            )
+        min_steps_per_example = jnp.full(batch_shape, self.min_steps, dtype=jnp.float32)
+        if forced_min_steps is not None:
+            min_steps_per_example = jnp.maximum(
+                min_steps_per_example, jnp.asarray(forced_min_steps, jnp.float32)
             )
 
         # The first scratchpad token is the observation projected into the
@@ -1572,6 +1594,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             per_step_halting_log_prob,
             per_step_halting_entropy,
             initial_token,  # observation_embedding (constant; see InputInjection)
+            min_steps_per_example,  # constant; see forced_min_steps
         )
         (
             _,
@@ -1590,6 +1613,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            _,
             _,
         ), _ = cot_step(initial_carry, jnp.arange(self.max_steps))
 
