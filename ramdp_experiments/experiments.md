@@ -839,3 +839,14 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps
 
 wait
 ```
+
+### Sokoban
+```
+project_name=moe_sweep
+
+python ramdp_experiments/jumanji_fixed_budget_sweep.py --systems ff_ppo_reinforce --budget 1,2,3,4,5 --seeds 3 --architectures cnn+transformer --hidden-dim 32 --qkv-dim 128 --mlp-dim 32 --num-layers 2 --num-heads 8 --total-timesteps 3e9 --envs sokoban --sokoban-generator unfiltered-train --sokoban-eval-generator unfiltered-valid --gpus 0 --rollout-length 20 --total-num-envs 128 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --use-rmsnorm true --ent-coef 0.01 --clip-eps 0.2 --gamma 0.999 --actor-weight-decay 0.0 --gae-lambda 0.95 --standardize-advantages true --wandb true --wandb-project sokoban-${project_name} --output-dir /home/bryanpu1/scratch/logs/ramdp/sokoban-icot-${project_name} --runs-per-gpu 1 --gpus 0,1,2,3 --yes --no-skip-existing --use-expectile-value-loss true --expectile 0.9 --max-grad-norm 0.5 --num-experts 8 --moe-type switch --moe-load-balancing-coef 0.01 --switch-capacity-factor 0 --switch-init-scale 0 --action-input-norm false --input-injection concat --use-sandwich-norm true &
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 3 --architectures cnn+transformer --hidden-dim 32 --qkv-dim 128 --mlp-dim 32 --num-layers 2 --num-heads 8 --total-timesteps 3e9 --envs sokoban --sokoban-generator unfiltered-train --sokoban-eval-generator unfiltered-valid --gpus 0 --rollout-length 20 --total-num-envs 128 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --use-input-layer-norm true --use-rmsnorm true --ent-coef 0.01 --clip-eps 0.2 --gamma 0.999 --actor-weight-decay 0.0 --gae-lambda 0.95 --standardize-advantages true --wandb true --wandb-project sokoban-${project_name} --output-dir /home/bryanpu1/scratch/logs/ramdp/sokoban-icot-${project_name} --runs-per-gpu 1 --gpus 4,5,6,7 --yes --use-expectile-value-loss true --expectile 0.2 --max-grad-norm 0.5 --halting-weight-decay 0.0 --halting-lr 1e-3,1e-5 --halting-ent-coef 0.0,1e-4 --num-experts 8 --moe-type switch --moe-load-balancing-coef 0.01 --switch-capacity-factor 0 --switch-init-scale 0 --action-input-norm false --halting-input-norm false --input-injection concat --use-sandwich-norm true &
+
+wait
+```
