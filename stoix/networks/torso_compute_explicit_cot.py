@@ -106,6 +106,8 @@ from flax import linen as nn
 from flax.linen.initializers import Initializer, normal, orthogonal
 
 from stoix.networks.torso_compute_transformer import (
+    INPUT_INJECTION_MODES,
+    InputInjection,
     TransformerBlock,
     _norm_cls,
     _resolve_qkv_dim,
@@ -173,8 +175,15 @@ class _ExplicitCoTBackbone(nn.Module):
     moe_type: str = "soft"
     switch_capacity_factor: Optional[float] = None
     switch_init_scale: Optional[float] = None
+    input_injection: str = "none"
 
     def setup(self) -> None:
+        if self.input_injection != "none":
+            # Shared by `run` and `step` (like `self.blocks`), so the parallel
+            # replay pass and the scanned path inject with the same weights.
+            self.input_injector = InputInjection(
+                self.hidden_dim, self.input_injection, self.kernel_init
+            )
         self.pos_embedding = self.param(
             "pos_embedding", normal(stddev=0.02), (self.max_steps + 1, self.hidden_dim)
         )
@@ -222,7 +231,20 @@ class _ExplicitCoTBackbone(nn.Module):
     def token_head(self, state: chex.Array) -> chex.Array:
         return self.token_embed.attend(state)
 
-    def run(self, scratchpad: chex.Array, token_mask: Optional[chex.Array] = None) -> chex.Array:
+    def _inject(self, token: chex.Array, observation_embedding: Optional[chex.Array]) -> chex.Array:
+        """Re-inject the observation embedding into scratchpad token(s) -
+        see `stoix.networks.torso_compute_transformer.InputInjection`; a
+        no-op with `input_injection="none"`."""
+        if self.input_injection == "none":
+            return token
+        return self.input_injector(token, observation_embedding)
+
+    def run(
+        self,
+        scratchpad: chex.Array,
+        token_mask: Optional[chex.Array] = None,
+        observation_embedding: Optional[chex.Array] = None,
+    ) -> chex.Array:
         """Runs the transformer over `scratchpad` (`(*batch, max_steps,
         hidden_dim)`) under a causal mask in one call and returns the
         per-position states - used only by the parallel one-shot replay pass
@@ -232,9 +254,13 @@ class _ExplicitCoTBackbone(nn.Module):
         The other paths use `step` instead (see class docstring).
         `token_mask` (`(*batch, max_steps)` bool) only selects which
         positions count towards the MoE statistics - see
-        `TransformerBlock.__call__`."""
+        `TransformerBlock.__call__`. `observation_embedding` (`(*batch,
+        hidden_dim)`) is injected into every position (incl. 0) when
+        `input_injection` is on, exactly as `step` does per step."""
         seq_len = scratchpad.shape[-2]
         batch_shape = scratchpad.shape[:-2]
+        if self.input_injection != "none":
+            scratchpad = self._inject(scratchpad, observation_embedding[..., None, :])
         tokens_in = scratchpad + self.pos_embedding[:seq_len]
         causal_mask = nn.make_causal_mask(jnp.ones(batch_shape + (seq_len,)))
         for block in self.blocks:
@@ -259,6 +285,7 @@ class _ExplicitCoTBackbone(nn.Module):
         moe_cache: list,
         step_idx: chex.Array,
         token_mask: Optional[chex.Array] = None,
+        observation_embedding: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, list, list, list]:
         """Incremental counterpart to `run`, used by the scanned per-step
         body (rollout mode and, when `use_latent_feedback=True`, replay
@@ -266,8 +293,8 @@ class _ExplicitCoTBackbone(nn.Module):
         extending each layer's KV-cache (`TransformerBlock.step`) instead of
         reprocessing the whole scratchpad. Uses the same `self.blocks` as
         `run`, so its weights stay shared with the parallel replay pass (see
-        class docstring)."""
-        x = token + self.pos_embedding[step_idx]
+        class docstring). `observation_embedding`: see `run`."""
+        x = self._inject(token, observation_embedding) + self.pos_embedding[step_idx]
         new_cached_keys = []
         new_cached_values = []
         new_moe_cache = []
@@ -336,6 +363,11 @@ class TransformerExplicitCoTTorso(nn.Module):
     `stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso`
     for why. The thought-token head (`token_head`, tied to the token
     embedding) still reads the unnormalized state.
+
+    `input_injection` (default `"none"`, the original design) re-injects the
+    observation embedding (the first scratchpad token) into every step's
+    input - see `stoix.networks.torso_compute_transformer.InputInjection` -
+    identically in the parallel replay pass and the scanned path.
     """
 
     hidden_dim: int
@@ -359,6 +391,7 @@ class TransformerExplicitCoTTorso(nn.Module):
     switch_capacity_factor: Optional[float] = None
     switch_init_scale: Optional[float] = None
     action_input_norm: bool = False
+    input_injection: str = "none"
 
     @nn.compact
     def __call__(
@@ -406,6 +439,11 @@ class TransformerExplicitCoTTorso(nn.Module):
         act_token_id = self.vocab_size
         num_classes = self.vocab_size + 1
 
+        if self.input_injection not in INPUT_INJECTION_MODES:
+            raise ValueError(
+                f"input_injection must be one of {INPUT_INJECTION_MODES}, "
+                f"got {self.input_injection!r}."
+            )
         initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         if self.use_input_layer_norm:
             initial_token = _norm_cls(self.use_rmsnorm)()(initial_token)
@@ -433,6 +471,7 @@ class TransformerExplicitCoTTorso(nn.Module):
             self.moe_type,
             self.switch_capacity_factor,
             self.switch_init_scale,
+            self.input_injection,
         )
 
         # Per-step "act now" legality, precomputed once as a constant boolean
@@ -495,7 +534,9 @@ class TransformerExplicitCoTTorso(nn.Module):
             still_running = earlier_halts == 0
             # (*batch, max_steps, hidden_dim); `token_mask` keeps post-halt
             # positions out of the MoE statistics.
-            states = backbone.run(scratchpad, token_mask=still_running)
+            states = backbone.run(
+                scratchpad, token_mask=still_running, observation_embedding=initial_token
+            )
 
             # Same masked-logits expression as the scanned path below, so
             # replay scores the exact distribution rollout would have sampled
@@ -603,6 +644,7 @@ class TransformerExplicitCoTTorso(nn.Module):
                 # Pre-update `still_running`: keeps steps past an example's
                 # halt out of the MoE statistics.
                 token_mask=still_running,
+                observation_embedding=initial_token,
             )
             token_logits = jnp.where(legal_mask[step_idx], backbone.token_head(state), _NEG_INF)
 

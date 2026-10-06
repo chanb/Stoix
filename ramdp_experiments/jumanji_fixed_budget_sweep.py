@@ -771,6 +771,7 @@ class Job:
     critic_weight_decay: float
     actor_weight_decay_mask: str
     action_input_norm: bool
+    input_injection: str
     ent_coef: float
     max_grad_norm: float
     delightful: bool
@@ -925,6 +926,10 @@ class Job:
             self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
         ):
             extra.append("ain")
+        if self.input_injection != "none" and (
+            self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
+        ):
+            extra.append(f"inj{self.input_injection}")
         if extra:
             parts.append("-".join(extra))
 
@@ -1096,6 +1101,14 @@ class Job:
             self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
         ):
             cmd.append("++network.actor_network.pre_torso.action_input_norm=True")
+        if self.input_injection != "none" and (
+            self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES
+        ):
+            # Re-inject the observation embedding into every CoT step's input -
+            # see stoix.networks.torso_compute_transformer.InputInjection.
+            cmd.append(
+                f"++network.actor_network.pre_torso.input_injection={self.input_injection}"
+            )
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
@@ -1585,6 +1598,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     moe_router_weight_decay_exempt=args.moe_router_weight_decay_exempt,
                     actor_weight_decay_mask=args.actor_weight_decay_mask,
                     action_input_norm=args.action_input_norm,
+                    input_injection=args.input_injection,
                     total_num_envs=args.total_num_envs,
                     rollout_length=args.rollout_length,
                     gamma=args.gamma,
@@ -1916,6 +1930,17 @@ def main() -> None:
         "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. Only applies "
         "to TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES (every other architecture has no "
         "TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
+    )
+    parser.add_argument(
+        "--input-injection",
+        default="none",
+        choices=("none", "add", "concat"),
+        help="network.actor_network.pre_torso.input_injection: re-inject the observation "
+        "embedding into every CoT step's input (add = zero-initialized additive projection, "
+        "concat = concat-then-project adapter) - see "
+        "stoix/networks/torso_compute_transformer.py's InputInjection. TRANSFORMER_ARCHES and "
+        "EXPLICIT_COT_ARCHES only. Not swept. Default none (omitted); runs with it are tagged "
+        "'injadd'/'injconcat'.",
     )
     parser.add_argument(
         "--action-input-norm",

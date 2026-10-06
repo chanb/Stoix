@@ -959,6 +959,49 @@ class TransformerBlock(nn.Module):
         return self._mlp_residual(token, mlp_out), cached_keys, cached_values, moe_cache
 
 
+INPUT_INJECTION_MODES = ("none", "add", "concat")
+
+
+class InputInjection(nn.Module):
+    """Re-injects the observation embedding into a CoT step's input token -
+    the recurrent-depth "input injection" (e.g. arXiv:2502.05171's adapter):
+    without it the observation enters only as the first scratchpad token, so
+    every later step can reach it only by attending back to position 0.
+
+      - `"add"`: `token + W e`, with `W` (and its bias) zero-initialized, so a
+        freshly initialized model computes exactly what it would without
+        injection and only learns to use it if it helps.
+      - `"concat"`: `W [token; e]` - a `Dense(2 * hidden_dim -> hidden_dim)`
+        adapter over the concatenation, as in recurrent-depth models.
+
+    `observation_embedding` broadcasts against `token` (e.g. `(..., d)`
+    against a `(..., seq_len, d)` scratchpad). Only instantiated for a mode
+    other than `"none"`.
+    """
+
+    hidden_dim: int
+    mode: str
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+
+    @nn.compact
+    def __call__(self, token: chex.Array, observation_embedding: chex.Array) -> chex.Array:
+        observation_embedding = jnp.broadcast_to(observation_embedding, token.shape)
+        if self.mode == "add":
+            proj = nn.Dense(
+                self.hidden_dim,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.zeros,
+                name="proj",
+            )
+            return token + proj(observation_embedding)
+        if self.mode == "concat":
+            adapter = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init, name="adapter")
+            return adapter(jnp.concatenate([token, observation_embedding], axis=-1))
+        raise ValueError(
+            f"input_injection must be one of {INPUT_INJECTION_MODES[1:]} here, got {self.mode!r}."
+        )
+
+
 class HaltingHead(nn.Module):
     """Maps a "thought" to a single halting logit.
 
@@ -1038,6 +1081,7 @@ class _CoTStep(nn.Module):
     switch_capacity_factor: Optional[float] = None
     switch_init_scale: Optional[float] = None
     halting_input_norm: bool = False
+    input_injection: str = "none"
 
     @nn.compact
     def __call__(
@@ -1060,6 +1104,7 @@ class _CoTStep(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            observation_embedding,
         ) = carry
 
         pos_embedding = self.param(
@@ -1094,6 +1139,12 @@ class _CoTStep(nn.Module):
             use_rmsnorm=self.use_rmsnorm,
         )
 
+        if self.input_injection != "none":
+            # Re-inject the observation embedding into this step's input -
+            # see `InputInjection`.
+            current_token = InputInjection(
+                self.hidden_dim, self.input_injection, self.kernel_init, name="input_injection"
+            )(current_token, observation_embedding)
         x = current_token + pos_embedding[step_idx]
         new_cached_keys = []
         new_cached_values = []
@@ -1225,6 +1276,7 @@ class _CoTStep(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            observation_embedding,
         )
         return new_carry, None
 
@@ -1337,6 +1389,12 @@ class TransformerChainOfThoughtTorso(nn.Module):
     the thought is the raw, unnormalized residual stream. Both use
     `nn.RMSNorm` if `use_rmsnorm` else `nn.LayerNorm`, and are applied
     identically in rollout and replay. `states_history` stays unnormalized.
+
+    `input_injection` (default `"none"`, the original design) re-injects the
+    observation embedding (the projected - and, with `use_input_layer_norm`,
+    normalized - first scratchpad token) into every CoT step's input, via
+    `InputInjection` (`"add"`: zero-initialized additive projection;
+    `"concat"`: a concat-then-project adapter).
     """
 
     hidden_dim: int
@@ -1363,6 +1421,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     switch_init_scale: Optional[float] = None
     halting_input_norm: bool = False
     action_input_norm: bool = False
+    input_injection: str = "none"
 
     @nn.compact
     def __call__(
@@ -1413,6 +1472,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
         assert qkv_dim % self.num_heads == 0, (
             f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
         )
+        if self.input_injection not in INPUT_INJECTION_MODES:
+            raise ValueError(
+                f"input_injection must be one of {INPUT_INJECTION_MODES}, "
+                f"got {self.input_injection!r}."
+            )
 
         # The first scratchpad token is the observation projected into the
         # model width.
@@ -1487,6 +1551,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.switch_capacity_factor,
             self.switch_init_scale,
             self.halting_input_norm,
+            self.input_injection,
         )
 
         initial_carry = (
@@ -1506,6 +1571,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            initial_token,  # observation_embedding (constant; see InputInjection)
         )
         (
             _,
@@ -1524,6 +1590,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            _,
         ), _ = cot_step(initial_carry, jnp.arange(self.max_steps))
 
         if self.action_input_norm:
