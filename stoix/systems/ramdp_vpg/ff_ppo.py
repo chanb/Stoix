@@ -240,6 +240,22 @@ policy:
   - V(s) estimates the value of the *unforced* policy, so forced samples are
     excluded from the V loss when `forced_compute_value_mask` (default True);
     Q(s, a, c) conditions on `c`, so they always train Q.
+
+Shared actor-critic torso (`config.system.share_actor_critic_torso`, default
+False; "reinforce" only): the actor network gets a `critic_head` next to its
+action head (`stoix.networks.base_compute.FeedForwardActorCriticWithComputeTime`),
+so V reads the same final "thought" as the action head, through the same input
+layer and adaptively-halting torso. `config.network.critic_network`'s
+`input_layer`/`pre_torso` are then unused - only its `critic_head` is. That
+thought depends on the sampled compute time, so the value is V(s, c) rather
+than V(s): at each rollout step it is read off the same pass that samples
+`c`, during the update off the replay at the stored `c`, and the bootstrap
+value at the rollout's last observation samples a fresh `c` (kept so
+`recompute_advantages` replays the same one). Everything trains through one
+loss, `actor_loss + vf_coef * value_loss`, with the actor's optimizer
+(`actor_lr`, `actor_weight_decay`, one `max_grad_norm` clip over all of it);
+`critic_lr`/`critic_weight_decay` are ignored, `critic_params` is left empty,
+and `critic_before_actor` is unsupported.
 """
 
 import copy
@@ -267,6 +283,7 @@ from stoix.base_types import (
     LearnerFn,
 )
 from stoix.networks.base import FeedForwardCritic
+from stoix.networks.base_compute import FeedForwardActorCriticWithComputeTime as ActorCritic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.networks.base_qac import SeparateValueAndQCritic, ValueAndQCritic
 from stoix.networks.torso_compute_transformer import (
@@ -282,6 +299,7 @@ from stoix.systems.ramdp_vpg.ppo_types import PPOTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
     solved_episode_info,
+    get_discounts,
     update_discounted_return,
 )
 from stoix.utils import make_env as environments
@@ -311,6 +329,10 @@ def get_learner_fn(
     config: DictConfig,
 ) -> LearnerFn[RamdpOnPolicyLearnerState]:
     """Get the learner function."""
+
+    # Per-environment-step and per-extra-compute-step discounts (each
+    # defaulting to `system.gamma`) - see `get_discounts`.
+    gamma_act, gamma_comp = get_discounts(config)
 
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
@@ -366,6 +388,19 @@ def get_learner_fn(
     ), f"Unknown qac_variant: {qac_variant}"
     is_qac = qac_variant in ("naive", "fac", "cond_naive", "cond_fac")
 
+    # Shared actor-critic torso - see the module docstring.
+    share_torso = bool(config.system.get("share_actor_critic_torso", False))
+    if share_torso and is_qac:
+        raise ValueError(
+            "share_actor_critic_torso is only supported for qac_variant='reinforce', "
+            f"got {qac_variant!r}."
+        )
+    if share_torso and config.system.critic_before_actor:
+        raise ValueError("share_actor_critic_torso does not support critic_before_actor.")
+    # `return_value=True` makes the shared network also return V(s, c), right
+    # after the action distribution - see FeedForwardActorCriticWithComputeTime.
+    value_kwargs = {"return_value": True} if share_torso else {}
+
     def _q_output(
         critic_params: FrozenDict, obs: chex.Array, compute_time: chex.Array
     ) -> chex.Array:
@@ -409,7 +444,7 @@ def get_learner_fn(
             return jnp.take_along_axis(q_at_c, action[..., jnp.newaxis], axis=-1).squeeze(-1)
         q_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
         if qac_variant in ("fac", "cond_fac"):
-            return config.system.gamma ** (compute_time - 1) * q_sa
+            return gamma_comp ** (compute_time - 1) * q_sa
         return q_sa  # "cond_naive"
 
     def _value_loss_fn(
@@ -460,7 +495,7 @@ def get_learner_fn(
                 key,
                 env_state,
                 last_timestep,
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             ) = learner_state
@@ -478,11 +513,26 @@ def get_learner_fn(
                 forced_min_steps = jnp.where(forced, floor, 1).astype(jnp.float32)
             else:
                 forced_min_steps = jnp.ones(batch_shape, dtype=jnp.float32)
-            actor_policy, compute_time, first_convergence_step, num_close_steps = actor_apply_fn(
+            # With a shared torso, this same pass also gives V(s, c) at the
+            # sampled compute time c.
+            actor_outputs = actor_apply_fn(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"rng": halting_key, **_forced_kwargs(forced_min_steps)},
+                **value_kwargs,
             )
+            if share_torso:
+                (
+                    actor_policy,
+                    value,
+                    compute_time,
+                    first_convergence_step,
+                    num_close_steps,
+                ) = actor_outputs
+            else:
+                actor_policy, compute_time, first_convergence_step, num_close_steps = (
+                    actor_outputs
+                )
             action = actor_policy.sample(seed=policy_key)
             env_log_prob = actor_policy.log_prob(action)
 
@@ -510,6 +560,8 @@ def get_learner_fn(
                     params.critic_params, last_timestep.observation, compute_time
                 )
                 q_value = _q_at_action_and_compute_time(q_output, action, compute_time)
+            elif share_torso:  # "reinforce", `value` from the actor pass above
+                q_value = jnp.zeros_like(value)
             else:  # "reinforce"
                 value = critic_apply_fn(params.critic_params, last_timestep.observation)
                 q_value = jnp.zeros_like(value)
@@ -518,17 +570,18 @@ def get_learner_fn(
 
             done = timestep.last().reshape(-1)
             (
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             ) = update_discounted_return(
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
                 compute_time,
                 timestep.reward,
                 done,
-                config.system.gamma,
+                gamma_act,
+                gamma_comp,
             )
             info = {
                 **timestep.extras["episode_metrics"],
@@ -559,7 +612,7 @@ def get_learner_fn(
                 key,
                 env_state,
                 timestep,
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             )
@@ -575,13 +628,26 @@ def get_learner_fn(
             key,
             env_state,
             last_timestep,
-            running_cum_compute_time,
+            running_log_discount,
             running_discounted_return,
             episode_discounted_return,
         ) = learner_state
         if is_qac:
             last_val = critic_apply_fn(
                 params.critic_params, last_timestep.observation, method="value"
+            )
+        elif share_torso:
+            # V(s, c) at the bootstrap observation needs a compute time too:
+            # sample one from the current halting policy (no forced floor),
+            # kept as `last_compute_time` so `recompute_advantages` replays
+            # the same c.
+            key, last_halting_key = jax.random.split(key)
+            no_forced_floor = jnp.ones(last_timestep.reward.shape, dtype=jnp.float32)
+            _, last_val, last_compute_time, _, _ = actor_apply_fn(
+                params.actor_params,
+                last_timestep.observation,
+                torso_kwargs={"rng": last_halting_key, **_forced_kwargs(no_forced_floor)},
+                return_value=True,
             )
         else:
             last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
@@ -591,10 +657,10 @@ def get_learner_fn(
         # Return target for V (and, for "naive", Q too): the same n-step,
         # compute-discounted return as `ff_reinforce.py`'s critic.
         compute_time = traj_batch.compute_time
-        r_t = traj_batch.reward * config.system.gamma ** (compute_time - 1)
+        r_t = traj_batch.reward * gamma_comp ** (compute_time - 1)
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
         not_done = 1.0 - traj_batch.done.astype(jnp.float32)
-        d_t = (not_done * config.system.gamma**compute_time).astype(jnp.float32)
+        d_t = (not_done * gamma_act * gamma_comp ** (compute_time - 1)).astype(jnp.float32)
         _, g_targets = batch_truncated_generalized_advantage_estimation(
             r_t, d_t, config.system.gae_lambda, v_tm1=traj_batch.value, v_t=v_t,
             stop_target_gradients=True,
@@ -779,7 +845,7 @@ def get_learner_fn(
                 if qac_variant == "fac":
                     q_pred = jnp.take_along_axis(
                         q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                    ).squeeze(-1) * config.system.gamma ** (traj_batch.compute_time - 1)
+                    ).squeeze(-1) * gamma_comp ** (traj_batch.compute_time - 1)
                     q_targets = targets
                 else:  # "naive", "cond_naive", "cond_fac"
                     q_pred = _q_at_action_and_compute_time(
@@ -993,6 +1059,7 @@ def get_learner_fn(
                     actor_params: FrozenDict,
                     traj_batch: PPOTransition,
                     advantage: chex.Array,
+                    targets: Optional[chex.Array] = None,
                 ) -> Tuple:
                     """Calculate the actor loss.
 
@@ -1008,13 +1075,7 @@ def get_learner_fn(
                     # `new_latent_states` is this epoch's per-step "thought"
                     # states at the same trajectory - only used by the
                     # optional latent KL penalty below (see module docstring).
-                    (
-                        actor_policy,
-                        _,
-                        new_latent_states,
-                        halting_log_prob,
-                        per_step_halting_entropy,
-                    ), moe_stats = apply_collecting_moe_stats(
+                    actor_outputs, moe_stats = apply_collecting_moe_stats(
                         actor_apply_fn,
                         collect_moe_stats,
                         actor_params,
@@ -1023,7 +1084,27 @@ def get_learner_fn(
                             "target_compute_time": traj_batch.compute_time,
                             **_forced_kwargs(traj_batch.forced_min_steps),
                         },
+                        **value_kwargs,
                     )
+                    # With a shared torso, `value` is V(s, c) off this same
+                    # replay, trained below against `targets`.
+                    if share_torso:
+                        (
+                            actor_policy,
+                            value,
+                            _,
+                            new_latent_states,
+                            halting_log_prob,
+                            per_step_halting_entropy,
+                        ) = actor_outputs
+                    else:
+                        (
+                            actor_policy,
+                            _,
+                            new_latent_states,
+                            halting_log_prob,
+                            per_step_halting_entropy,
+                        ) = actor_outputs
                     env_log_prob = actor_policy.log_prob(traj_batch.action)
 
                     if config.system.use_dpo_loss:
@@ -1151,6 +1232,16 @@ def get_learner_fn(
                         + config.system.latent_kl_coef * latent_kl_penalty
                         + config.system.moe_load_balancing_coef * load_balancing_loss
                     )
+                    if share_torso:
+                        # Same V loss as `_critic_loss_fn`'s "reinforce" branch.
+                        value_loss = _value_loss_fn(
+                            value,
+                            traj_batch.value,
+                            targets,
+                            use_expectile=config.system.use_expectile_value_loss,
+                            weights=_value_loss_weights(traj_batch),
+                        )
+                        total_loss_actor = total_loss_actor + config.system.vf_coef * value_loss
                     loss_info = {
                         "actor_loss": loss_actor,
                         "action_loss": action_loss,
@@ -1168,6 +1259,8 @@ def get_learner_fn(
                     # MoE routing/combine statistics, masked to steps actually
                     # taken - empty without MoE.
                     loss_info["moe_load_balancing_loss"] = load_balancing_loss
+                    if share_torso:
+                        loss_info["value_loss"] = value_loss
                     if use_forced_compute:
                         unforced = (traj_batch.forced_min_steps <= 1.0).astype(jnp.float32)
                         loss_info["forced_compute_fraction"] = 1.0 - unforced.mean()
@@ -1203,7 +1296,7 @@ def get_learner_fn(
                             # against `targets` (already on that true scale).
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                            ).squeeze(-1) * config.system.gamma ** (
+                            ).squeeze(-1) * gamma_comp ** (
                                 traj_batch.compute_time - 1
                             )
                             q_targets = targets
@@ -1239,6 +1332,33 @@ def get_learner_fn(
                             "value_loss": value_loss,
                         }
                     return critic_total_loss, loss_info
+
+                if share_torso:
+                    # One combined loss/optimizer over the shared network;
+                    # `critic_params` (empty) pass through unchanged.
+                    actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
+                    actor_grads, loss_info = actor_grad_fn(
+                        params.actor_params, traj_batch, advantages, targets
+                    )
+                    actor_grads, loss_info = jax.lax.pmean(
+                        (actor_grads, loss_info), axis_name="batch"
+                    )
+                    actor_grads, loss_info = jax.lax.pmean(
+                        (actor_grads, loss_info), axis_name="device"
+                    )
+                    loss_info["actor_grad_norm"] = optax.global_norm(actor_grads)
+
+                    actor_updates, actor_new_opt_state = actor_update_fn(
+                        actor_grads, opt_states.actor_opt_state, params.actor_params
+                    )
+                    actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+                    loss_info["actor_param_norm"] = optax.global_norm(actor_new_params)
+
+                    new_params = ActorCriticParams(actor_new_params, params.critic_params)
+                    new_opt_state = ActorCriticOptStates(
+                        actor_new_opt_state, opt_states.critic_opt_state
+                    )
+                    return (new_params, new_opt_state), loss_info
 
                 actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
                 actor_grads, actor_loss_info = actor_grad_fn(
@@ -1335,6 +1455,32 @@ def get_learner_fn(
                     )
                     new_last_val = critic_apply_fn(
                         params.critic_params, last_timestep.observation, method="value"
+                    )
+                elif share_torso:
+                    # V(s, c) replayed at each sample's stored c (on the
+                    # flattened batch, like the MoE drift replay below), and
+                    # at the bootstrap observation's `last_compute_time`.
+                    def _flatten_batch(x: chex.Array) -> chex.Array:
+                        return x.reshape(-1, *x.shape[2:])
+
+                    _, flat_new_value, *_ = actor_apply_fn(
+                        params.actor_params,
+                        jax.tree.map(_flatten_batch, traj_batch.obs),
+                        torso_kwargs={
+                            "target_compute_time": _flatten_batch(traj_batch.compute_time),
+                            **_forced_kwargs(_flatten_batch(traj_batch.forced_min_steps)),
+                        },
+                        return_value=True,
+                    )
+                    new_value = flat_new_value.reshape(traj_batch.compute_time.shape)
+                    _, new_last_val, *_ = actor_apply_fn(
+                        params.actor_params,
+                        last_timestep.observation,
+                        torso_kwargs={
+                            "target_compute_time": last_compute_time,
+                            **_forced_kwargs(no_forced_floor),
+                        },
+                        return_value=True,
                     )
                 else:  # "reinforce"
                     new_value = critic_apply_fn(params.critic_params, traj_batch.obs)
@@ -1442,7 +1588,7 @@ def get_learner_fn(
             key,
             env_state,
             last_timestep,
-            running_cum_compute_time,
+            running_log_discount,
             running_discounted_return,
             episode_discounted_return,
         )
@@ -1582,7 +1728,19 @@ def learner_setup(
             config.network.critic_network.input_layer
         )
 
-    actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
+    # Shared actor-critic torso (see module docstring): the critic head sits
+    # on the actor's network, and the separate critic network built below is
+    # never initialised or applied.
+    share_torso = bool(config.system.get("share_actor_critic_torso", False))
+    if share_torso:
+        actor_network = ActorCritic(
+            torso=actor_torso,
+            action_head=actor_action_head,
+            critic_head=hydra.utils.instantiate(config.network.critic_network.critic_head),
+            **actor_kwargs,
+        )
+    else:
+        actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
 
     if qac_variant in ("naive", "fac", "cond_naive", "cond_fac"):
         value_head = hydra.utils.instantiate(config.network.critic_network.value_head)
@@ -1706,7 +1864,10 @@ def learner_setup(
     init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
 
     actor_params = actor_network.init(
-        actor_net_key, init_x, torso_kwargs={"rng": actor_net_key}
+        actor_net_key,
+        init_x,
+        torso_kwargs={"rng": actor_net_key},
+        **({"return_value": True} if share_torso else {}),
     )
     actor_opt_state = actor_optim.init(actor_params)
 
@@ -1717,6 +1878,8 @@ def learner_setup(
         critic_params = critic_network.init(
             critic_net_key, init_x, compute_time=dummy_compute_time
         )
+    elif share_torso:
+        critic_params = {}
     else:
         critic_params = critic_network.init(critic_net_key, init_x)
     critic_opt_state = critic_optim.init(critic_params)
@@ -1761,7 +1924,7 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
     replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
-    # running_cum_compute_time/running_discounted_return/episode_discounted_return
+    # running_log_discount/running_discounted_return/episode_discounted_return
     # start at 0 for every env, shaped like env_states/timesteps' leading dims.
     params, opt_states = replicate_learner
     zeros_per_env = jnp.zeros(
@@ -1811,6 +1974,22 @@ def run_experiment(_config: DictConfig) -> float:
             config=config,
         )
     )
+
+    # A second evaluator on the training env, so that every eval step also
+    # reports the current policy's performance on training levels, rather than
+    # only the `LogEvent.ACT` returns of the rollouts, whose episodes span
+    # several (changing) policies.
+    evaluate_on_train_env = config.arch.get("evaluate_on_train_env", True)
+    if evaluate_on_train_env:
+        key_e, key_train_e = jax.random.split(key_e)
+        train_env_evaluator, _, _ = evaluator_setup_with_compute_time(
+            eval_env=environments.strip_core_wrappers(env),
+            key_e=key_train_e,
+            eval_act_fn=get_distribution_act_fn_with_compute_time(config, actor_network.apply),
+            params=learner_state.params.actor_params,
+            config=config,
+            use_config_eval_reset_fn=False,
+        )
 
     steps_per_rollout = (
         n_devices
@@ -1870,6 +2049,20 @@ def run_experiment(_config: DictConfig) -> float:
         steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
         evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
+
+        if evaluate_on_train_env:
+            start_time = time.time()
+            key_e, *train_eval_keys = jax.random.split(key_e, n_devices + 1)
+            train_eval_keys = jnp.stack(train_eval_keys).reshape(n_devices, -1)
+
+            train_evaluator_output = train_env_evaluator(trained_params, train_eval_keys)
+            jax.block_until_ready(train_evaluator_output)
+
+            elapsed_time = time.time() - start_time
+            train_eval_metrics = train_evaluator_output.episode_metrics
+            steps_per_train_eval = int(jnp.sum(train_eval_metrics["episode_length"]))
+            train_eval_metrics["steps_per_second"] = steps_per_train_eval / elapsed_time
+            logger.log(train_eval_metrics, t, eval_step, LogEvent.TRAIN_EVAL)
 
         if save_checkpoint:
             checkpointer.save(

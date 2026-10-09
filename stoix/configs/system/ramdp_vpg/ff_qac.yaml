@@ -26,6 +26,10 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # (for "fac") the Q(s,a,1) -> Q(s,a,c) scaling. Only used for the critic's own
   # bootstrapped return target and the "fac" scaling - the advantage itself is
   # Q(s,a,c) - V(s), with no n-step return involved.
+gamma_act: null # Per-environment-step discount; null = gamma. The return is
+  # G = sum_t gamma_act^t * gamma_comp^(z_t + c_t - 1) * r_t with z_t = sum_{k<t} (c_k - 1),
+  # see stoix/systems/ramdp_vpg/ramdp_vpg_types.get_discounts.
+gamma_comp: null # Per-extra-compute-step (pondering/CoT) discount; null = gamma.
 ent_coef: 0.001 # Entropy regularisation term for loss function.
 moe_load_balancing_coef: 0.01 # Switch-Transformer load-balancing loss (the paper's alpha)
   # on the actor's Switch MoE router(s) (pre_torso.num_experts > 0, moe_type=switch),

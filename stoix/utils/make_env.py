@@ -20,7 +20,7 @@ from stoa import (
 from stoa.core_wrappers.auto_reset import CachedAutoResetWrapper
 from stoa.core_wrappers.optimistic_auto_reset import OptimisticResetVmapWrapper
 from stoa.core_wrappers.vmap import VmapWrapper
-from stoa.core_wrappers.wrapper import AddRNGKey
+from stoa.core_wrappers.wrapper import AddRNGKey, Wrapper
 from stoa.utility_wrappers.extras_transforms import NoExtrasWrapper
 
 from stoix.utils.env_factory import EnvFactory
@@ -60,6 +60,21 @@ def apply_core_wrappers(env: Environment, config: DictConfig) -> Environment:
             env = AutoResetWrapper(env, next_obs_in_extras=True)
         env = VmapWrapper(env)
     return env
+
+
+def strip_core_wrappers(env: Environment) -> Environment:
+    """Undoes `apply_core_wrappers` (and the jaxarc variant of it), returning
+    the single, non-auto-resetting environment underneath - i.e. the training
+    environment in the same form as the evaluation environment, so that it can
+    be passed to an evaluator. `AddRNGKey` is always the innermost core wrapper,
+    so we peel wrappers off until we have removed it."""
+    inner = env
+    while isinstance(inner, Wrapper):
+        is_rng_wrapper = isinstance(inner, AddRNGKey)
+        inner = inner._env
+        if is_rng_wrapper:
+            return inner
+    raise ValueError(f"Environment {env!r} does not have the core wrappers applied.")
 
 
 def apply_optional_wrappers(

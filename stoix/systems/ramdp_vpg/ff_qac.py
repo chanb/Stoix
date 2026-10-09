@@ -83,6 +83,7 @@ from stoix.systems.ramdp_vpg.qac_types import Transition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
     solved_episode_info,
+    get_discounts,
     update_discounted_return,
 )
 from stoix.utils import make_env as environments
@@ -101,6 +102,10 @@ def get_learner_fn(
     config: DictConfig,
 ) -> LearnerFn[RamdpOnPolicyLearnerState]:
     """Get the learner function."""
+
+    # Per-environment-step and per-extra-compute-step discounts (each
+    # defaulting to `system.gamma`) - see `get_discounts`.
+    gamma_act, gamma_comp = get_discounts(config)
 
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
@@ -131,7 +136,7 @@ def get_learner_fn(
             return jnp.take_along_axis(q_at_c, action[..., jnp.newaxis], axis=-1).squeeze(-1)
         else:  # "fac"
             q1_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
-            return config.system.gamma ** (compute_time - 1) * q1_sa
+            return gamma_comp ** (compute_time - 1) * q1_sa
 
     def _update_step(
         learner_state: RamdpOnPolicyLearnerState, _: Any
@@ -145,7 +150,7 @@ def get_learner_fn(
                 key,
                 env_state,
                 last_timestep,
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             ) = learner_state
@@ -169,17 +174,18 @@ def get_learner_fn(
 
             done = timestep.last().reshape(-1)
             (
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             ) = update_discounted_return(
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
                 compute_time,
                 timestep.reward,
                 done,
-                config.system.gamma,
+                gamma_act,
+                gamma_comp,
             )
             info = {
                 **timestep.extras["episode_metrics"],
@@ -205,7 +211,7 @@ def get_learner_fn(
                 key,
                 env_state,
                 timestep,
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             )
@@ -221,7 +227,7 @@ def get_learner_fn(
             key,
             env_state,
             last_timestep,
-            running_cum_compute_time,
+            running_log_discount,
             running_discounted_return,
             episode_discounted_return,
         ) = learner_state
@@ -236,10 +242,10 @@ def get_learner_fn(
         # compute-discounted return as `ff_reinforce.py`'s critic. Used purely
         # to train the critic; the advantage above never touches it.
         compute_time = traj_batch.compute_time
-        r_t = traj_batch.reward * config.system.gamma ** (compute_time - 1)
+        r_t = traj_batch.reward * gamma_comp ** (compute_time - 1)
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
         not_done = 1.0 - traj_batch.done.astype(jnp.float32)
-        d_t = (not_done * config.system.gamma**compute_time).astype(jnp.float32)
+        d_t = (not_done * gamma_act * gamma_comp ** (compute_time - 1)).astype(jnp.float32)
         g_targets = batch_discounted_returns(r_t, d_t, v_t, True, False)
 
         def _actor_loss_fn(
@@ -327,7 +333,7 @@ def get_learner_fn(
                 q_pred = jnp.take_along_axis(
                     q_output, actions[..., jnp.newaxis], axis=-1
                 ).squeeze(-1)
-                q_targets = targets / config.system.gamma ** (compute_times - 1)
+                q_targets = targets / gamma_comp ** (compute_times - 1)
             q_loss = rlax.l2_loss(q_pred, q_targets).mean()
 
             critic_total_loss = config.system.vf_coef * (value_loss + q_loss)
@@ -396,7 +402,7 @@ def get_learner_fn(
             key,
             env_state,
             last_timestep,
-            running_cum_compute_time,
+            running_log_discount,
             running_discounted_return,
             episode_discounted_return,
         )
@@ -573,7 +579,7 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
     replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
-    # running_cum_compute_time/running_discounted_return/episode_discounted_return
+    # running_log_discount/running_discounted_return/episode_discounted_return
     # start at 0 for every env, shaped like env_states/timesteps' leading dims.
     params, opt_states = replicate_learner
     zeros_per_env = jnp.zeros(

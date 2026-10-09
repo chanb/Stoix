@@ -29,6 +29,7 @@ class LogEvent(Enum):
     ACT = "actor"
     TRAIN = "trainer"
     EVAL = "evaluator"
+    TRAIN_EVAL = "train_evaluator"
     ABSOLUTE = "absolute"
     MISC = "misc"
 
@@ -401,6 +402,12 @@ class JsonLogger(BaseLogger):
         # We only want to log evaluation metrics to the json logger
         if event == LogEvent.ABSOLUTE or event == LogEvent.EVAL:
             self.logger.write(step, key, value, eval_step, event == LogEvent.ABSOLUTE)
+        elif event == LogEvent.TRAIN_EVAL:
+            # Evaluation on the training env (see `stoix.systems.ramdp_vpg.ff_ppo`).
+            # It is written into the same `step_<eval_step>` entry as the EVAL
+            # metrics, so prefix the keys to avoid overwriting them, e.g.
+            # `train_mean_episode_return`.
+            self.logger.write(step, f"train_{key}", value, eval_step)
 
     def log_config(self, config: Dict) -> None:
         ...
@@ -410,6 +417,7 @@ class ConsoleLogger(BaseLogger):
     _EVENT_COLOURS: ClassVar[Dict[LogEvent, str]] = {
         LogEvent.TRAIN: Fore.MAGENTA,
         LogEvent.EVAL: Fore.GREEN,
+        LogEvent.TRAIN_EVAL: Fore.LIGHTGREEN_EX,
         LogEvent.ABSOLUTE: Fore.BLUE,
         LogEvent.ACT: Fore.CYAN,
         LogEvent.MISC: Fore.YELLOW,

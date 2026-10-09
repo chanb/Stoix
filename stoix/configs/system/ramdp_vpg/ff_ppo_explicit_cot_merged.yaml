@@ -22,6 +22,10 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # took `compute_time` pondering steps discounts through `gamma ** compute_time`
   # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
   # controls both the usual reward horizon and the cost of pondering longer.
+gamma_act: null # Per-environment-step discount; null = gamma. The return is
+  # G = sum_t gamma_act^t * gamma_comp^(z_t + c_t - 1) * r_t with z_t = sum_{k<t} (c_k - 1),
+  # see stoix/systems/ramdp_vpg/ramdp_vpg_types.get_discounts.
+gamma_comp: null # Per-extra-compute-step (pondering/CoT) discount; null = gamma.
 gae_lambda: 1.0 # GAE(lambda) mixing parameter for the critic's regression target
   # (`targets`/`g_targets`). 1.0 (the default) recovers the original to-the-end
   # Monte-Carlo return exactly; <1.0 blends in earlier bootstrapped value

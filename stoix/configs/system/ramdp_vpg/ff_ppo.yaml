@@ -47,6 +47,10 @@ gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition
   # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
   # controls both the usual reward horizon and the cost of pondering longer, and
   # (for "fac") the Q(s,a,1) -> Q(s,a,c) scaling.
+gamma_act: null # Per-environment-step discount; null = gamma. The return is
+  # G = sum_t gamma_act^t * gamma_comp^(z_t + c_t - 1) * r_t with z_t = sum_{k<t} (c_k - 1),
+  # see stoix/systems/ramdp_vpg/ramdp_vpg_types.get_discounts.
+gamma_comp: null # Per-extra-compute-step (pondering/CoT) discount; null = gamma.
 gae_lambda: 1.0 # GAE(lambda) mixing parameter for the critic's regression target
   # (`targets`/`g_targets`). 1.0 (the default) recovers the original to-the-end
   # Monte-Carlo return exactly; <1.0 blends in earlier bootstrapped value
@@ -124,6 +128,13 @@ latent_kl_coef: 0.0 # Coefficient on an optional trust-region penalty for how fa
   # and current-epoch states. 0.0 (default) disables it exactly, recovering the
   # original ff_ppo.py behaviour.
 vf_coef: 0.5 # Critic weight.
+share_actor_critic_torso: False # Whether the critic is a value head on the actor's own
+  # network (shared input layer and adaptively-halting torso, reading the same final
+  # "thought" as the action head, so V(s, c) rather than V(s)), trained with one combined
+  # loss `actor_loss + vf_coef * value_loss` and the actor's optimizer - critic_lr and
+  # critic_weight_decay are then ignored, and network.critic_network's input_layer/pre_torso
+  # are unused (only its critic_head is). qac_variant="reinforce" only, and incompatible with
+  # critic_before_actor. See ff_ppo.py's module docstring.
 recompute_advantages: False # Whether the advantage's "what changed" term (Q(s,a,c) for the
   # four Q-V variants, V(s) for "reinforce") and the critic's own regression target are
   # recomputed at the end of every PPO epoch from that epoch's just-updated critic params,

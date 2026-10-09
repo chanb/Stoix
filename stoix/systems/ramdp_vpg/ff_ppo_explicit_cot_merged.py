@@ -91,6 +91,7 @@ from stoix.systems.ramdp_vpg.explicit_cot_types import PPOMergedActionCoTTransit
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
     RamdpOnPolicyLearnerState,
     solved_episode_info,
+    get_discounts,
     update_discounted_return,
 )
 from stoix.utils import make_env as environments
@@ -147,6 +148,10 @@ def get_learner_fn(
 ) -> LearnerFn[RamdpOnPolicyLearnerState]:
     """Get the learner function."""
 
+    # Per-environment-step and per-extra-compute-step discounts (each
+    # defaulting to `system.gamma`) - see `get_discounts`.
+    gamma_act, gamma_comp = get_discounts(config)
+
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
 
@@ -195,7 +200,7 @@ def get_learner_fn(
             return jnp.take_along_axis(q_at_c, action[..., jnp.newaxis], axis=-1).squeeze(-1)
         q_sa = jnp.take_along_axis(q_output, action[..., jnp.newaxis], axis=-1).squeeze(-1)
         if qac_variant in ("fac", "cond_fac"):
-            return config.system.gamma ** (compute_time - 1) * q_sa
+            return gamma_comp ** (compute_time - 1) * q_sa
         return q_sa  # "cond_naive"
 
     def _value_loss_fn(
@@ -221,7 +226,7 @@ def get_learner_fn(
                 key,
                 env_state,
                 last_timestep,
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             ) = learner_state
@@ -263,17 +268,18 @@ def get_learner_fn(
 
             done = timestep.last().reshape(-1)
             (
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             ) = update_discounted_return(
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
                 compute_time,
                 timestep.reward,
                 done,
-                config.system.gamma,
+                gamma_act,
+                gamma_comp,
             )
             info = {
                 **timestep.extras["episode_metrics"],
@@ -300,7 +306,7 @@ def get_learner_fn(
                 key,
                 env_state,
                 timestep,
-                running_cum_compute_time,
+                running_log_discount,
                 running_discounted_return,
                 episode_discounted_return,
             )
@@ -316,7 +322,7 @@ def get_learner_fn(
             key,
             env_state,
             last_timestep,
-            running_cum_compute_time,
+            running_log_discount,
             running_discounted_return,
             episode_discounted_return,
         ) = learner_state
@@ -332,10 +338,10 @@ def get_learner_fn(
         # Return target for V (and, for "naive", Q too): the same n-step,
         # compute-discounted return as `ff_reinforce.py`'s critic.
         compute_time = traj_batch.compute_time
-        r_t = traj_batch.reward * config.system.gamma ** (compute_time - 1)
+        r_t = traj_batch.reward * gamma_comp ** (compute_time - 1)
         v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
         not_done = 1.0 - traj_batch.done.astype(jnp.float32)
-        d_t = (not_done * config.system.gamma**compute_time).astype(jnp.float32)
+        d_t = (not_done * gamma_act * gamma_comp ** (compute_time - 1)).astype(jnp.float32)
         _, g_targets = batch_truncated_generalized_advantage_estimation(
             r_t, d_t, config.system.gae_lambda, v_tm1=traj_batch.value, v_t=v_t,
             stop_target_gradients=True,
@@ -442,7 +448,7 @@ def get_learner_fn(
                 if qac_variant == "fac":
                     q_pred = jnp.take_along_axis(
                         q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                    ).squeeze(-1) * config.system.gamma ** (traj_batch.compute_time - 1)
+                    ).squeeze(-1) * gamma_comp ** (traj_batch.compute_time - 1)
                     q_targets = targets
                 else:  # "naive", "cond_naive", "cond_fac"
                     q_pred = _q_at_action_and_compute_time(
@@ -754,7 +760,7 @@ def get_learner_fn(
                         if qac_variant == "fac":
                             q_pred = jnp.take_along_axis(
                                 q_output, traj_batch.action[..., jnp.newaxis], axis=-1
-                            ).squeeze(-1) * config.system.gamma ** (
+                            ).squeeze(-1) * gamma_comp ** (
                                 traj_batch.compute_time - 1
                             )
                             q_targets = targets
@@ -943,7 +949,7 @@ def get_learner_fn(
             key,
             env_state,
             last_timestep,
-            running_cum_compute_time,
+            running_log_discount,
             running_discounted_return,
             episode_discounted_return,
         )
@@ -1133,7 +1139,7 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
     replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
-    # running_cum_compute_time/running_discounted_return/episode_discounted_return
+    # running_log_discount/running_discounted_return/episode_discounted_return
     # start at 0 for every env, shaped like env_states/timesteps' leading dims.
     params, opt_states = replicate_learner
     zeros_per_env = jnp.zeros(
@@ -1183,6 +1189,22 @@ def run_experiment(_config: DictConfig) -> float:
             config=config,
         )
     )
+
+    # A second evaluator on the training env, so that every eval step also
+    # reports the current policy's performance on training levels, rather than
+    # only the `LogEvent.ACT` returns of the rollouts, whose episodes span
+    # several (changing) policies.
+    evaluate_on_train_env = config.arch.get("evaluate_on_train_env", True)
+    if evaluate_on_train_env:
+        key_e, key_train_e = jax.random.split(key_e)
+        train_env_evaluator, _, _ = evaluator_setup_with_compute_time(
+            eval_env=environments.strip_core_wrappers(env),
+            key_e=key_train_e,
+            eval_act_fn=get_merged_action_act_fn_with_compute_time(config, actor_network.apply),
+            params=learner_state.params.actor_params,
+            config=config,
+            use_config_eval_reset_fn=False,
+        )
 
     steps_per_rollout = (
         n_devices
@@ -1242,6 +1264,20 @@ def run_experiment(_config: DictConfig) -> float:
         steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
         evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
+
+        if evaluate_on_train_env:
+            start_time = time.time()
+            key_e, *train_eval_keys = jax.random.split(key_e, n_devices + 1)
+            train_eval_keys = jnp.stack(train_eval_keys).reshape(n_devices, -1)
+
+            train_evaluator_output = train_env_evaluator(trained_params, train_eval_keys)
+            jax.block_until_ready(train_evaluator_output)
+
+            elapsed_time = time.time() - start_time
+            train_eval_metrics = train_evaluator_output.episode_metrics
+            steps_per_train_eval = int(jnp.sum(train_eval_metrics["episode_length"]))
+            train_eval_metrics["steps_per_second"] = steps_per_train_eval / elapsed_time
+            logger.log(train_eval_metrics, t, eval_step, LogEvent.TRAIN_EVAL)
 
         if save_checkpoint:
             checkpointer.save(

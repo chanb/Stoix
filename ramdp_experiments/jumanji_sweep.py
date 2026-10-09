@@ -117,7 +117,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -192,6 +192,10 @@ EXPLICIT_COT_PPO_SYSTEMS = (
 # omitted from the command) for EXPLICIT_COT_PPO_SYSTEMS, same as every
 # non-PPO system - see build_grid()/Job.command().
 LATENT_KL_PPO_SYSTEMS = tuple(s for s in PPO_SYSTEMS if s not in EXPLICIT_COT_PPO_SYSTEMS)
+# Systems supporting system.share_actor_critic_torso (critic as a value head on
+# the actor's own network) - ff_ppo.py with qac_variant="reinforce" only, see
+# ff_ppo.py's module docstring.
+SHARED_TORSO_SYSTEMS = ("ff_ppo_reinforce",)
 # Every system with a genuine Q-V critic (a q_head alongside value_head),
 # i.e. every key of SYSTEM_TO_QAC_VARIANT except the "reinforce" variants
 # (ff_ppo_reinforce/ff_ppo_explicit_reinforce use a plain V-only critic, see
@@ -762,6 +766,7 @@ class Job:
     standardize_advantages: bool
     recompute_advantages: bool
     critic_before_actor: bool
+    share_actor_critic_torso: bool
     use_layer_norm: bool
     use_input_layer_norm: bool
     stop_gradient_halting_input: bool
@@ -787,9 +792,24 @@ class Job:
     total_num_envs: int
     rollout_length: int
     gamma: float
+    # Optional split of `gamma` (see ramdp_vpg_types.get_discounts) - None
+    # leaves system.gamma_act/gamma_comp unset, i.e. falling back to gamma.
+    gamma_act: Optional[float]
+    gamma_comp: Optional[float]
     output_dir: Path
     wandb: bool
     wandb_project: str
+
+    @property
+    def _gamma_tag(self) -> str:
+        """`g<gamma>`, plus `-ga<gamma_act>`/`-gc<gamma_comp>` only when set,
+        so runs without the split keep their existing tags/run_names."""
+        tag = f"g{self.gamma:g}"
+        if self.gamma_act is not None:
+            tag += f"-ga{self.gamma_act:g}"
+        if self.gamma_comp is not None:
+            tag += f"-gc{self.gamma_comp:g}"
+        return tag
 
     @property
     def group_tag_parts(self) -> List[str]:
@@ -817,11 +837,14 @@ class Job:
             f"{self.env}-{self.difficulty.tag}",
             f"{system_short}-{arch_short}",
             f"mn{self.min_steps}-mx{self.max_steps}",
-            f"g{self.gamma:g}",
+            self._gamma_tag,
         ]
 
+        # critic_lr is ignored with a shared actor-critic torso - left out of
+        # the tag then (see build_grid).
+        clr = "" if self.share_actor_critic_torso else f"-clr{self.critic_lr:g}"
         net = (
-            f"hd{self.hidden_dim}-lr{self.lr:g}-clr{self.critic_lr:g}-ec{self.ent_coef:g}"
+            f"hd{self.hidden_dim}-lr{self.lr:g}{clr}-ec{self.ent_coef:g}"
             f"-mgn{self.max_grad_norm:g}-nl{self.num_layers}"
         )
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
@@ -864,6 +887,8 @@ class Job:
                 ppo += "-radv"
             if self.critic_before_actor:
                 ppo += "-cba"
+            if self.share_actor_critic_torso:
+                ppo += "-shac"
             if self.use_dpo_loss:
                 ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
             if self.use_expectile_value_loss:
@@ -894,7 +919,7 @@ class Job:
             extra.append(f"hh{'x'.join(str(d) for d in self.halting_hidden_dims)}")
         if self.actor_weight_decay:
             extra.append(f"wd{self.actor_weight_decay:g}{wd_mask_tag}")
-        if self.critic_weight_decay:
+        if self.critic_weight_decay and not self.share_actor_critic_torso:
             extra.append(f"cwd{self.critic_weight_decay:g}")
         if self.use_layer_norm:
             extra.append("ln")
@@ -968,8 +993,8 @@ class Job:
             f"arch.total_timesteps={self.total_timesteps:g}",
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
-            "arch.num_evaluation=50",
-            "arch.num_eval_episodes=10",
+            "arch.num_evaluation=100",
+            "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # Independently swept - see the compute torsos' min_steps mechanism
@@ -991,6 +1016,10 @@ class Job:
             f"logger.base_exp_path={self.output_dir / self.run_name}",
         ]
         cmd.extend(self.difficulty.overrides)
+        if self.gamma_act is not None:
+            cmd.append(f"system.gamma_act={self.gamma_act:g}")
+        if self.gamma_comp is not None:
+            cmd.append(f"system.gamma_comp={self.gamma_comp:g}")
 
         if self.system in PPO_SYSTEMS:
             cmd.append(f"system.epochs={self.epochs}")
@@ -1001,6 +1030,8 @@ class Job:
             cmd.append(f"system.standardize_advantages={self.standardize_advantages}")
             cmd.append(f"system.recompute_advantages={self.recompute_advantages}")
             cmd.append(f"system.critic_before_actor={self.critic_before_actor}")
+            if self.system in SHARED_TORSO_SYSTEMS:
+                cmd.append(f"system.share_actor_critic_torso={self.share_actor_critic_torso}")
             if self.system in LATENT_KL_PPO_SYSTEMS:
                 # Latent trust-region penalty - ff_ppo.py (implicit CoT)
                 # only, see LATENT_KL_PPO_SYSTEMS.
@@ -1554,6 +1585,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 critic_before_actor,
             ),
             latent_kl_coef,
+            share_actor_critic_torso,
             clip_halting_head,
             halting_lr,
             halting_weight_decay,
@@ -1578,6 +1610,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             delightful_combos,
             ppo_combos,
             args.latent_kl_coef,
+            args.share_actor_critic_torso,
             args.clip_halting_head,
             args.halting_lr,
             args.halting_weight_decay,
@@ -1610,6 +1643,18 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             # for every other system (including explicit-CoT PPO systems).
             if system not in LATENT_KL_PPO_SYSTEMS:
                 latent_kl_coef = args.latent_kl_coef[0]
+            # share_actor_critic_torso only exists for SHARED_TORSO_SYSTEMS, and
+            # ff_ppo.py rejects it with critic_before_actor - forced off for
+            # either (the resulting duplicates are deduplicated by run_name).
+            if system not in SHARED_TORSO_SYSTEMS or critic_before_actor:
+                share_actor_critic_torso = False
+            # With a shared torso there is no separate critic optimizer, so
+            # critic_lr/critic_weight_decay are ignored by ff_ppo.py - forced to
+            # the first requested value (deduplicated by run_name, and left out
+            # of the tag - see Job.group_tag_parts) rather than swept.
+            if share_actor_critic_torso:
+                critic_lr = args.critic_lr[0]
+                critic_weight_decay = args.critic_weight_decay[0]
             # clip_halting_head/halting_lr/halting_weight_decay only exist on
             # ff_ppo.py's own systems and only have an actual halting head to
             # single out on TRANSFORMER_ARCHES (see
@@ -1688,6 +1733,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     standardize_advantages=standardize_advantages,
                     recompute_advantages=recompute_advantages,
                     critic_before_actor=critic_before_actor,
+                    share_actor_critic_torso=share_actor_critic_torso,
                     use_layer_norm=use_layer_norm,
                     use_input_layer_norm=use_input_layer_norm,
                     stop_gradient_halting_input=stop_gradient_halting_input,
@@ -1718,6 +1764,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     total_num_envs=args.total_num_envs,
                     rollout_length=args.rollout_length,
                     gamma=args.gamma,
+                    gamma_act=args.gamma_act,
+                    gamma_comp=args.gamma_comp,
                     output_dir=args.output_dir,
                     wandb=args.wandb,
                     wandb_project=args.wandb_project,
@@ -1930,6 +1978,16 @@ def main() -> None:
         "joint per-minibatch actor+critic update with two fully sequential phases, `epochs` "
         "epochs of critic-only updates followed by `epochs` epochs of actor-only updates - see "
         "ff_ppo.py's module docstring. PPO systems only.",
+    )
+    parser.add_argument(
+        "--share-actor-critic-torso",
+        default="false",
+        help="Comma-separated bools (true/false) - system.share_actor_critic_torso: the critic "
+        "becomes a value head on the actor's own network (shared input layer and CoT torso, "
+        "V(s, c) off the same final thought as the action head), trained with one combined "
+        "loss and the actor's optimizer (critic_lr/critic_weight_decay ignored) - see "
+        "ff_ppo.py's module docstring. ff_ppo_reinforce only (SHARED_TORSO_SYSTEMS); forced "
+        "off for other systems and with --critic-before-actor true.",
     )
     parser.add_argument(
         "--latent-kl-coef",
@@ -2341,6 +2399,18 @@ def main() -> None:
         "still used as the shared default rather than special-cased per env, unlike MinAtar's "
         "gamma=0.9999 default.",
     )
+    parser.add_argument(
+        "--gamma-act", type=float, default=None,
+        help="system.gamma_act, applied to every job (not swept): the per-environment-step "
+        "discount of G = sum_t gamma_act^t * gamma_comp^(z_t + c_t - 1) * r_t, "
+        "z_t = sum_{k<t} (c_k - 1) (see stoix/systems/ramdp_vpg/ramdp_vpg_types.get_discounts). "
+        "Unset (default) falls back to --gamma.",
+    )
+    parser.add_argument(
+        "--gamma-comp", type=float, default=None,
+        help="system.gamma_comp, applied to every job (not swept): the per-extra-compute-step "
+        "(pondering/CoT) discount - see --gamma-act. Unset (default) falls back to --gamma.",
+    )
     parser.add_argument("--wandb", type=lambda x: x.strip().lower() in ("1", "true", "yes"), default=False)
     parser.add_argument("--wandb-project", default="jumanji_sweep")
     parser.add_argument(
@@ -2407,6 +2477,9 @@ def main() -> None:
     ]
     args.critic_before_actor = [
         x.strip().lower() in ("1", "true", "yes") for x in args.critic_before_actor.split(",")
+    ]
+    args.share_actor_critic_torso = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.share_actor_critic_torso.split(",")
     ]
     args.latent_kl_coef = [float(x) for x in args.latent_kl_coef.split(",")]
     args.clip_halting_head = [
@@ -2531,7 +2604,7 @@ def main() -> None:
         n_skipped = 0
 
     concurrency = len(gpu_ids) * args.runs_per_gpu
-    mem_fraction = 0.95 / args.runs_per_gpu
+    mem_fraction = 0.8 / args.runs_per_gpu
     print(
         f"GPUs: {gpu_ids} x {args.runs_per_gpu} runs/GPU = {concurrency} concurrent "
         f"(XLA_PYTHON_CLIENT_MEM_FRACTION={mem_fraction:g} per process)"
@@ -2548,6 +2621,10 @@ def main() -> None:
         f"max_grad_norm={args.max_grad_norm}"
     )
     print(f"  actor_weight_decay={args.actor_weight_decay} (mask={args.actor_weight_decay_mask}) critic_weight_decay={args.critic_weight_decay}")
+    print(
+        f"  share_actor_critic_torso={args.share_actor_critic_torso} "
+        f"(only: {SHARED_TORSO_SYSTEMS})"
+    )
     print(
         f"  latent_kl_coef={args.latent_kl_coef} "
         f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
@@ -2593,7 +2670,7 @@ def main() -> None:
         f"knapsack_max_value={args.knapsack_max_value} knapsack_max_budget={args.knapsack_max_budget}"
     )
     print(f"  maze_size={args.maze_size}")
-    print(f"  gamma={args.gamma}")
+    print(f"  gamma={args.gamma} gamma_act={args.gamma_act} gamma_comp={args.gamma_comp}")
     print(
         f"  total_timesteps={args.total_timesteps:g} total_num_envs={args.total_num_envs} "
         f"rollout_length={args.rollout_length} output_dir={args.output_dir}"

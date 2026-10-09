@@ -77,3 +77,45 @@ class FeedForwardActorFromTorso(nn.Module):
 
         obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
         return self.torso(obs_embedding, **(torso_kwargs or {}))
+
+
+class FeedForwardActorCriticWithComputeTime(nn.Module):
+    """`FeedForwardActorWithComputeTime` plus a `critic_head` on the same
+    embedding - the actor and critic share the input layer *and* the
+    adaptively-halting torso, and the value is read off the same final
+    "thought" the action head reads. Since that thought depends on how many
+    steps the torso took, the value is V(s, c) for whichever `compute_time`
+    the call sampled (rollout mode) or replayed (`target_compute_time`), not
+    a `c`-independent V(s) - see `stoix.systems.ramdp_vpg.ff_ppo`'s
+    `share_actor_critic_torso`.
+
+    With `return_value=False` (the default) this is a drop-in actor, with
+    exactly `FeedForwardActorWithComputeTime`'s outputs, so the evaluator's
+    `act_fn` works unchanged; `return_value=True` additionally returns the
+    value right after the action distribution: `(action_distribution,
+    value, *torso_extra)`. Initialise with `return_value=True` so the
+    critic head's parameters are created too."""
+
+    action_head: nn.Module
+    critic_head: nn.Module
+    torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        observation: Observation,
+        input_kwargs: Optional[Dict] = None,
+        torso_kwargs: Optional[Dict] = None,
+        head_kwargs: Optional[Dict] = None,
+        return_value: bool = False,
+    ) -> Tuple:
+
+        obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
+        obs_embedding, *torso_extra = self.torso(obs_embedding, **(torso_kwargs or {}))
+        action_distribution = self.action_head(obs_embedding, **(head_kwargs or {}))
+        if not return_value:
+            return (action_distribution, *torso_extra)
+
+        value = self.critic_head(obs_embedding)
+        return (action_distribution, value, *torso_extra)

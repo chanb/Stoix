@@ -26,6 +26,7 @@ from typing_extensions import NamedTuple
 
 from stoix.base_types import EvalFn, EvalResetFn, EvaluationOutput, State
 from stoix.evaluator import make_random_initial_eval_reset_fn
+from stoix.systems.ramdp_vpg.ramdp_vpg_types import get_discounts
 from stoix.utils.jax_utils import unreplicate_batch_dim
 from stoix.utils.running_statistics import RunningStatisticsState, normalize
 
@@ -64,6 +65,8 @@ def get_ff_evaluator_fn_with_compute_time(
     """Like `stoix.evaluator.get_ff_evaluator_fn`, but for a compute-time-aware
     `act_fn` and reporting the actor's mean compute time per action as the
     `compute_time` episode metric."""
+
+    gamma_act, gamma_comp = get_discounts(config)
 
     def eval_one_episode(
         params: FrozenDict,
@@ -106,15 +109,15 @@ def get_ff_evaluator_fn_with_compute_time(
 
             # Log episode metrics. `episode_discounted_return` follows the same
             # compute-adjusted discounting the actor is trained with (see
-            # `ff_reinforce.get_learner_fn`'s `G_h = gamma^(C_h - 1) * (r_h +
-            # gamma * G_{h+1})`), accumulated forward from the start of the
+            # `ff_reinforce.get_learner_fn`'s `G_h = gamma_comp^(C_h - 1) * (r_h +
+            # gamma_act * G_{h+1})`), accumulated forward from the start of the
             # episode via a running `discount_factor` rather than backward
             # like the training-time `batch_discounted_returns` recursion.
             episode_return += timestep.reward
             episode_discounted_return += (
-                discount_factor * config.system.gamma ** (compute_time - 1) * timestep.reward
+                discount_factor * gamma_comp ** (compute_time - 1) * timestep.reward
             )
-            discount_factor *= config.system.gamma**compute_time
+            discount_factor *= gamma_act * gamma_comp ** (compute_time - 1)
             episode_compute_time += compute_time
             episode_first_convergence_step += first_convergence_step
             episode_num_close_steps += num_close_steps
@@ -225,15 +228,24 @@ def evaluator_setup_with_compute_time(
     eval_act_fn: ComputeAwareActFn,
     params: FrozenDict,
     config: DictConfig,
+    use_config_eval_reset_fn: bool = True,
 ) -> Tuple[EvalFn, EvalFn, Tuple[FrozenDict, chex.Array]]:
     """Like `stoix.evaluator.evaluator_setup`, but wires up
     `get_ff_evaluator_fn_with_compute_time` so evaluation also reports the
     actor's mean compute time per action. Only supports feedforward networks
-    (all `ramdp_vpg` uses)."""
+    (all `ramdp_vpg` uses).
+
+    `use_config_eval_reset_fn=False` ignores `config.env.eval_reset_fn` (which
+    is meant for the eval env's levels) and resets `eval_env` randomly - for
+    evaluating on the (unwrapped) training env instead."""
     n_devices = len(jax.devices())
     log_solve_rate = hasattr(config.env, "solved_return_threshold")
 
-    if "eval_reset_fn" in config.env and config.env.eval_reset_fn is not None:
+    if (
+        use_config_eval_reset_fn
+        and "eval_reset_fn" in config.env
+        and config.env.eval_reset_fn is not None
+    ):
         eval_reset_fn = hydra.utils.instantiate(config.env.eval_reset_fn, config, eval_env)
     else:
         eval_reset_fn = make_random_initial_eval_reset_fn(config, eval_env)
