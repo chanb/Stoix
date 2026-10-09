@@ -258,7 +258,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -556,6 +556,9 @@ class Job:
     use_dpo_loss: bool
     dpo_alpha: float
     dpo_beta: float
+    use_reverse_kl_loss: bool
+    reverse_kl_beta: float
+    target_kl: Optional[float]
     use_expectile_value_loss: bool
     expectile: float
     standardize_advantages: bool
@@ -652,6 +655,10 @@ class Job:
                 ppo += "-cba"
             if self.use_dpo_loss:
                 ppo += f"-dpoa{self.dpo_alpha:g}b{self.dpo_beta:g}"
+            if self.use_reverse_kl_loss:
+                ppo += f"-rkl{self.reverse_kl_beta:g}"
+            if self.target_kl is not None:
+                ppo += f"-tkl{self.target_kl:g}"
             if self.use_expectile_value_loss:
                 ppo += f"-iql{self.expectile:g}"
             parts.append(ppo)
@@ -769,6 +776,17 @@ class Job:
             cmd.append(f"system.use_dpo_loss={self.use_dpo_loss}")
             cmd.append(f"system.dpo_alpha={self.dpo_alpha:g}")
             cmd.append(f"system.dpo_beta={self.dpo_beta:g}")
+            # Reverse-KL-regularized actor surrogate (Hsu et al. 2020) and
+            # SB3-style target_kl early stopping - ff_ppo.py's own systems
+            # only (LATENT_KL_PPO_SYSTEMS, same as latent_kl_coef), see
+            # ff_ppo.py's module docstring.
+            if self.system in LATENT_KL_PPO_SYSTEMS:
+                cmd.append(f"system.use_reverse_kl_loss={self.use_reverse_kl_loss}")
+                cmd.append(f"system.reverse_kl_beta={self.reverse_kl_beta:g}")
+                cmd.append(
+                    "system.target_kl="
+                    + ("null" if self.target_kl is None else f"{self.target_kl:g}")
+                )
             # Expectile regression for V's loss only (never Q) - both
             # ff_ppo.py's own systems and ff_ppo_explicit_* (unlike
             # latent_kl_coef above, same applicability as use_dpo_loss) -
@@ -888,6 +906,19 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         else:
             dpo_combos.append((False, args.dpo_alpha[0], args.dpo_beta[0]))
     dpo_combos = list(dict.fromkeys(dpo_combos))
+
+    # (use_reverse_kl_loss, reverse_kl_beta) combos: beta only matters (and
+    # is only swept) when use_reverse_kl_loss=True, mirroring dpo_combos
+    # above. Jobs pairing it with use_dpo_loss=True are dropped in the main
+    # product loop below (ff_ppo.py rejects both at once).
+    reverse_kl_combos = []
+    for use_reverse_kl in args.use_reverse_kl_loss:
+        if use_reverse_kl:
+            for beta in args.reverse_kl_beta:
+                reverse_kl_combos.append((True, beta))
+        else:
+            reverse_kl_combos.append((False, args.reverse_kl_beta[0]))
+    reverse_kl_combos = list(dict.fromkeys(reverse_kl_combos))
 
     # (use_expectile_value_loss, expectile) combos: expectile only matters
     # (and is only swept) when use_expectile_value_loss=True, mirroring
@@ -1082,6 +1113,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         latent_kl_coef,
         clip_halting_head,
         (use_dpo_loss, dpo_alpha, dpo_beta),
+        (use_reverse_kl_loss, reverse_kl_beta),
+        target_kl,
         (use_expectile_value_loss, expectile),
         seed,
     ) in itertools.product(
@@ -1100,6 +1133,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.latent_kl_coef,
         args.clip_halting_head,
         dpo_combos,
+        reverse_kl_combos,
+        args.target_kl,
         expectile_combos,
         range(args.seeds),
     ):
@@ -1137,6 +1172,15 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         # ff_reinforce/ff_qac_*.
         if system not in PPO_SYSTEMS:
             use_dpo_loss, dpo_alpha, dpo_beta = False, args.dpo_alpha[0], args.dpo_beta[0]
+        # use_reverse_kl_loss/reverse_kl_beta/target_kl only exist on
+        # ff_ppo.py's own systems (LATENT_KL_PPO_SYSTEMS) - forced to
+        # their off/first-requested values for every other system.
+        if system not in LATENT_KL_PPO_SYSTEMS:
+            use_reverse_kl_loss, reverse_kl_beta = False, args.reverse_kl_beta[0]
+            target_kl = args.target_kl[0]
+        # ff_ppo.py rejects DPO + reverse-KL together - drop the combo.
+        if use_dpo_loss and use_reverse_kl_loss:
+            continue
         # use_expectile_value_loss/expectile exist on every PPO_SYSTEMS
         # system (same applicability as use_dpo_loss above) - forced to a
         # non-expectile default for ff_reinforce/ff_qac_*.
@@ -1172,6 +1216,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 use_dpo_loss=use_dpo_loss,
                 dpo_alpha=dpo_alpha,
                 dpo_beta=dpo_beta,
+                use_reverse_kl_loss=use_reverse_kl_loss,
+                reverse_kl_beta=reverse_kl_beta,
+                target_kl=target_kl,
                 use_expectile_value_loss=use_expectile_value_loss,
                 expectile=expectile,
                 standardize_advantages=standardize_advantages,
@@ -1507,6 +1554,32 @@ def main() -> None:
         "by Lu et al. (2022)'s meta-optimisation.",
     )
     parser.add_argument(
+        "--use-reverse-kl-loss",
+        default="false",
+        help="Comma-separated bools (true/false) - system.use_reverse_kl_loss: whether the "
+        "env-action and halting-step actor surrogates use the unclipped reverse-KL-regularized "
+        "objective r * A - reverse_kl_beta * KL(pi_new || pi_old) (Hsu et al. 2020, "
+        "https://arxiv.org/abs/2009.10897, eq. 2c; stoix.utils.loss.reverse_kl_loss) instead of "
+        "PPO's clipped surrogate. ff_ppo.py's own systems only (LATENT_KL_PPO_SYSTEMS); forced "
+        "to false otherwise. Jobs combining it with --use-dpo-loss true are dropped.",
+    )
+    parser.add_argument(
+        "--reverse-kl-beta",
+        default="3.0",
+        help="Comma-separated system.reverse_kl_beta values - the reverse-KL penalty "
+        "coefficient, only used (and only swept) when --use-reverse-kl-loss includes true "
+        "(paired via reverse_kl_combos, mirroring --dpo-alpha). Default 3.0, Hsu et al. "
+        "(2020)'s MuJoCo value.",
+    )
+    parser.add_argument(
+        "--target-kl",
+        default="none",
+        help="Comma-separated system.target_kl values ('none' disables) - SB3-style KL "
+        "early stopping: the actor takes no further minibatch steps on a rollout once "
+        "approx_kl exceeds 1.5 * target_kl (the critic keeps training). ff_ppo.py's own "
+        "systems only (LATENT_KL_PPO_SYSTEMS). Default none.",
+    )
+    parser.add_argument(
         "--use-expectile-value-loss",
         default="false",
         help="Comma-separated bools (true/false) - system.use_expectile_value_loss: whether V's "
@@ -1760,6 +1833,14 @@ def main() -> None:
     ]
     args.dpo_alpha = [float(x) for x in args.dpo_alpha.split(",")]
     args.dpo_beta = [float(x) for x in args.dpo_beta.split(",")]
+    args.use_reverse_kl_loss = [
+        x.strip().lower() in ("1", "true", "yes") for x in args.use_reverse_kl_loss.split(",")
+    ]
+    args.reverse_kl_beta = [float(x) for x in args.reverse_kl_beta.split(",")]
+    args.target_kl = [
+        None if x.strip().lower() in ("", "none", "null") else float(x)
+        for x in args.target_kl.split(",")
+    ]
     args.use_expectile_value_loss = [
         x.strip().lower() in ("1", "true", "yes") for x in args.use_expectile_value_loss.split(",")
     ]
@@ -1885,6 +1966,11 @@ def main() -> None:
     print(
         f"  use_dpo_loss={args.use_dpo_loss} dpo_alpha={args.dpo_alpha} dpo_beta={args.dpo_beta} "
         f"(PPO systems only: {PPO_SYSTEMS})"
+    )
+    print(
+        f"  use_reverse_kl_loss={args.use_reverse_kl_loss} "
+        f"reverse_kl_beta={args.reverse_kl_beta} target_kl={args.target_kl} "
+        f"(ff_ppo.py's own systems only: {LATENT_KL_PPO_SYSTEMS})"
     )
     print(
         f"  use_expectile_value_loss={args.use_expectile_value_loss} expectile={args.expectile} "

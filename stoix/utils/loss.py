@@ -81,6 +81,54 @@ def dpo_loss(
     return dpo_surrogate(pi_log_prob_t, b_pi_log_prob_t, gae_t, alpha, beta).mean()
 
 
+def reverse_kl_estimate(pi_log_prob_t: chex.Array, b_pi_log_prob_t: chex.Array) -> chex.Array:
+    """Unreduced per-sample estimate of the reverse KL `KL(pi || b_pi)` from
+    actions sampled under `b_pi`: `r log r - (r - 1)` with `r = pi / b_pi`.
+    Unbiased since `E_b_pi[r log r] = KL(pi || b_pi)` and `E_b_pi[r - 1] = 0`
+    (the `-(r - 1)` term is only a control variate that also makes every
+    sample non-negative), and needs only the sampled action's log-probs -
+    not the full behaviour distribution."""
+    log_diff = pi_log_prob_t - b_pi_log_prob_t
+    ratio = jnp.exp(log_diff)
+    return ratio * log_diff - (ratio - 1.0)
+
+
+def approx_kl_estimate(pi_log_prob_t: chex.Array, b_pi_log_prob_t: chex.Array) -> chex.Array:
+    """Unreduced per-sample estimate of the forward KL `KL(b_pi || pi)` from
+    actions sampled under `b_pi`: `(r - 1) - log r` with `r = pi / b_pi` -
+    the non-negative, low-variance "approx_kl" used for `target_kl` early
+    stopping in common PPO implementations (e.g. Stable-Baselines3)."""
+    log_diff = pi_log_prob_t - b_pi_log_prob_t
+    return jnp.expm1(log_diff) - log_diff
+
+
+def reverse_kl_surrogate(
+    pi_log_prob_t: chex.Array,
+    b_pi_log_prob_t: chex.Array,
+    gae_t: chex.Array,
+    beta: float,
+) -> chex.Array:
+    """Unreduced per-element reverse-KL-regularized PPO surrogate loss (Hsu,
+    Mendler-Dunner & Hardt, 2020, "Revisiting Design Choices in Proximal
+    Policy Optimization", https://arxiv.org/abs/2009.10897, eq. 2c):
+    `-(r * A - beta * KL(pi || b_pi))` with no ratio clipping, the KL term
+    estimated per sample by `reverse_kl_estimate`. `reverse_kl_loss` below
+    is just `.mean()` of this; exposed separately for masked means, as with
+    `dpo_surrogate`."""
+    ratio = jnp.exp(pi_log_prob_t - b_pi_log_prob_t)
+    kl = reverse_kl_estimate(pi_log_prob_t, b_pi_log_prob_t)
+    return -(ratio * gae_t - beta * kl)
+
+
+def reverse_kl_loss(
+    pi_log_prob_t: chex.Array,
+    b_pi_log_prob_t: chex.Array,
+    gae_t: chex.Array,
+    beta: float,
+) -> chex.Array:
+    return reverse_kl_surrogate(pi_log_prob_t, b_pi_log_prob_t, gae_t, beta).mean()
+
+
 def expectile_loss(
     pred_t: chex.Array, target_t: chex.Array, expectile: float
 ) -> chex.Array:

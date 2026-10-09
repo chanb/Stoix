@@ -128,7 +128,18 @@ one joint ratio before exponentiating would make the *effective* per-step
 trust region shrink as `max_steps` grows - clipping longer-budget runs far
 more readily than short ones for reasons unrelated to whether the update is
 actually good. The two clipped surrogates are added together (each already
-an average over its own decisions) before the entropy bonus. The critic (V,
+an average over its own decisions) before the entropy bonus.
+`config.system.use_reverse_kl_loss=True` swaps both clipped surrogates
+(per decision, same masking) for the unclipped reverse-KL-regularized one
+of Hsu et al. 2020 (https://arxiv.org/abs/2009.10897, eq. 2c),
+`r * A - reverse_kl_beta * KL(pi_new || pi_old)`, with the KL estimated
+from the sampled decision alone as `r log r - (r - 1)` (no old
+distribution is stored, only old log-probs); `action_reverse_kl`/
+`halting_reverse_kl` log that estimate for every variant. Independently,
+`config.system.target_kl` stops the actor's (not the critic's) minibatch
+steps for the rest of a rollout's epochs once `approx_kl` - the joint
+action + halting-trajectory KL(pi_old || pi_new) - exceeds
+`1.5 * target_kl`, as in Stable-Baselines3's PPO. The critic (V,
 and Q for "naive"/"fac") is trained with PPO's own clipped value loss
 (`stoix.utils.loss.clipped_value_loss`) against the `old` value/Q estimate
 recorded at rollout time by default, or with plain L2 regression
@@ -296,8 +307,12 @@ from stoix.utils.loss import (
     clipped_value_loss,
     dpo_loss,
     dpo_surrogate,
+    approx_kl_estimate,
     expectile_loss,
     ppo_clip_loss,
+    reverse_kl_estimate,
+    reverse_kl_loss,
+    reverse_kl_surrogate,
 )
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
@@ -326,6 +341,40 @@ def get_learner_fn(
     # Needed to build the "was this pondering step actually taken" mask used
     # by the optional latent KL penalty below - see `_actor_loss_fn`.
     max_steps = config.network.actor_network.pre_torso.max_steps
+
+    # Reverse-KL-regularized surrogate instead of the clip - see the module
+    # docstring.
+    use_reverse_kl_loss = bool(config.system.get("use_reverse_kl_loss", False))
+    if use_reverse_kl_loss and config.system.use_dpo_loss:
+        raise ValueError("use_reverse_kl_loss and use_dpo_loss are mutually exclusive.")
+
+    # SB3-style `target_kl` early stopping of the actor's updates - see
+    # `_kl_early_stop`.
+    target_kl = config.system.get("target_kl", None)
+    use_target_kl = target_kl is not None
+
+    def _kl_early_stop(
+        actor_stopped: chex.Array,
+        actor_loss_info: dict,
+        old: Tuple[FrozenDict, Any],
+        new: Tuple[FrozenDict, Any],
+    ) -> Tuple[chex.Array, Tuple[FrozenDict, Any]]:
+        """Stop the actor's updates for the rest of this rollout's epochs
+        once `approx_kl` (computed on the current minibatch at the
+        pre-step params, already averaged over batch/devices so every
+        replica agrees) exceeds `1.5 * target_kl`, as Stable-Baselines3's
+        PPO does. `lax.scan` can't break, so the remaining steps still run
+        but `old` (actor params, actor opt state) is kept instead of `new`.
+        Only the actor stops - the critic keeps fitting its targets."""
+        if not use_target_kl:
+            actor_loss_info["kl_early_stopped"] = jnp.zeros((), jnp.float32)
+            return actor_stopped, new
+        actor_stopped = actor_stopped | (actor_loss_info["approx_kl"] > 1.5 * target_kl)
+        kept = jax.tree_util.tree_map(
+            lambda o, n: jnp.where(actor_stopped, o, n), old, new
+        )
+        actor_loss_info["kl_early_stopped"] = actor_stopped.astype(jnp.float32)
+        return actor_stopped, kept
 
     # Random forced-compute rollouts - see the module docstring.
     forced_compute_prob = float(config.system.get("forced_compute_prob", 0.0))
@@ -651,6 +700,13 @@ def get_learner_fn(
                     config.system.dpo_alpha,
                     config.system.dpo_beta,
                 )
+            elif use_reverse_kl_loss:
+                action_loss = reverse_kl_loss(
+                    env_log_prob,
+                    traj_batch.env_log_prob,
+                    advantage,
+                    config.system.reverse_kl_beta,
+                )
             else:
                 action_loss = ppo_clip_loss(
                     env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
@@ -659,6 +715,9 @@ def get_learner_fn(
             action_clip_fraction = jnp.mean(
                 (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
             )
+            action_reverse_kl = reverse_kl_estimate(
+                env_log_prob, traj_batch.env_log_prob
+            ).mean()
             entropy = actor_policy.entropy().mean()
 
             step_idx = jnp.arange(max_steps)
@@ -682,6 +741,13 @@ def get_learner_fn(
                     advantage_per_step,
                     config.system.dpo_alpha,
                     config.system.dpo_beta,
+                )
+            elif use_reverse_kl_loss:
+                halting_per_step_loss = reverse_kl_surrogate(
+                    halting_log_prob,
+                    traj_batch.halting_log_prob,
+                    advantage_per_step,
+                    config.system.reverse_kl_beta,
                 )
             else:
                 halting_surrogate1 = halting_ratio * advantage_per_step
@@ -715,6 +781,26 @@ def get_learner_fn(
                 jnp.sum(per_step_halting_entropy * valid_decision) / num_valid_decisions
             )
 
+            halting_reverse_kl = (
+                jnp.sum(
+                    reverse_kl_estimate(halting_log_prob, traj_batch.halting_log_prob)
+                    * valid_decision
+                )
+                / num_valid_decisions
+            )
+
+            # Joint (env action + halting trajectory) forward KL by the chain
+            # rule: the action's term plus each sampled halting decision's,
+            # per example, then averaged - drives `target_kl` early stopping.
+            approx_kl = jnp.mean(
+                approx_kl_estimate(env_log_prob, traj_batch.env_log_prob)
+                + jnp.sum(
+                    approx_kl_estimate(halting_log_prob, traj_batch.halting_log_prob)
+                    * valid_decision,
+                    axis=-1,
+                )
+            )
+
             loss_actor = action_loss + halting_loss
 
             sq_dist = jnp.sum(
@@ -743,6 +829,9 @@ def get_learner_fn(
                 "num_close_steps": traj_batch.num_close_steps,
                 "action_clip_fraction": action_clip_fraction,
                 "halting_clip_fraction": halting_clip_fraction,
+                "action_reverse_kl": action_reverse_kl,
+                "halting_reverse_kl": halting_reverse_kl,
+                "approx_kl": approx_kl,
                 "latent_kl_penalty": latent_kl_penalty,
             }
             # MoE routing/combine statistics, masked to steps actually
@@ -807,11 +896,12 @@ def get_learner_fn(
         def _apply_actor_update(
             params: ActorCriticParams,
             opt_states: ActorCriticOptStates,
+            actor_stopped: chex.Array,
             traj_batch: PPOTransition,
             advantage: chex.Array,
-        ) -> Tuple[ActorCriticParams, ActorCriticOptStates, dict]:
+        ) -> Tuple[ActorCriticParams, ActorCriticOptStates, chex.Array, dict]:
             """Actor-only minibatch update - critic params/opt_state pass
-            through unchanged."""
+            through unchanged. A no-op once `_kl_early_stop` has tripped."""
             actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
             actor_grads, actor_loss_info = actor_grad_fn(
                 params.actor_params, traj_batch, advantage
@@ -828,11 +918,17 @@ def get_learner_fn(
                 actor_grads, opt_states.actor_opt_state, params.actor_params
             )
             actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+            actor_stopped, (actor_new_params, actor_new_opt_state) = _kl_early_stop(
+                actor_stopped,
+                actor_loss_info,
+                (params.actor_params, opt_states.actor_opt_state),
+                (actor_new_params, actor_new_opt_state),
+            )
             actor_loss_info["actor_param_norm"] = optax.global_norm(actor_new_params)
 
             new_params = ActorCriticParams(actor_new_params, params.critic_params)
             new_opt_state = ActorCriticOptStates(actor_new_opt_state, opt_states.critic_opt_state)
-            return new_params, new_opt_state, actor_loss_info
+            return new_params, new_opt_state, actor_stopped, actor_loss_info
 
         def _apply_critic_update(
             params: ActorCriticParams,
@@ -912,12 +1008,12 @@ def get_learner_fn(
 
         def _update_minibatch_actor_only(train_state: Tuple, batch_info: Tuple) -> Tuple:
             """`critic_before_actor`'s actor-only minibatch step."""
-            params, opt_states = train_state
+            params, opt_states, actor_stopped = train_state
             mb_traj_batch, mb_advantages = batch_info
-            params, opt_states, actor_loss_info = _apply_actor_update(
-                params, opt_states, mb_traj_batch, mb_advantages
+            params, opt_states, actor_stopped, actor_loss_info = _apply_actor_update(
+                params, opt_states, actor_stopped, mb_traj_batch, mb_advantages
             )
-            return (params, opt_states), actor_loss_info
+            return (params, opt_states, actor_stopped), actor_loss_info
 
         def _update_epoch_critic_only(update_state: Tuple, _: Any) -> Tuple:
             """`critic_before_actor`'s critic-only epoch: one full shuffled
@@ -956,7 +1052,9 @@ def get_learner_fn(
             pass over the rollout's minibatches, actor params only. No
             recompute here - the critic is frozen through this phase, so
             `advantages` would not change even if refreshed."""
-            params, opt_states, epoch_traj_batch, epoch_advantages, key = update_state
+            params, opt_states, actor_stopped, epoch_traj_batch, epoch_advantages, key = (
+                update_state
+            )
             key, shuffle_key = jax.random.split(key)
 
             batch_size = config.system.rollout_length * config.arch.num_envs
@@ -971,11 +1069,13 @@ def get_learner_fn(
                 shuffled_batch,
             )
 
-            (params, opt_states), loss_info = jax.lax.scan(
-                _update_minibatch_actor_only, (params, opt_states), minibatches
+            (params, opt_states, actor_stopped), loss_info = jax.lax.scan(
+                _update_minibatch_actor_only, (params, opt_states, actor_stopped), minibatches
             )
 
-            update_state = (params, opt_states, epoch_traj_batch, epoch_advantages, key)
+            update_state = (
+                params, opt_states, actor_stopped, epoch_traj_batch, epoch_advantages, key
+            )
             return update_state, loss_info
 
         # --- end config.system.critic_before_actor machinery ---
@@ -986,7 +1086,7 @@ def get_learner_fn(
             def _update_minibatch(train_state: Tuple, batch_info: Tuple) -> Tuple:
                 """Update the network for a single minibatch."""
 
-                params, opt_states = train_state
+                params, opt_states, actor_stopped = train_state
                 traj_batch, advantages, targets = batch_info
 
                 def _actor_loss_fn(
@@ -1034,6 +1134,13 @@ def get_learner_fn(
                             config.system.dpo_alpha,
                             config.system.dpo_beta,
                         )
+                    elif use_reverse_kl_loss:
+                        action_loss = reverse_kl_loss(
+                            env_log_prob,
+                            traj_batch.env_log_prob,
+                            advantage,
+                            config.system.reverse_kl_beta,
+                        )
                     else:
                         action_loss = ppo_clip_loss(
                             env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
@@ -1044,6 +1151,9 @@ def get_learner_fn(
                             jnp.float32
                         )
                     )
+                    action_reverse_kl = reverse_kl_estimate(
+                        env_log_prob, traj_batch.env_log_prob
+                    ).mean()
                     entropy = actor_policy.entropy().mean()
 
                     # `halting_log_prob`/`traj_batch.halting_log_prob`:
@@ -1079,6 +1189,13 @@ def get_learner_fn(
                             advantage_per_step,
                             config.system.dpo_alpha,
                             config.system.dpo_beta,
+                        )
+                    elif use_reverse_kl_loss:
+                        halting_per_step_loss = reverse_kl_surrogate(
+                            halting_log_prob,
+                            traj_batch.halting_log_prob,
+                            advantage_per_step,
+                            config.system.reverse_kl_beta,
                         )
                     else:
                         halting_surrogate1 = halting_ratio * advantage_per_step
@@ -1127,6 +1244,26 @@ def get_learner_fn(
                         jnp.sum(per_step_halting_entropy * valid_decision) / num_valid_decisions
                     )
 
+                    halting_reverse_kl = (
+                        jnp.sum(
+                            reverse_kl_estimate(halting_log_prob, traj_batch.halting_log_prob)
+                            * valid_decision
+                        )
+                        / num_valid_decisions
+                    )
+
+                    # Joint (env action + halting trajectory) forward KL by the chain
+                    # rule: the action's term plus each sampled halting decision's,
+                    # per example, then averaged - drives `target_kl` early stopping.
+                    approx_kl = jnp.mean(
+                        approx_kl_estimate(env_log_prob, traj_batch.env_log_prob)
+                        + jnp.sum(
+                            approx_kl_estimate(halting_log_prob, traj_batch.halting_log_prob)
+                            * valid_decision,
+                            axis=-1,
+                        )
+                    )
+
                     loss_actor = action_loss + halting_loss
 
                     # Optional latent trust-region penalty (see module
@@ -1163,6 +1300,9 @@ def get_learner_fn(
                         "num_close_steps": traj_batch.num_close_steps,
                         "action_clip_fraction": action_clip_fraction,
                         "halting_clip_fraction": halting_clip_fraction,
+                        "action_reverse_kl": action_reverse_kl,
+                        "halting_reverse_kl": halting_reverse_kl,
+                        "approx_kl": approx_kl,
                         "latent_kl_penalty": latent_kl_penalty,
                     }
                     # MoE routing/combine statistics, masked to steps actually
@@ -1269,6 +1409,12 @@ def get_learner_fn(
                     actor_grads, opt_states.actor_opt_state, params.actor_params
                 )
                 actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+                actor_stopped, (actor_new_params, actor_new_opt_state) = _kl_early_stop(
+                    actor_stopped,
+                    actor_loss_info,
+                    (params.actor_params, opt_states.actor_opt_state),
+                    (actor_new_params, actor_new_opt_state),
+                )
 
                 critic_updates, critic_new_opt_state = critic_update_fn(
                     critic_grads, opt_states.critic_opt_state, params.critic_params
@@ -1285,11 +1431,12 @@ def get_learner_fn(
                     **actor_loss_info,
                     **critic_loss_info,
                 }
-                return (new_params, new_opt_state), loss_info
+                return (new_params, new_opt_state, actor_stopped), loss_info
 
             (
                 params,
                 opt_states,
+                actor_stopped,
                 traj_batch,
                 advantages,
                 targets,
@@ -1309,8 +1456,8 @@ def get_learner_fn(
                 shuffled_batch,
             )
 
-            (params, opt_states), loss_info = jax.lax.scan(
-                _update_minibatch, (params, opt_states), minibatches
+            (params, opt_states, actor_stopped), loss_info = jax.lax.scan(
+                _update_minibatch, (params, opt_states, actor_stopped), minibatches
             )
 
             if config.system.recompute_advantages:
@@ -1383,6 +1530,7 @@ def get_learner_fn(
             update_state = (
                 params,
                 opt_states,
+                actor_stopped,
                 traj_batch,
                 advantages,
                 targets,
@@ -1413,17 +1561,20 @@ def get_learner_fn(
             # Phase 2: `epochs` epochs of actor-only updates against that
             # fixed advantage - the critic no longer moves, so there is
             # nothing to recompute epoch-to-epoch here.
-            actor_update_state = (params, opt_states, traj_batch, advantages, key)
+            actor_update_state = (
+                params, opt_states, jnp.array(False), traj_batch, advantages, key
+            )
             actor_update_state, actor_loss_info = jax.lax.scan(
                 _update_epoch_actor_only, actor_update_state, None, config.system.epochs
             )
-            params, opt_states, traj_batch, advantages, key = actor_update_state
+            params, opt_states, _, traj_batch, advantages, key = actor_update_state
 
             loss_info = {**critic_loss_info, **actor_loss_info}
         else:
             update_state = (
                 params,
                 opt_states,
+                jnp.array(False),
                 traj_batch,
                 advantages,
                 targets,
@@ -1434,7 +1585,7 @@ def get_learner_fn(
                 _update_epoch, update_state, None, config.system.epochs
             )
 
-            params, opt_states, traj_batch, advantages, targets, key = update_state
+            params, opt_states, _, traj_batch, advantages, targets, key = update_state
 
         learner_state = RamdpOnPolicyLearnerState(
             params,
