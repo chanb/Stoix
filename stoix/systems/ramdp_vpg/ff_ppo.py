@@ -354,10 +354,11 @@ def get_learner_fn(
     use_forced_compute = forced_compute_prob > 0.0
     if use_forced_compute:
         torso_target = str(config.network.actor_network.pre_torso.get("_target_", ""))
-        if not torso_target.endswith("TransformerChainOfThoughtTorso"):
+        if not torso_target.endswith(("TransformerChainOfThoughtTorso", "LoopedTransformerTorso")):
             raise ValueError(
                 "config.system.forced_compute_prob > 0 is only supported for "
-                "TransformerChainOfThoughtTorso actors (its forced_min_steps), got "
+                "TransformerChainOfThoughtTorso / LoopedTransformerTorso actors (their "
+                "forced_min_steps), got "
                 f"{torso_target!r}."
             )
         if max_steps < 2:

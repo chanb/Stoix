@@ -850,3 +850,11 @@ python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps
 
 wait
 ```
+
+```
+project_name=moe_sweep_2
+
+python ramdp_experiments/jumanji_sweep.py --systems ff_ppo_reinforce --max-steps 5 --seeds 1 --runs-per-gpu 1 --gpus 0 --architectures cnn+transformer --hidden-dim 128 --qkv-dim 128 --mlp-dim 32 --num-layers 4 --num-heads 8 --total-timesteps 1e8 --envs sokoban --sokoban-generator unfiltered-train --sokoban-eval-generator unfiltered-valid --rollout-length 64 --total-num-envs 1024 --epochs 4 --num-minibatches 64 --ent-coef 0.01 --gamma 0.999 --actor-weight-decay 0.0 --clip-value-loss false --lr 3e-4 --standardize-advantages true --use-input-layer-norm true --use-rmsnorm true --gae-lambda 0.95 --wandb true --wandb-project sokoban-${project_name} --output-dir /home/bryanpu1/scratch/logs/ramdp/sokoban-icot-${project_name} --yes --no-skip-existing --use-expectile-value-loss false --max-grad-norm 1.0 --num-experts 8 --moe-type switch --moe-load-balancing-coef 0.01 --switch-capacity-factor 0 --switch-init-scale 0 --action-input-norm false --input-injection concat --use-sandwich-norm true --halting-ent-coef 0.0 --halting-temperature 1.0 --clip-halting-head true  --stop-gradient-halting-input false --halting-lr 1e-5 --halting-weight-decay 0 --halting-input-norm false --share-actor-critic-torso true
+
+wait
+```
