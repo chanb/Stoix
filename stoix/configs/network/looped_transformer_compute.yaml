@@ -1,0 +1,47 @@
+# ---Looped Transformer Compute-Time-Aware Networks---
+# A looped (weight-tied, recurrent-in-depth) transformer over per-cell grid
+# tokens (one token per cell from its channels + geometry, plus a READOUT
+# token), refining every token at each step, with a learned halting predictor
+# on the READOUT token (see
+# stoix.networks.torso_compute_looped_transformer.LoopedTransformerTorso). The
+# torso tokenizes the raw (H, W, C) grid itself, so the actor has no
+# input_layer - use a grid scenario (e.g. env=jumanji/sokoban_grid). The
+# separate critic (unused with system.share_actor_critic_torso=True) is the
+# same CNN critic as cnn_transformer_compute.yaml.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute_looped_transformer.LoopedTransformerTorso
+    hidden_dim: 128
+    num_heads: 4
+    num_layers: 2
+    mlp_dim: 256
+    max_steps: 8
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    activation: gelu
+    use_input_layer_norm: False
+    halting_temperature: 1.0 # <1.0 sharpens the halting probability towards 0/1, >1.0 softens it towards 0.5.
+    input_injection: add # none | add | concat - re-inject the input tokens at every step.
+    use_grid_conv: False # Residual depthwise 3x3 conv over the cell tokens at every step.
+    use_step_embedding: False # Learned per-step embedding (ties params to max_steps).
+    remat: True # Rematerialize each step in the backward pass (memory ~ one step).
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  input_layer:
+    _target_: stoix.networks.torso.CNNTorso
+    channel_sizes: [32, 64]
+    kernel_sizes: [3, 3]
+    strides: [1, 1]
+    use_layer_norm: False
+    activation: relu
+    channel_first: False
+    hidden_sizes: [128]
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
