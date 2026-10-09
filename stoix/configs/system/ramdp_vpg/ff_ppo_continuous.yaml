@@ -1,0 +1,64 @@
+# --- Defaults Compute-Time-Aware FF-PPO, continuous actions (RAMDP-PPO, continuous) ---
+
+system_name: ramdp_ff_ppo_continuous # Name of the system.
+
+# --- RL hyperparameters ---
+# No qac_variant knob here (unlike ff_ppo.yaml): this system only supports
+# the "reinforce" advantage (G-V, REINFORCE-with-baseline, a plain V-only
+# critic) - the four Q-V variants ff_ppo.py offers are inherently discrete
+# (their critic outputs one Q-value per discrete action) and have no
+# continuous-action equivalent without a different, action-conditioned
+# critic architecture - see ff_ppo_continuous.py's module docstring.
+actor_lr: 3e-4 # Learning rate for actor network
+critic_lr: 3e-4 # Learning rate for critic network
+actor_weight_decay: 0.0 # AdamW weight decay coefficient for the actor. 0.0 recovers plain Adam.
+critic_weight_decay: 0.0 # AdamW weight decay coefficient for the critic. 0.0 recovers plain Adam.
+rollout_length: 32 # Number of environment steps per vectorised environment.
+epochs: 4 # Number of PPO epochs per training data batch.
+num_minibatches: 16 # Number of minibatches per PPO epoch.
+gamma: 0.99 # Discounting factor. Compute time is folded into this: a transition that
+  # took `compute_time` pondering steps discounts through `gamma ** compute_time`
+  # rather than a flat `gamma` (Semi-MDP/RAMDP formulation), so the same `gamma`
+  # controls both the usual reward horizon and the cost of pondering longer.
+gae_lambda: 1.0 # GAE(lambda) mixing parameter for the critic's regression target
+  # (`targets`/`g_targets`), which also feeds the advantage (`targets - V(s)`).
+  # 1.0 (the default) recovers the original to-the-end Monte-Carlo return
+  # exactly; <1.0 blends in earlier bootstrapped value estimates for a
+  # lower-variance, more-biased target - standard GAE(lambda).
+clip_eps: 0.2 # Clipping value for the PPO actor ratio, and for the critic's value loss
+  # when clip_value_loss=True.
+clip_value_loss: True # Whether the critic's value loss uses PPO-style clipping against the
+  # old value estimate recorded at rollout time (stoix.utils.loss.clipped_value_loss), or
+  # plain L2 regression to the target instead (rlax.l2_loss). Only affects the critic -
+  # the actor's ratio is always clipped regardless of this setting.
+ent_coef: 0.01 # Entropy regularisation term for the environment action's distribution
+  # (Monte-Carlo-estimated via a sample, since a Tanh-squashed Normal has no closed-form
+  # entropy - see ff_ppo_continuous.py's module docstring).
+halting_ent_coef: 0.0 # Entropy regularisation term for the halting decision's own
+  # distribution (per-step Bernoulli halting probability), separate from ent_coef above
+  # since that only ever reaches the environment action's distribution - without this,
+  # nothing keeps the halting policy from collapsing to a degenerate, non-adaptive
+  # compute-time before discovering genuine per-example structure. 0.0 (default) disables
+  # it exactly. See ff_ppo.py's module docstring.
+latent_kl_coef: 0.0 # Coefficient on an optional trust-region penalty for how far the
+  # actor torso's per-step "thought" states (states_history) may drift across a PPO
+  # update, on top of the existing halting-log-prob ratio clip (which only bounds the
+  # halting *decision*, not the continuous states themselves). Interpretable as
+  # 1 / (2 * sigma^2) of an isotropic Gaussian centered at each step's state: the
+  # penalty is exactly KL(N(new, sigma^2 I) || N(old, sigma^2 I)) between rollout-time
+  # and current-epoch states. 0.0 (default) disables it exactly. See ff_ppo.py's module
+  # docstring.
+vf_coef: 0.5 # Critic weight.
+recompute_advantages: False # Whether the advantage (`targets - V(s)`) and the critic's own
+  # regression target are recomputed at the end of every PPO epoch from that epoch's
+  # just-updated critic params, rather than staying pinned at their rollout-time values for
+  # the whole update (vanilla-PPO style, the default here). False also skips the extra
+  # critic forward passes that only feed this refresh, saving compute.
+standardize_advantages: False # Whether to standardize the advantages.
+critic_before_actor: False # Whether to replace the joint per-minibatch actor+critic
+  # update with two fully sequential phases: `epochs` epochs of critic-only minibatch
+  # updates, followed by `epochs` epochs of actor-only minibatch updates - instead of
+  # updating both networks together in every minibatch. See ff_ppo.py's module
+  # docstring. Roughly doubles the per-rollout update compute when enabled.
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: False # Whether learning rates should be linearly decayed during training.

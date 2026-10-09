@@ -1,0 +1,35 @@
+# ---IRU Unshared Compute-Time-Aware Continuous PPO Networks---
+# Like iru_unshared_compute.yaml (used by ff_ppo.py's/ff_reinforce.py's
+# "reinforce" qac_variant), except the actor's action_head is a continuous
+# (Tanh-squashed Normal) distribution instead of a Categorical one - for
+# stoix.systems.ramdp_vpg.ff_ppo_continuous, which only supports "reinforce".
+# Same IRU-based Adaptive Computation Time mechanism as
+# iru_compute_continuous.yaml (sampled "halt now?" decision at each step,
+# reported as `compute_time`), but each pondering step is its own
+# independently-parameterized IRU layer - no weight sharing across steps,
+# unlike IRUAdaptiveComputationTimeTorso's single shared step reused at
+# every iteration (see
+# stoix.networks.torso_compute.UnsharedIRUAdaptiveComputationTimeTorso). So
+# increasing max_steps here adds a whole new IRU layer's worth of
+# parameters, whereas for iru_compute_continuous.yaml it's free.
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso_compute.UnsharedIRUAdaptiveComputationTimeTorso
+    hidden_dim: 256
+    max_steps: 10
+    min_steps: 1 # Forbids halting before this many steps; set equal to max_steps for a
+      # fixed-budget, non-adaptive baseline.
+    use_input_layer_norm: False
+  action_head:
+    _target_: stoix.networks.heads.NormalAffineTanhDistributionHead
+    # action_dim/minimum/maximum are filled in at runtime from the env's
+    # action space - see ff_ppo_continuous.py's learner_setup.
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
