@@ -239,6 +239,9 @@ ARCH_TO_NETWORK = {
         "cnn+transformer": "cnn_transformer_compute",
         "cnn+gru": "cnn_gru_compute",
         "cnn+iru": "cnn_iru_compute",
+        # Looped transformer over per-cell grid tokens (no QAC variant) - see
+        # LOOPED_ARCH below.
+        "looped_transformer": "looped_transformer_compute",
     },
     "ff_qac_fac": {
         "mlp": "mlp_compute_qac",
@@ -266,8 +269,27 @@ ARCH_TO_NETWORK["ff_ppo_naive"] = ARCH_TO_NETWORK["ff_qac_naive"]
 ARCH_TO_NETWORK["ff_ppo_cond_naive"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_cond_fac"] = ARCH_TO_NETWORK["ff_ppo_fac"]
 ARCH_TO_NETWORK["ff_ppo_reinforce"] = ARCH_TO_NETWORK["ff_reinforce"]
-NO_LAYER_NORM_ARCHES = ("transformer", "cnn+transformer", "gru", "cnn+gru", "iru", "cnn+iru")
-TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
+# Looped (weight-tied) transformer over per-cell grid tokens with a learned
+# halting head (stoix.networks.torso_compute_looped_transformer.
+# LoopedTransformerTorso). It tokenizes the raw grid itself, so it runs on the
+# grid scenario (like CNN_ARCHES) but its actor has no CNN input_layer - only
+# its separate critic does (see GRID_INPUT_ARCHES / Job.command()). Only
+# defined for the non-QAC systems (ff_reinforce / ff_ppo_reinforce, see
+# ARCH_TO_NETWORK); requested for any other system it's skipped. Shares
+# every TransformerChainOfThoughtTorso hyperparameter, so it's one of
+# TRANSFORMER_ARCHES (soft MoE is not supported - use --moe-type switch).
+LOOPED_ARCH = "looped_transformer"
+GRID_INPUT_ARCHES = (LOOPED_ARCH,)
+NO_LAYER_NORM_ARCHES = (
+    "transformer",
+    "cnn+transformer",
+    "gru",
+    "cnn+gru",
+    "iru",
+    "cnn+iru",
+    LOOPED_ARCH,
+)
+TRANSFORMER_ARCHES = ("transformer", "cnn+transformer", LOOPED_ARCH)
 # Architectures whose pre_torso is IRUStep-based (IRUAdaptiveComputationTimeTorso,
 # see stoix/networks/torso_compute.py).
 IRU_ARCHES = ("iru", "cnn+iru")
@@ -357,7 +379,9 @@ EXPLICIT_COT_NETWORK_BY_SYSTEM = {
 }
 EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 CNN_ARCHES = ("cnn+mlp", "cnn+transformer", "cnn+gru", "cnn+iru", CNN_EXPLICIT_COT_ARCH)
-VALID_ARCHITECTURES = ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES
+VALID_ARCHITECTURES = (
+    ("mlp", "transformer", "gru", "iru", EXPLICIT_COT_ARCH) + CNN_ARCHES + GRID_INPUT_ARCHES
+)
 # Short forms for group_tag/run_name (wandb group names get long fast):
 # "transformer" -> implicit-CoT transformer ("TF-iCoT"), "transformer_explicit_cot"
 # -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru are already short.
@@ -366,6 +390,7 @@ ARCH_SHORT_TAG = {
     "cnn+transformer": "cnn+TF-iCoT",
     EXPLICIT_COT_ARCH: "TF-eCoT",
     CNN_EXPLICIT_COT_ARCH: "cnn+TF-eCoT",
+    LOOPED_ARCH: "LoopTF",
 }
 
 # W&B's "group" field (and, in practice, run IDs) are capped at 128
@@ -977,8 +1002,11 @@ class Job:
             base_network = ARCH_TO_NETWORK[self.system][self.arch]
         network = _qv_network_name(base_network, self.system, self.qv_critic)
         is_cnn = self.arch in CNN_ARCHES
+        # Grid-input arches (LOOPED_ARCH) also need the grid scenario, but
+        # only their critic has a CNN input_layer.
+        uses_grid = is_cnn or self.arch in GRID_INPUT_ARCHES
         flat_scenario, grid_scenario = ENV_SCENARIOS[self.env]
-        if is_cnn:
+        if uses_grid:
             assert grid_scenario is not None, f"{self.env} has no CNN/grid scenario"
             scenario = grid_scenario
         else:
@@ -1234,7 +1262,7 @@ class Job:
         if self.system in SYSTEM_TO_QAC_VARIANT:
             cmd.append(f"system.qac_variant={SYSTEM_TO_QAC_VARIANT[self.system]}")
 
-        if is_cnn:
+        if uses_grid:
             cnn_arch = ENV_CNN_ARCH[self.env]
             critic_channel_sizes = channel_sizes = ",".join(str(c) for c in cnn_arch["channel_sizes"])
             critic_kernel_sizes = kernel_sizes = ",".join(str(k) for k in cnn_arch["kernel_sizes"])
@@ -1248,10 +1276,11 @@ class Job:
             hidden_sizes = ",".join(str(h) for h in cnn_arch["hidden_sizes"])
             critic_hidden_sizes = ",".join(str(h) for h in cnn_arch["critic_hidden_sizes"])
             critic_layer_sizes = ",".join(str(h) for h in cnn_arch["critic_layer_sizes"])
-            cmd.append(f"network.actor_network.input_layer.channel_sizes=[{channel_sizes}]")
-            cmd.append(f"network.actor_network.input_layer.kernel_sizes=[{kernel_sizes}]")
-            cmd.append(f"network.actor_network.input_layer.strides=[{strides}]")
-            cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{hidden_sizes}]")
+            if is_cnn:
+                cmd.append(f"network.actor_network.input_layer.channel_sizes=[{channel_sizes}]")
+                cmd.append(f"network.actor_network.input_layer.kernel_sizes=[{kernel_sizes}]")
+                cmd.append(f"network.actor_network.input_layer.strides=[{strides}]")
+                cmd.append(f"network.actor_network.input_layer.hidden_sizes=[{hidden_sizes}]")
             if self.system in QAC_SYSTEMS and self.qv_critic == "separate":
                 # Separate-torso Q-V critic (value_input_layer/q_input_layer +
                 # value_pre_torso/q_pre_torso), not a single input_layer/pre_torso.
@@ -1356,6 +1385,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
     #    to a single value.
     system_arch_ln_combos = []
     n_skipped_incompatible = 0
+    n_skipped_looped = 0
     for system in args.systems:
         if system in EXPLICIT_COT_PPO_SYSTEMS:
             requested_explicit_cot_archs = [a for a in args.architectures if a in EXPLICIT_COT_ARCHES]
@@ -1447,6 +1477,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 if is_transformer_arch
                 else [dense_moe_option]
             )
+            if arch in GRID_INPUT_ARCHES and arch not in ARCH_TO_NETWORK.get(system, {}):
+                n_skipped_looped += 1
+                continue
             if arch in EXPLICIT_COT_ARCHES:
                 if system not in EXPLICIT_COT_SYSTEMS:
                     n_skipped_incompatible += 1
@@ -1518,6 +1551,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         print(
             f"Skipping {n_skipped_incompatible} (system, architecture) combo(s) requesting "
             f"one of {EXPLICIT_COT_ARCHES}, which is only implemented for {EXPLICIT_COT_SYSTEMS}."
+        )
+    if n_skipped_looped:
+        print(
+            f"Skipping {n_skipped_looped} (system, architecture) combo(s) requesting "
+            f"{GRID_INPUT_ARCHES}, which only has a non-QAC network (ff_reinforce/ff_ppo_reinforce)."
         )
 
     # (min_steps, max_steps) combos: independently swept (see --min-steps/
@@ -1622,7 +1660,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             args.qv_critic,
             range(args.base_seed, args.base_seed + args.seeds),
         ):
-            if arch in CNN_ARCHES and not ENV_SUPPORTS_CNN[env]:
+            if (arch in CNN_ARCHES or arch in GRID_INPUT_ARCHES) and not ENV_SUPPORTS_CNN[env]:
                 n_skipped_cnn += 1
                 continue
             if system in PPO_SYSTEMS:

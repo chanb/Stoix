@@ -14,6 +14,7 @@ those pickles don't carry, so they read the notebooks' rollout caches
 the pickles were exported from.
 """
 
+import argparse
 import pickle
 from pathlib import Path
 
@@ -189,9 +190,37 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
     return handles
 
 
+def plot_hardness_only(lightsout, slidingpuzzle):
+    """1x2 figure: just the two hardness-vs-compute-time panels (no action
+    panels), each panel half the 4-up figure's width so panel sizes match."""
+    figsize = set_size(doc_width_pt, fraction=0.95 / 2, subplots=(1, 2), use_golden_ratio=False)
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
+    for ax, data, title in [(axes[0], lightsout, "Lightsout"), (axes[1], slidingpuzzle, "Sliding puzzle")]:
+        plot_violin_panel(ax, data["hardness"], data["first_step_compute_time"], xlabel=None)
+        ax.set_title(title)
+        ax.xaxis.set_major_locator(plt.MultipleLocator(5))
+    axes[0].set_ylabel("Compute steps")
+    fig.supxlabel("Shortest path length", fontsize=plt.rcParams["axes.labelsize"])
+    fig.tight_layout(pad=0.2, w_pad=1.0)
+    out_path = HERE / "analysis-compute_time-hardness-combined.pdf"
+    fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
+    print(f"Saved {out_path}")
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--no-actions",
+        action="store_true",
+        help="Only the two hardness panels (saved to analysis-compute_time-hardness-combined.pdf).",
+    )
+    args = parser.parse_args()
+
     lightsout = load_plot_data("lightsout")
     slidingpuzzle = load_plot_data("slidingpuzzle")
+    if args.no_actions:
+        plot_hardness_only(lightsout, slidingpuzzle)
+        return
 
     env_map = {
         "lightsout-5x4": "Lightsout",
