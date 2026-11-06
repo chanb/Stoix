@@ -349,6 +349,15 @@ NO_LAYER_NORM_ARCHES = ("transformer", "cnn+transformer", "gru", "cnn+gru", "iru
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze")
+# MinAtar games (env=gymnax/<game>, see stoix/configs/env/gymnax/*.yaml) -
+# handled here rather than in the removed minatar_fixed_budget_sweep.py so
+# they share every current system/network/PPO knob. Not part of the --envs
+# default (opt in via --envs). No difficulty knobs. The observation is already
+# a (10, 10, C) grid, so it's used as-is by CNN architectures and flattened
+# otherwise. Pass --gamma 0.9999 for MinAtar's long episodes
+# (minatar_fixed_budget_sweep.py's old default).
+MINATAR_GAMES = ("asterix", "breakout", "freeway", "seaquest", "space_invaders")
+ALL_ENVS = JUMANJI_ENVS + MINATAR_GAMES
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py)
 # doesn't fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup:
@@ -463,6 +472,8 @@ ENV_SCENARIOS = {
     "knapsack": ("jumanji/knapsack", None),
     "maze": ("jumanji/maze", "jumanji/maze_grid"),
 }
+# MinAtar: same gymnax scenario either way (CNN-ready grid; flattened for non-CNN arches).
+ENV_SCENARIOS.update((game, (f"gymnax/{game}", f"gymnax/{game}")) for game in MINATAR_GAMES)
 ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.items()}
 # knapsack/maze already set env.wrapper in their yaml (ConcatObservationWrapper,
 # since their observation is several equally-necessary fields with no single
@@ -471,6 +482,7 @@ ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.it
 # must NOT also append the +env.wrapper._target_=stoa.FlattenObservationWrapper
 # override lightsout/minatar-style jobs use, which would conflict.
 ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "knapsack": True, "maze": True}
+ENV_HAS_BUILTIN_WRAPPER.update((game, False) for game in MINATAR_GAMES)
 
 # Per-env CNN architecture - env-specific rather than one shared CNN, since
 # the three CNN-capable envs (see ENV_SUPPORTS_CNN) differ substantially in
@@ -543,6 +555,23 @@ ENV_CNN_ARCH = {
         "critic_layer_sizes": (128, 128),
     },
 }
+
+# MinAtar: the CNN network yamls' own defaults (e.g. cnn_transformer_compute.yaml),
+# which is what the removed minatar_*sweep.py scripts trained with.
+ENV_CNN_ARCH.update(
+    (
+        game,
+        {
+            "channel_sizes": (32, 64),
+            "kernel_sizes": (3, 3),
+            "strides": (1, 1),
+            "hidden_sizes": (128,),
+            "critic_hidden_sizes": (128,),
+            "critic_layer_sizes": (256, 256),
+        },
+    )
+    for game in MINATAR_GAMES
+)
 
 SOKOBAN_GENERATOR_CHOICES = (
     "default",
@@ -668,6 +697,10 @@ ENV_DIFFICULTY_AXES = {
     "knapsack": _knapsack_difficulty_axis,
     "maze": _maze_difficulty_axis,
 }
+# MinAtar has no difficulty knobs - a single fixed setting per game.
+ENV_DIFFICULTY_AXES.update(
+    (game, lambda args: [EnvDifficulty(tag="minatar")]) for game in MINATAR_GAMES
+)
 
 
 @dataclass
@@ -1376,7 +1409,10 @@ def main() -> None:
     parser.add_argument(
         "--envs",
         default=",".join(JUMANJI_ENVS),
-        help=f"Comma-separated subset of {{{','.join(JUMANJI_ENVS)}}} (env=jumanji/<env>).",
+        help=(
+            f"Comma-separated subset of {{{','.join(ALL_ENVS)}}} (env=jumanji/<env>, or "
+            "env=gymnax/<game> for the MinAtar games). Defaults to the jumanji envs only."
+        ),
     )
     parser.add_argument(
         "--systems",
@@ -1716,7 +1752,7 @@ def main() -> None:
     args.maze_size = [int(x) for x in args.maze_size.split(",")]
 
     for e in args.envs:
-        assert e in JUMANJI_ENVS, f"unknown env {e!r}, expected one of {list(JUMANJI_ENVS)}"
+        assert e in ALL_ENVS, f"unknown env {e!r}, expected one of {list(ALL_ENVS)}"
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
     for a in args.architectures:
