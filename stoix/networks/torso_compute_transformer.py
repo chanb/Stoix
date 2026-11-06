@@ -69,6 +69,16 @@ def _norm_cls(use_rmsnorm: bool):
     return nn.RMSNorm if use_rmsnorm else nn.LayerNorm
 
 
+def simplicial_embedding(x: chex.Array, group_size: int, temperature: float) -> chex.Array:
+    """Simplicial embedding (Lavoie et al., 2022). Splits the last axis into
+    groups of `group_size` and applies a softmax to each group. Each group
+    then is a point on a simplex. `group_size <= 0` disables it."""
+    if group_size <= 0:
+        return x
+    groups = x.reshape(x.shape[:-1] + (-1, group_size))
+    return jax.nn.softmax(groups / temperature, axis=-1).reshape(x.shape)
+
+
 class TransformerBlock(nn.Module):
     """A single transformer block: self-attention + MLP, pre-norm by default.
 
@@ -267,11 +277,21 @@ class _CoTStep(nn.Module):
     halting_hidden_dims: Tuple[int, ...] = ()
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    num_state_tokens: int = 1
+    sem_group_size: int = 0
+    sem_temperature: float = 1.0
 
     @nn.compact
     def __call__(
-        self, carry: Tuple[chex.Array, ...], step_idx: chex.Array
+        self, carry: Tuple[chex.Array, ...], xs: Tuple[chex.Array, chex.Array]
     ) -> Tuple[Tuple[chex.Array, ...], None]:
+        # `pos` is the scratchpad position. The first `num_state_tokens - 1`
+        # positions only prefill the KV-cache with state tokens (no halting).
+        # The CoT step `step_idx` starts at the last state token.
+        pos, state_token = xs
+        num_prefill = self.num_state_tokens - 1
+        num_positions = self.max_steps + num_prefill
+        step_idx = pos - num_prefill
         (
             current_token,
             cached_keys,
@@ -289,11 +309,16 @@ class _CoTStep(nn.Module):
             per_step_halting_log_prob,
             per_step_halting_entropy,
         ) = carry
+        # Prefill positions are never "running": they cannot halt, count as
+        # compute, or add halting log prob.
+        all_running = still_running
+        still_running = still_running & (step_idx >= 0)
+        hist_idx = jnp.maximum(step_idx, 0)  # prefill writes are overwritten at step 0
 
         pos_embedding = self.param(
             "pos_embedding",
             normal(stddev=0.02),
-            (self.max_steps + 1, self.hidden_dim),
+            (num_positions + 1, self.hidden_dim),
         )
         blocks = [
             TransformerBlock(
@@ -311,22 +336,25 @@ class _CoTStep(nn.Module):
             self.halting_hidden_dims, self.activation, self.kernel_init
         )
 
-        x = current_token + pos_embedding[step_idx]
+        token = jnp.where(pos < self.num_state_tokens, state_token, current_token)
+        x = token + pos_embedding[pos]
         new_cached_keys = []
         new_cached_values = []
         for layer_idx, block in enumerate(blocks):
             x, k, v = block.step(
-                x, cached_keys[layer_idx], cached_values[layer_idx], step_idx, self.max_steps
+                x, cached_keys[layer_idx], cached_values[layer_idx], pos, num_positions
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-        state = x
+        # The latent goes through SEM before it is fed back or read by the
+        # halting/action heads.
+        state = simplicial_embedding(x, self.sem_group_size, self.sem_temperature)
         cached_keys = new_cached_keys
         cached_values = new_cached_values
         if self.replaying:
             # Only ever populated when replaying - see
             # `TransformerChainOfThoughtTorso`'s docstring for `states_history`.
-            states_history = states_history.at[..., step_idx, :].set(state)
+            states_history = states_history.at[..., hist_idx, :].set(state)
 
         halting_input = state
         if self.stop_gradient_halting_input:
@@ -389,7 +417,7 @@ class _CoTStep(nn.Module):
         step_contribution = jnp.where(still_running & (~is_forced_step), step_log_prob, 0.0)
         halting_log_prob = halting_log_prob + step_contribution
         if self.replaying:
-            per_step_halting_log_prob = per_step_halting_log_prob.at[..., step_idx].set(
+            per_step_halting_log_prob = per_step_halting_log_prob.at[..., hist_idx].set(
                 step_contribution
             )
             # Bernoulli entropy of this step's halting decision - masked
@@ -405,13 +433,13 @@ class _CoTStep(nn.Module):
                 halting_prob * jnp.log(halting_prob)
                 + (1.0 - halting_prob) * jnp.log(1.0 - halting_prob)
             )
-            per_step_halting_entropy = per_step_halting_entropy.at[..., step_idx].set(
+            per_step_halting_entropy = per_step_halting_entropy.at[..., hist_idx].set(
                 jnp.where(still_running & (~is_forced_step), halting_entropy_this_step, 0.0)
             )
         num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
         final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
-        still_running = still_running & (~halts_this_step)
+        still_running = all_running & (~halts_this_step)
         current_token = state
 
         new_carry = (
@@ -518,6 +546,19 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `use_rmsnorm` (default `False`) switches every norm in this torso -
     `use_input_layer_norm`'s norm on the initial token, and every norm inside
     the shared `TransformerBlock`s - from `nn.LayerNorm` to `nn.RMSNorm`.
+
+    `num_state_tokens` (default `1`) is N: one `Dense` maps the observation
+    to N tokens of width `hidden_dim`. Tokens 0..N-2 only prefill the
+    KV-cache. CoT step 0 runs on token N-1. `N = 1` is the original torso.
+
+    `sem_group_size` (default `0`, off) applies `simplicial_embedding` (groups
+    of this size, softmax temperature `sem_temperature`) to each state token
+    before the transformer, and to each latent the transformer makes, before
+    it is fed back or read by the halting/action heads.
+
+    `input_is_tokens` (default `False`) takes an input of shape `(*batch, N,
+    F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
+    `num_state_tokens` is not used.
     """
 
     hidden_dim: int
@@ -535,6 +576,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
     halting_hidden_dims: Tuple[int, ...] = ()
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
+    num_state_tokens: int = 1
+    sem_group_size: int = 0
+    sem_temperature: float = 1.0
+    input_is_tokens: bool = False
 
     @nn.compact
     def __call__(
@@ -585,18 +630,37 @@ class TransformerChainOfThoughtTorso(nn.Module):
             f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
         )
 
-        # The first scratchpad token is the observation projected into the
-        # model width.
-        initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+        # The first N scratchpad tokens are the observation projected into N
+        # tokens of the model width.
+        if self.input_is_tokens:
+            # `observation` is already `(*batch, N, F)` (e.g. CNN kernel
+            # features). One shared Dense maps each token to `hidden_dim`.
+            batch_shape, n = observation.shape[:-2], observation.shape[-2]
+            state_tokens = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+        else:
+            n = self.num_state_tokens
+            state_tokens = nn.Dense(n * self.hidden_dim, kernel_init=self.kernel_init)(observation)
+            state_tokens = state_tokens.reshape(batch_shape + (n, self.hidden_dim))
         if self.use_input_layer_norm:
-            initial_token = _norm_cls(self.use_rmsnorm)()(initial_token)
+            state_tokens = _norm_cls(self.use_rmsnorm)()(state_tokens)
+        state_tokens = simplicial_embedding(
+            state_tokens, self.sem_group_size, self.sem_temperature
+        )
+        initial_token = state_tokens[..., -1, :]
+        num_positions = self.max_steps + n - 1
+        # Per-position scan input: state token p at position p < N, else unused.
+        step_inputs = jnp.concatenate(
+            [state_tokens, jnp.zeros(batch_shape + (self.max_steps - 1, self.hidden_dim))],
+            axis=-2,
+        )
+        step_inputs = jnp.moveaxis(step_inputs, -2, 0)
 
         # Pre-allocate each layer's KV-cache; positions written by
         # `_CoTStep`/`TransformerBlock.step` are set incrementally, and
         # not-yet-written positions are masked out of attention (see
         # `TransformerBlock.step`), never read.
         head_dim = self.hidden_dim // self.num_heads
-        cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
+        cache_shape = batch_shape + (num_positions + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
 
@@ -636,6 +700,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.halting_hidden_dims,
             self.use_sandwich_norm,
             self.use_rmsnorm,
+            n,
+            self.sem_group_size,
+            self.sem_temperature,
         )
 
         initial_carry = (
@@ -671,7 +738,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
-        ), _ = cot_step(initial_carry, jnp.arange(self.max_steps))
+        ), _ = cot_step(initial_carry, (jnp.arange(num_positions), step_inputs))
 
         if replaying:
             return (

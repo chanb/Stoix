@@ -8,6 +8,7 @@ from flax.linen.initializers import Initializer, orthogonal
 from stoix.networks.layers import NoisyLinear
 from stoix.networks.utils import parse_activation_fn
 import jax
+import jax.numpy as jnp
 
 
 class MLPTorso(nn.Module):
@@ -71,6 +72,9 @@ class CNNTorso(nn.Module):
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     channel_first: bool = False
     hidden_sizes: Sequence[int] = (256,)
+    # If True, return one token per last-layer kernel: (..., channels, height * width).
+    # The MLP is not used.
+    channel_tokens: bool = False
 
     @nn.compact
     def __call__(self, observation: chex.Array) -> chex.Array:
@@ -93,6 +97,10 @@ class CNNTorso(nn.Module):
             if self.use_layer_norm:
                 x = nn.LayerNorm(reduction_axes=(-3, -2, -1))(x)
             x = parse_activation_fn(self.activation)(x)
+
+        if self.channel_tokens:
+            x = jnp.moveaxis(x, -1, -3)
+            return x.reshape(*x.shape[:-2], -1)
 
         # Flatten
         x = x.reshape(*observation.shape[:-3], -1)
