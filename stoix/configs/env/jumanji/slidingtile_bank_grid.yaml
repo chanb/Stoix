@@ -1,0 +1,41 @@
+# ---Environment Configs---
+# Same as jumanji/slidingtile_grid.yaml (CNN networks), but boards come from level banks split by
+# optimal solution length (port of LoopedActor's slidingpuzzle-<N>x<N>-train-test)
+# instead of random-walk scrambles - see stoix/envs/slidingpuzzle/generator.py.
+# Banks: $SLIDINGPUZZLE_DATA_DIR/<N>x<N>/<split>.npz (default <repo>/data/slidingpuzzle),
+# built by data_scripts/build_slidingpuzzle_banks.py (3x3: train = optimal length
+# <= 28, test = 29-31; 4x4: train <= 60, test > 60).
+# Training draws an optimal length uniformly, then a board of that length.
+# Evaluation draws a board uniformly from the test bank.
+env_name: jumanji
+observation_attribute: puzzle
+multi_agent: False
+
+scenario:
+  name: SlidingTilePuzzle-v0
+  task_name: slidingtile
+
+kwargs:
+  generator:
+    _target_: stoix.envs.slidingpuzzle.generator.BankGenerator
+    grid_size: 3
+    split: train
+    by_length: True
+  reward_fn:
+    _target_: jumanji.environments.logic.sliding_tile_puzzle.reward.SparseRewardFn
+  time_limit: 40
+
+eval_kwargs:
+  generator:
+    _target_: stoix.envs.slidingpuzzle.generator.BankGenerator
+    grid_size: 3
+    split: test
+    by_length: False
+
+solved_final_reward_threshold: 1.0
+eval_metric: episode_return
+
+wrapper:
+  _target_: stoix.wrappers.grid_observation.GridObservationWrapper
+  dtype: float32
+  add_channel_dim: True

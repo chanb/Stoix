@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 
 cuda-*
+**/*.pdf
+**/*.pkl
+**/*.csv
 
 # C extensions
 *.so
