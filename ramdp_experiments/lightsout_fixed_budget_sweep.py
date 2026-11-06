@@ -505,6 +505,10 @@ class Job:
     output_dir: Path
     wandb: bool
     wandb_project: str
+    # TransformerChainOfThoughtTorso state tokenization / simplicial embedding
+    # (see torso_compute_transformer.py). Defaults reproduce the original torso.
+    num_state_tokens: int = 1
+    sem_group_size: int = 0
 
     @property
     def env(self) -> str:
@@ -595,6 +599,10 @@ class Job:
             extra.append("sn")
         if self.use_rmsnorm:
             extra.append("rms")
+        if self.num_state_tokens != 1:
+            extra.append(f"nst{self.num_state_tokens}")
+        if self.sem_group_size > 0:
+            extra.append(f"sem{self.sem_group_size}")
         if extra:
             parts.append("-".join(extra))
 
@@ -698,6 +706,12 @@ class Job:
                 f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
+        if self.arch == "transformer":
+            # TransformerChainOfThoughtTorso only - see its docstring.
+            cmd.append(
+                f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
+            )
+            cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
         if self.arch == EXPLICIT_COT_ARCH:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
@@ -1066,6 +1080,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 output_dir=args.output_dir,
                 wandb=args.wandb,
                 wandb_project=args.wandb_project,
+                num_state_tokens=args.num_state_tokens,
+                sem_group_size=args.sem_group_size,
             )
         )
 
@@ -1458,6 +1474,20 @@ def main() -> None:
         "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. Only applies "
         "to architecture in {transformer, transformer_explicit_cot} (every other architecture "
         "has no TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
+    )
+    parser.add_argument(
+        "--num-state-tokens",
+        type=int,
+        default=1,
+        help="TransformerChainOfThoughtTorso num_state_tokens (transformer arch only): "
+        "the observation is projected to this many tokens. Default 1 (original torso).",
+    )
+    parser.add_argument(
+        "--sem-group-size",
+        type=int,
+        default=0,
+        help="TransformerChainOfThoughtTorso sem_group_size (transformer arch only): "
+        "simplicial embedding group size; 0 disables SEM. Default 0.",
     )
     parser.add_argument(
         "--use-rmsnorm",
