@@ -121,7 +121,11 @@ def simplicial_embedding(x: chex.Array, group_size: int, temperature: float) -> 
 
 
 def _readout_and_feedback(
-    x: chex.Array, latent_rms_norm: bool, group_size: int, temperature: float
+    x: chex.Array,
+    latent_rms_norm: bool,
+    group_size: int,
+    temperature: float,
+    readout_only: bool = False,
 ) -> Tuple[chex.Array, chex.Array]:
     """Returns `(state, fed_back)`: `state` is what the halting/action heads
     read, `fed_back` is what re-enters the residual stream as a scratchpad token.
@@ -131,7 +135,13 @@ def _readout_and_feedback(
     logits instead of the raw residual, and `fed_back = sqrt(V) * state` (V =
     `group_size`) brings the token back to roughly unit scale. With SEM off
     (`group_size <= 0`) both are `rms_norm(x)`.
+
+    `readout_only=True`: SEM is used only on `state`; `fed_back` is
+    `rms_norm(x)` (or `x` without `latent_rms_norm`).
     """
+    if readout_only:
+        x = rms_norm(x) if latent_rms_norm else x
+        return simplicial_embedding(x, group_size, temperature), x
     if not latent_rms_norm:
         state = simplicial_embedding(x, group_size, temperature)
         return state, state
@@ -369,6 +379,7 @@ class _CoTStep(nn.Module):
     num_state_tokens: int = 1
     sem_group_size: int = 0
     sem_temperature: float = 1.0
+    sem_readout_only: bool = False
     latent_rms_norm: bool = False
     input_injection: bool = False
     residual_scaling: bool = False
@@ -479,7 +490,8 @@ class _CoTStep(nn.Module):
         # The latent goes through (RMSNorm then) SEM before it is fed back or
         # read by the halting/action heads.
         state, fed_back = _readout_and_feedback(
-            x, self.latent_rms_norm, self.sem_group_size, self.sem_temperature
+            x, self.latent_rms_norm, self.sem_group_size, self.sem_temperature,
+            self.sem_readout_only,
         )
         cached_keys = new_cached_keys
         cached_values = new_cached_values
@@ -693,7 +705,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `sem_group_size` (default `0`, off) applies `simplicial_embedding` (groups
     of this size, softmax temperature `sem_temperature`) to each state token
     before the transformer, and to each latent the transformer makes, before
-    it is fed back or read by the halting/action heads.
+    it is fed back or read by the halting/action heads. `sem_readout_only`
+    (default `False`) uses SEM only on what the heads read (action, halting,
+    and the value head of a `CoTCriticTorso`); state tokens and fed-back
+    thoughts skip it.
 
     `input_is_tokens` (default `False`) takes an input of shape `(*batch, N,
     F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
@@ -746,6 +761,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     num_state_tokens: int = 1
     sem_group_size: int = 0
     sem_temperature: float = 1.0
+    sem_readout_only: bool = False
     input_is_tokens: bool = False
     latent_rms_norm: bool = False
     input_injection: bool = False
@@ -819,7 +835,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
             state_tokens = _norm_cls(self.use_rmsnorm)()(state_tokens)
         # State tokens enter the residual stream exactly like fed-back thoughts.
         _, state_tokens = _readout_and_feedback(
-            state_tokens, self.latent_rms_norm, self.sem_group_size, self.sem_temperature
+            state_tokens, self.latent_rms_norm, self.sem_group_size, self.sem_temperature,
+            self.sem_readout_only,
         )
         initial_token = state_tokens[..., -1, :]
         num_positions = self.max_steps + n - 1
@@ -880,6 +897,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             n,
             self.sem_group_size,
             self.sem_temperature,
+            sem_readout_only=self.sem_readout_only,
             latent_rms_norm=self.latent_rms_norm,
             input_injection=self.input_injection,
             residual_scaling=self.residual_scaling,

@@ -158,3 +158,22 @@ def test_cot_critic_torso_returns_embedding():
     emb = critic.apply(params, obs)
     np.testing.assert_allclose(emb, torso.apply({"params": params["params"]["torso"]}, obs, deterministic=True)[0])
     assert emb.shape == (7, H)
+
+
+def test_sem_readout_only_skips_sem_on_fed_back_and_state_tokens():
+    from stoix.networks.torso_compute_transformer import _readout_and_feedback, rms_norm
+
+    x = 3.0 * jax.random.normal(jax.random.PRNGKey(0), (7, H))
+    state, fed_back = _readout_and_feedback(x, True, G, 1.0, readout_only=True)
+    np.testing.assert_allclose(state.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
+    np.testing.assert_allclose(fed_back, rms_norm(x), atol=1e-6)
+    _, raw = _readout_and_feedback(x, False, G, 1.0, readout_only=True)
+    np.testing.assert_allclose(raw, x)
+
+    torso, obs, params = _stable_setup(sem_readout_only=True)
+    emb, compute_time, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2))
+    replay_emb = torso.apply(params, obs, target_compute_time=compute_time)[0]
+    np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
+    np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
+    full_sem = torso.clone(sem_readout_only=False).apply(params, obs, target_compute_time=compute_time)[0]
+    assert not np.allclose(emb, full_sem)
