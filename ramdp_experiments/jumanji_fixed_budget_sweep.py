@@ -534,6 +534,7 @@ class Job:
     latent_rms_norm: bool = False
     input_injection: bool = False
     residual_scaling: bool = False
+    block_init: str = "orthogonal"
     cnn_tokens: bool = False
     vf_coef: float = 0.5
 
@@ -616,6 +617,8 @@ class Job:
             extra.append("inj")
         if self.residual_scaling:
             extra.append("rs")
+        if self.block_init != "orthogonal":
+            extra.append(f"bi{self.block_init}")
         if extra:
             parts.append("-".join(extra))
 
@@ -728,6 +731,7 @@ class Job:
             cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
             cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
             cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
+            cmd.append(f"++network.actor_network.pre_torso.block_init={self.block_init}")
             if self.arch == "cnn+transformer" and self.cnn_tokens:
                 # One state token per last-layer CNN kernel (CNNTorso.channel_tokens).
                 cmd.append("++network.actor_network.input_layer.channel_tokens=True")
@@ -1080,6 +1084,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     latent_rms_norm=args.latent_rms_norm,
                     input_injection=args.input_injection,
                     residual_scaling=args.residual_scaling,
+                    block_init=args.block_init,
                     cnn_tokens=args.cnn_tokens,
                     vf_coef=args.vf_coef,
                 )
@@ -1432,7 +1437,13 @@ def main() -> None:
         "--residual-scaling",
         type=lambda x: x.strip().lower() in ("1", "true", "yes"),
         default=False,
-        help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): FPRMCore coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
+        help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
+    )
+    parser.add_argument(
+        "--block-init",
+        choices=("orthogonal", "trunc_normal"),
+        default="orthogonal",
+        help="TransformerChainOfThoughtTorso block_init (transformer arch only): kernel init of the TransformerBlock projections - orthogonal(sqrt(2)) or truncated_normal(1/sqrt(fan_in)). Default orthogonal.",
     )
     parser.add_argument(
         "--cnn-tokens",

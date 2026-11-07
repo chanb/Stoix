@@ -80,12 +80,34 @@ def _resolve_qkv_dim(hidden_dim: int, qkv_dim: Optional[int]) -> int:
 
 
 def rms_norm(x: chex.Array, eps: float = 1e-5) -> chex.Array:
-    """Parameter-free RMSNorm (LoopedActor's `models/fprm.py:rms_norm`)."""
+    """Parameter-free RMSNorm."""
     return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
 
 
 def _logit(p: float) -> float:
     return float(np.log(p / (1.0 - p)))
+
+
+# `truncated_normal(stddev=1/sqrt(fan_in))`, truncated at +-2 stddev without
+# rescaling, so the realized std is ~0.88 / sqrt(fan_in) (flax
+# `truncated_normal` semantics). `variance_scaling(truncated_normal)` divides
+# its stddev by 0.87962566, so a scale of 0.87962566^2 cancels that. Fan-in for
+# DenseGeneral's `out` is the product of its contracted (heads, head_dim) axes.
+_TRUNC_NORMAL_CORRECTION = 0.87962566103423978
+trunc_normal_kernel_init = nn.initializers.variance_scaling(
+    _TRUNC_NORMAL_CORRECTION**2, "fan_in", "truncated_normal"
+)
+
+
+def _block_kernel_init(block_init: str, default: Initializer) -> Initializer:
+    """Kernel init of every `TransformerBlock` projection in the CoT loop:
+    `"orthogonal"` keeps the torso's `kernel_init` (orthogonal(sqrt(2)) by
+    default), `"trunc_normal"` uses `trunc_normal_kernel_init`."""
+    if block_init == "orthogonal":
+        return default
+    if block_init == "trunc_normal":
+        return trunc_normal_kernel_init
+    raise ValueError(f"block_init must be 'orthogonal' or 'trunc_normal', got {block_init!r}")
 
 
 def simplicial_embedding(x: chex.Array, group_size: int, temperature: float) -> chex.Array:
@@ -104,8 +126,8 @@ def _readout_and_feedback(
     """Returns `(state, fed_back)`: `state` is what the halting/action heads
     read, `fed_back` is what re-enters the residual stream as a scratchpad token.
 
-    `latent_rms_norm=False` (original): both are `SEM(x)`. `True` (LoopedActor's
-    `sem_latent`): `state = SEM(rms_norm(x))`, so the softmax groups see unit-RMS
+    `latent_rms_norm=False` (original): both are `SEM(x)`. `True`: `state =
+    SEM(rms_norm(x))`, so the softmax groups see unit-RMS
     logits instead of the raw residual, and `fed_back = sqrt(V) * state` (V =
     `group_size`) brings the token back to roughly unit scale. With SEM off
     (`group_size <= 0`) both are `rms_norm(x)`.
@@ -211,7 +233,7 @@ class TransformerBlock(nn.Module):
     def _residual(
         h: chex.Array, out: chex.Array, res_scale: Optional[Tuple[chex.Array, chex.Array]]
     ) -> chex.Array:
-        """`h + out`, or LoopedActor's coupled `a1 * h + b1 * out` when
+        """`h + out`, or the coupled `a1 * h + b1 * out` when
         `res_scale = (a1, b1)` (see `_CoTStep`'s `residual_scaling`)."""
         if res_scale is None:
             return h + out
@@ -352,6 +374,7 @@ class _CoTStep(nn.Module):
     residual_scaling: bool = False
     alpha_1_init: float = 0.75
     alpha_2_init: float = 0.25
+    block_init: str = "orthogonal"
 
     @nn.compact
     def __call__(
@@ -399,7 +422,7 @@ class _CoTStep(nn.Module):
                 self.num_heads,
                 self.mlp_dim,
                 self.activation,
-                self.kernel_init,
+                _block_kernel_init(self.block_init, self.kernel_init),
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
                 self.qkv_dim,
@@ -410,8 +433,7 @@ class _CoTStep(nn.Module):
             self.halting_hidden_dims, self.activation, self.kernel_init
         )
 
-        # LoopedActor's FPRMCore residual scaling (models/fprm.py): learned
-        # per-dim a1 (block residuals) and a2 (input mixing), with b1/b2 tied to
+        # Coupled residual scaling: learned per-dim a1 (block residuals) and a2 (input mixing), with b1/b2 tied to
         # them so the per-step map stays contractive. Without input injection
         # b2 = 1 - a1^(2L), which gives b1 = 1 - a1 (a convex residual).
         res_scale = None
@@ -441,8 +463,8 @@ class _CoTStep(nn.Module):
 
         token = jnp.where(pos < self.num_state_tokens, state_token, current_token)
         if self.input_injection:
-            # Re-inject the observation into every fed-back thought (FPRMCore's
-            # `h = a2 * z + b2 * input_tokens`). Step 0 already *is* that token.
+            # Re-inject the observation into every fed-back thought
+            # (`a2 * thought + b2 * s`). Step 0 already *is* that token.
             token = jnp.where(pos >= self.num_state_tokens, a2 * token + b2 * inject_token, token)
         x = token + pos_embedding[pos]
         new_cached_keys = []
@@ -677,8 +699,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
     `num_state_tokens` is not used.
 
-    Three options ported from LoopedActor's `FPRMCore` (`models/fprm.py`) to
-    keep the weight-tied loop stable, so more CoT steps refine the latent
+    Three options keep the weight-tied loop stable, so more CoT steps refine the latent
     instead of compounding its scale. All are off by default:
 
       - `latent_rms_norm`: parameter-free RMSNorm on every latent (state
@@ -695,7 +716,15 @@ class TransformerChainOfThoughtTorso(nn.Module):
         b1 * sublayer(norm(h))`, with learned per-dim `a1 = sigmoid(.)`
         (initialized to `alpha_1_init`) and `a2` (initialized to
         `alpha_2_init`), and `b2 = 1 - a2 a1^(2L)`, `b1 = b2 (1 - a1) / (1 -
-        a1^(2L))` as in FPRMCore. Without injection, `b2 = 1 - a1^(2L)`.
+        a1^(2L))`, which keeps the per-step map contractive. Without injection, `b2 = 1 - a1^(2L)`.
+
+    `block_init` (default `"orthogonal"`) sets the kernel init of every
+    `TransformerBlock` projection (Q/K/V, attention out, both MLP layers).
+    `"orthogonal"` uses `kernel_init` (orthogonal(sqrt(2))); its sqrt(2) gain
+    on the residual-branch outputs grows the residual stream every block.
+    `"trunc_normal"` uses `truncated_normal(1/sqrt(fan_in))` (see
+    `trunc_normal_kernel_init`). The observation projection and halting head keep
+    `kernel_init` either way.
     """
 
     hidden_dim: int
@@ -723,6 +752,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     residual_scaling: bool = False
     alpha_1_init: float = 0.75
     alpha_2_init: float = 0.25
+    block_init: str = "orthogonal"
 
     @nn.compact
     def __call__(
@@ -855,6 +885,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             residual_scaling=self.residual_scaling,
             alpha_1_init=self.alpha_1_init,
             alpha_2_init=self.alpha_2_init,
+            block_init=self.block_init,
         )
 
         initial_carry = (
