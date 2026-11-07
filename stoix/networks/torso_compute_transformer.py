@@ -79,6 +79,15 @@ def _resolve_qkv_dim(hidden_dim: int, qkv_dim: Optional[int]) -> int:
     return hidden_dim if qkv_dim is None else qkv_dim
 
 
+def rms_norm(x: chex.Array, eps: float = 1e-5) -> chex.Array:
+    """Parameter-free RMSNorm (LoopedActor's `models/fprm.py:rms_norm`)."""
+    return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+
+
+def _logit(p: float) -> float:
+    return float(np.log(p / (1.0 - p)))
+
+
 def simplicial_embedding(x: chex.Array, group_size: int, temperature: float) -> chex.Array:
     """Simplicial embedding (Lavoie et al., 2022). Splits the last axis into
     groups of `group_size` and applies a softmax to each group. Each group
@@ -87,6 +96,26 @@ def simplicial_embedding(x: chex.Array, group_size: int, temperature: float) -> 
         return x
     groups = x.reshape(x.shape[:-1] + (-1, group_size))
     return jax.nn.softmax(groups / temperature, axis=-1).reshape(x.shape)
+
+
+def _readout_and_feedback(
+    x: chex.Array, latent_rms_norm: bool, group_size: int, temperature: float
+) -> Tuple[chex.Array, chex.Array]:
+    """Returns `(state, fed_back)`: `state` is what the halting/action heads
+    read, `fed_back` is what re-enters the residual stream as a scratchpad token.
+
+    `latent_rms_norm=False` (original): both are `SEM(x)`. `True` (LoopedActor's
+    `sem_latent`): `state = SEM(rms_norm(x))`, so the softmax groups see unit-RMS
+    logits instead of the raw residual, and `fed_back = sqrt(V) * state` (V =
+    `group_size`) brings the token back to roughly unit scale. With SEM off
+    (`group_size <= 0`) both are `rms_norm(x)`.
+    """
+    if not latent_rms_norm:
+        state = simplicial_embedding(x, group_size, temperature)
+        return state, state
+    state = simplicial_embedding(rms_norm(x), group_size, temperature)
+    scale = float(np.sqrt(group_size)) if group_size > 0 else 1.0
+    return state, scale * state
 
 
 class TransformerBlock(nn.Module):
@@ -178,12 +207,25 @@ class TransformerBlock(nn.Module):
             self.attn_post_norm = norm_cls()
             self.mlp_post_norm = norm_cls()
 
-    def _mlp(self, tokens: chex.Array) -> chex.Array:
+    @staticmethod
+    def _residual(
+        h: chex.Array, out: chex.Array, res_scale: Optional[Tuple[chex.Array, chex.Array]]
+    ) -> chex.Array:
+        """`h + out`, or LoopedActor's coupled `a1 * h + b1 * out` when
+        `res_scale = (a1, b1)` (see `_CoTStep`'s `residual_scaling`)."""
+        if res_scale is None:
+            return h + out
+        a1, b1 = res_scale
+        return a1 * h + b1 * out
+
+    def _mlp(
+        self, tokens: chex.Array, res_scale: Optional[Tuple[chex.Array, chex.Array]] = None
+    ) -> chex.Array:
         y = self.mlp_norm(tokens)
         y = self.mlp_dense_0(y)
         y = parse_activation_fn(self.activation)(y)
         y = self.mlp_dense_1(y)
-        y = tokens + y
+        y = self._residual(tokens, y, res_scale)
         return self.mlp_post_norm(y) if self.use_sandwich_norm else y
 
     def __call__(self, tokens: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
@@ -208,8 +250,11 @@ class TransformerBlock(nn.Module):
         cached_values: chex.Array,
         step_idx: chex.Array,
         max_steps: int,
+        res_scale: Optional[Tuple[chex.Array, chex.Array]] = None,
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
+        res_scale: optional `(a1, b1)` - both residuals become `a1 * h + b1 *
+            sublayer(norm(h))` instead of `h + sublayer(norm(h))`.
         token: `(*batch, hidden_dim)` - this layer's input at this step.
         cached_keys, cached_values: `(*batch, max_steps + 1, num_heads,
             head_dim)` - this layer's cache (positions > step_idx are
@@ -234,10 +279,10 @@ class TransformerBlock(nn.Module):
         weights = jax.nn.softmax(scores, axis=-1)
         attn_out = jnp.einsum("...hk,...khd->...hd", weights, cached_values)
 
-        token = token + self.out_proj(attn_out)
+        token = self._residual(token, self.out_proj(attn_out), res_scale)
         if self.use_sandwich_norm:
             token = self.attn_post_norm(token)
-        return self._mlp(token), cached_keys, cached_values
+        return self._mlp(token, res_scale), cached_keys, cached_values
 
 
 class HaltingHead(nn.Module):
@@ -302,15 +347,21 @@ class _CoTStep(nn.Module):
     num_state_tokens: int = 1
     sem_group_size: int = 0
     sem_temperature: float = 1.0
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
+    alpha_1_init: float = 0.75
+    alpha_2_init: float = 0.25
 
     @nn.compact
     def __call__(
-        self, carry: Tuple[chex.Array, ...], xs: Tuple[chex.Array, chex.Array]
+        self, carry: Tuple[chex.Array, ...], xs: Tuple[chex.Array, chex.Array, chex.Array]
     ) -> Tuple[Tuple[chex.Array, ...], None]:
         # `pos` is the scratchpad position. The first `num_state_tokens - 1`
         # positions only prefill the KV-cache with state tokens (no halting).
         # The CoT step `step_idx` starts at the last state token.
-        pos, state_token = xs
+        # `inject_token` is the token CoT step 0 runs on, repeated per position.
+        pos, state_token, inject_token = xs
         num_prefill = self.num_state_tokens - 1
         num_positions = self.max_steps + num_prefill
         step_idx = pos - num_prefill
@@ -359,19 +410,55 @@ class _CoTStep(nn.Module):
             self.halting_hidden_dims, self.activation, self.kernel_init
         )
 
+        # LoopedActor's FPRMCore residual scaling (models/fprm.py): learned
+        # per-dim a1 (block residuals) and a2 (input mixing), with b1/b2 tied to
+        # them so the per-step map stays contractive. Without input injection
+        # b2 = 1 - a1^(2L), which gives b1 = 1 - a1 (a convex residual).
+        res_scale = None
+        a2, b2 = 1.0, 1.0
+        if self.residual_scaling:
+            a1 = nn.sigmoid(
+                self.param(
+                    "alpha_1_logit",
+                    nn.initializers.constant(_logit(self.alpha_1_init)),
+                    (self.hidden_dim,),
+                )
+            )
+            a1_pow = a1 ** (2 * self.num_layers)
+            if self.input_injection:
+                a2 = nn.sigmoid(
+                    self.param(
+                        "alpha_2_logit",
+                        nn.initializers.constant(_logit(self.alpha_2_init)),
+                        (self.hidden_dim,),
+                    )
+                )
+                b2 = 1.0 - a2 * a1_pow
+            else:
+                b2 = 1.0 - a1_pow
+            b1 = b2 * (1.0 - a1) / (1.0 - a1_pow + 1e-5)
+            res_scale = (a1, b1)
+
         token = jnp.where(pos < self.num_state_tokens, state_token, current_token)
+        if self.input_injection:
+            # Re-inject the observation into every fed-back thought (FPRMCore's
+            # `h = a2 * z + b2 * input_tokens`). Step 0 already *is* that token.
+            token = jnp.where(pos >= self.num_state_tokens, a2 * token + b2 * inject_token, token)
         x = token + pos_embedding[pos]
         new_cached_keys = []
         new_cached_values = []
         for layer_idx, block in enumerate(blocks):
             x, k, v = block.step(
-                x, cached_keys[layer_idx], cached_values[layer_idx], pos, num_positions
+                x, cached_keys[layer_idx], cached_values[layer_idx], pos, num_positions,
+                res_scale,
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-        # The latent goes through SEM before it is fed back or read by the
-        # halting/action heads.
-        state = simplicial_embedding(x, self.sem_group_size, self.sem_temperature)
+        # The latent goes through (RMSNorm then) SEM before it is fed back or
+        # read by the halting/action heads.
+        state, fed_back = _readout_and_feedback(
+            x, self.latent_rms_norm, self.sem_group_size, self.sem_temperature
+        )
         cached_keys = new_cached_keys
         cached_values = new_cached_values
         if self.replaying:
@@ -463,7 +550,7 @@ class _CoTStep(nn.Module):
         final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
         still_running = all_running & (~halts_this_step)
-        current_token = state
+        current_token = fed_back
 
         new_carry = (
             current_token,
@@ -589,6 +676,26 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `input_is_tokens` (default `False`) takes an input of shape `(*batch, N,
     F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
     `num_state_tokens` is not used.
+
+    Three options ported from LoopedActor's `FPRMCore` (`models/fprm.py`) to
+    keep the weight-tied loop stable, so more CoT steps refine the latent
+    instead of compounding its scale. All are off by default:
+
+      - `latent_rms_norm`: parameter-free RMSNorm on every latent (state
+        tokens and each step's output) before SEM. The heads read
+        `SEM(rms_norm(x))`, and the fed-back token is `sqrt(sem_group_size) *
+        SEM(rms_norm(x))`. Without it, SEM gets the raw residual stream and
+        saturates. With SEM off, the latent is just `rms_norm(x)`.
+      - `input_injection`: each fed-back thought (CoT step >= 1) becomes `a2 *
+        thought + b2 * s`, where `s` is the token CoT step 0 runs on (the last
+        state token). This keeps the observation in every step's input rather
+        than only in the attention cache. Without `residual_scaling`, `a2 = b2
+        = 1`.
+      - `residual_scaling`: every block residual in the loop becomes `a1 * h +
+        b1 * sublayer(norm(h))`, with learned per-dim `a1 = sigmoid(.)`
+        (initialized to `alpha_1_init`) and `a2` (initialized to
+        `alpha_2_init`), and `b2 = 1 - a2 a1^(2L)`, `b1 = b2 (1 - a1) / (1 -
+        a1^(2L))` as in FPRMCore. Without injection, `b2 = 1 - a1^(2L)`.
     """
 
     hidden_dim: int
@@ -611,6 +718,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
     sem_group_size: int = 0
     sem_temperature: float = 1.0
     input_is_tokens: bool = False
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
+    alpha_1_init: float = 0.75
+    alpha_2_init: float = 0.25
 
     @nn.compact
     def __call__(
@@ -675,8 +787,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
             state_tokens = state_tokens.reshape(batch_shape + (n, self.hidden_dim))
         if self.use_input_layer_norm:
             state_tokens = _norm_cls(self.use_rmsnorm)()(state_tokens)
-        state_tokens = simplicial_embedding(
-            state_tokens, self.sem_group_size, self.sem_temperature
+        # State tokens enter the residual stream exactly like fed-back thoughts.
+        _, state_tokens = _readout_and_feedback(
+            state_tokens, self.latent_rms_norm, self.sem_group_size, self.sem_temperature
         )
         initial_token = state_tokens[..., -1, :]
         num_positions = self.max_steps + n - 1
@@ -686,6 +799,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             axis=-2,
         )
         step_inputs = jnp.moveaxis(step_inputs, -2, 0)
+        inject_inputs = jnp.broadcast_to(initial_token, (num_positions,) + initial_token.shape)
 
         # Pre-allocate each layer's KV-cache; positions written by
         # `_CoTStep`/`TransformerBlock.step` are set incrementally, and
@@ -736,6 +850,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
             n,
             self.sem_group_size,
             self.sem_temperature,
+            latent_rms_norm=self.latent_rms_norm,
+            input_injection=self.input_injection,
+            residual_scaling=self.residual_scaling,
+            alpha_1_init=self.alpha_1_init,
+            alpha_2_init=self.alpha_2_init,
         )
 
         initial_carry = (
@@ -771,7 +890,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
-        ), _ = cot_step(initial_carry, (jnp.arange(num_positions), step_inputs))
+        ), _ = cot_step(initial_carry, (jnp.arange(num_positions), step_inputs, inject_inputs))
 
         if replaying:
             return (

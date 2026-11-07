@@ -87,6 +87,11 @@ NO_LAYER_NORM_ARCHES = ("transformer", "cnn+transformer", "gru", "cnn+gru", "iru
 TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 
 JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze", "slidingtile_bank")
+# MinAtar games (env=gymnax/<game>, see stoix/configs/env/gymnax/*.yaml). Not part of the
+# --envs default (opt in via --envs). No difficulty knobs. The observation is already a
+# (10, 10, C) grid, so it is used as-is by CNN architectures and flattened otherwise.
+MINATAR_GAMES = ("asterix", "breakout", "freeway", "seaquest", "space_invaders")
+ALL_ENVS = JUMANJI_ENVS + MINATAR_GAMES
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py) doesn't
 # fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup: it's only trained by
@@ -162,6 +167,8 @@ ENV_SCENARIOS = {
     "knapsack": ("jumanji/knapsack", None),
     "maze": ("jumanji/maze", "jumanji/maze_grid"),
 }
+# MinAtar: same gymnax scenario either way (CNN-ready grid; flattened for non-CNN arches).
+ENV_SCENARIOS.update((game, (f"gymnax/{game}", f"gymnax/{game}")) for game in MINATAR_GAMES)
 ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.items()}
 # knapsack/maze already set env.wrapper in their yaml (ConcatObservationWrapper,
 # since their observation is several equally-necessary fields with no single
@@ -171,6 +178,8 @@ ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.it
 # override lightsout/minatar-style jobs use, which would conflict.
 ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "slidingtile_bank": False, "knapsack": True, "maze": True}
 
+ENV_HAS_BUILTIN_WRAPPER.update((game, False) for game in MINATAR_GAMES)
+
 # Per-env CNN architecture - env-specific rather than one shared CNN, since the three CNN-capable
 # envs (see ENV_SUPPORTS_CNN) differ substantially in per-cell channel semantics: - sokoban: fixed
 # 10x10 grid, 2 channels bundling walls/boxes/targets/ player (see
@@ -178,16 +187,19 @@ ENV_HAS_BUILTIN_WRAPPER = {"sokoban": False, "slidingtile": False, "slidingtile_
 # gets the deepest conv stack and widest MLPs (matches cnn_mlp_compute.yaml's own defaults
 # throughout).
 ENV_CNN_ARCH = {
-    # Last conv layer has 4 channels so --cnn-tokens yields N=4 state tokens (one per kernel,
+    # Last conv layer has 8 channels so --cnn-tokens yields N=8 state tokens (one per kernel,
     # H*W features each); the critic keeps a flattened CNN+MLP.
     "slidingtile_bank": {
-        "channel_sizes": (32, 4),
+        "channel_sizes": (32, 8),
         "kernel_sizes": (3, 3),
         "strides": (1, 1),
         "hidden_sizes": (128,),
         "critic_channel_sizes": "32,64",
-        "critic_hidden_sizes": (128,),
-        "critic_layer_sizes": (256, 256),
+        "critic_hidden_sizes": (),  # flattened CNN features go straight into the critic MLP
+        "critic_layer_sizes": (256, 256, 256),
+        "activation": "gelu",  # CNN encoders (actor + critic input_layer)
+        "critic_activation": "gelu",  # critic MLP (critic_network.pre_torso)
+        "transformer_activation": "gelu",  # actor pre_torso (matches lightsout's transformer)
     },
     # "sokoban": {
     #     "channel_sizes": (128, 128),
@@ -254,6 +266,12 @@ ENV_CNN_ARCH = {
         "critic_layer_sizes": (128, 128),
     },
 }
+
+# SEM round (2026-11-07): Sokoban and the MinAtar games share sliding puzzle's CNN encoders
+# (actor: one token per last-layer kernel with --cnn-tokens; critic: CNN -> 3x256 GELU MLP) and
+# GELU transformer. The previous per-env Sokoban CNN is the "sokoban-final" entry above.
+for _env in ("sokoban", *MINATAR_GAMES):
+    ENV_CNN_ARCH[_env] = dict(ENV_CNN_ARCH["slidingtile_bank"])
 
 SOKOBAN_GENERATOR_CHOICES = (
     "default",
@@ -456,6 +474,12 @@ ENV_DIFFICULTY_AXES = {
 }
 
 
+# MinAtar has no difficulty knobs - a single fixed setting per game.
+ENV_DIFFICULTY_AXES.update(
+    (game, lambda args: [EnvDifficulty(tag="minatar")]) for game in MINATAR_GAMES
+)
+
+
 @dataclass
 class Job:
     env: str
@@ -507,7 +531,11 @@ class Job:
     # (see torso_compute_transformer.py). Defaults reproduce the original torso.
     num_state_tokens: int = 1
     sem_group_size: int = 0
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
     cnn_tokens: bool = False
+    vf_coef: float = 0.5
 
     @property
     def group_tag_parts(self) -> List[str]:
@@ -580,6 +608,14 @@ class Job:
             extra.append(f"nst{self.num_state_tokens}")
         if self.sem_group_size > 0:
             extra.append(f"sem{self.sem_group_size}")
+        if self.vf_coef != 0.5:
+            extra.append(f"vf{self.vf_coef:g}")
+        if self.latent_rms_norm:
+            extra.append("lrn")
+        if self.input_injection:
+            extra.append("inj")
+        if self.residual_scaling:
+            extra.append("rs")
         if extra:
             parts.append("-".join(extra))
 
@@ -618,7 +654,7 @@ class Job:
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
-            "arch.num_eval_episodes=10",
+            "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # min_steps == max_steps == budget: no adaptivity, every example always
@@ -670,6 +706,7 @@ class Job:
         # ff_ppo_explicit_cot.py's module docstrings.
         cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
         cmd.append(f"system.expectile={self.expectile:g}")
+        cmd.append(f"system.vf_coef={self.vf_coef:g}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             cmd.append(f"++network.actor_network.pre_torso.num_heads={self.num_heads}")
             cmd.append(f"++network.actor_network.pre_torso.mlp_dim={self.mlp_dim}")
@@ -688,6 +725,9 @@ class Job:
         if self.arch in ("transformer", "cnn+transformer"):
             # TransformerChainOfThoughtTorso only - see its docstring.
             cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
+            cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
+            cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
+            cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
             if self.arch == "cnn+transformer" and self.cnn_tokens:
                 # One state token per last-layer CNN kernel (CNNTorso.channel_tokens).
                 cmd.append("++network.actor_network.input_layer.channel_tokens=True")
@@ -756,6 +796,15 @@ class Job:
             cmd.append(f"network.critic_network.input_layer.strides=[{critic_strides}]")
             cmd.append(f"network.critic_network.input_layer.hidden_sizes=[{critic_hidden_sizes}]")
             cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{critic_layer_sizes}]")
+            if "activation" in cnn_arch:
+                cmd.append(f"network.actor_network.input_layer.activation={cnn_arch['activation']}")
+                cmd.append(f"network.critic_network.input_layer.activation={cnn_arch['activation']}")
+            if "critic_activation" in cnn_arch:
+                cmd.append(f"network.critic_network.pre_torso.activation={cnn_arch['critic_activation']}")
+            if "transformer_activation" in cnn_arch and self.arch == "cnn+transformer":
+                cmd.append(
+                    f"network.actor_network.pre_torso.activation={cnn_arch['transformer_activation']}"
+                )
         elif not ENV_HAS_BUILTIN_WRAPPER[self.env]:
             # sokoban (non-CNN)/slidingtile: native observation is a single
             # multi-dim array (grid/puzzle) that needs flattening for
@@ -1028,7 +1077,11 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     wandb_project=args.wandb_project,
                     num_state_tokens=args.num_state_tokens,
                     sem_group_size=args.sem_group_size,
+                    latent_rms_norm=args.latent_rms_norm,
+                    input_injection=args.input_injection,
+                    residual_scaling=args.residual_scaling,
                     cnn_tokens=args.cnn_tokens,
+                    vf_coef=args.vf_coef,
                 )
             )
 
@@ -1052,6 +1105,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             "to that job's system)."
         )
     return deduped_jobs
+
+CUDA_INIT_ERROR = "Unable to initialize backend 'cuda'"
+CUDA_INIT_RETRIES = 3
 
 
 def run_job(
@@ -1089,9 +1145,22 @@ def run_job(
             f"# CMD={' '.join(cmd)}\n\n"
         )
         log_file.flush()
-        proc = subprocess.run(
-            run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
-        )
+        # Many processes initializing CUDA at once (e.g. under MPS) occasionally fail with
+        # "Unable to initialize backend 'cuda'" before training starts; that is transient, so
+        # retry those (and only those) a few times, appending to the same log.
+        for attempt in range(1, CUDA_INIT_RETRIES + 1):
+            proc = subprocess.run(
+                run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
+            )
+            log_file.flush()
+            if proc.returncode == 0 or attempt == CUDA_INIT_RETRIES:
+                break
+            with open(log_path) as f:
+                if CUDA_INIT_ERROR not in f.read():
+                    break
+            log_file.write(f"\n# CUDA init failed (attempt {attempt}); retrying in 30s\n\n")
+            log_file.flush()
+            time.sleep(30)
     elapsed = time.time() - start
 
     result_job = asdict(job)
@@ -1119,7 +1188,10 @@ def main() -> None:
     parser.add_argument(
         "--envs",
         default=",".join(JUMANJI_ENVS),
-        help=f"Comma-separated subset of {{{','.join(JUMANJI_ENVS)}}} (env=jumanji/<env>).",
+        help=(
+            f"Comma-separated subset of {{{','.join(ALL_ENVS)}}} (env=jumanji/<env>, or "
+            "env=gymnax/<game> for the MinAtar games). Defaults to the jumanji envs only."
+        ),
     )
     parser.add_argument(
         "--systems",
@@ -1325,6 +1397,12 @@ def main() -> None:
         "TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
     )
     parser.add_argument(
+        "--vf-coef",
+        type=float,
+        default=0.5,
+        help="system.vf_coef (PPO systems only): critic loss weight. Default 0.5 (ff_ppo.yaml).",
+    )
+    parser.add_argument(
         "--num-state-tokens",
         type=int,
         default=1,
@@ -1337,6 +1415,24 @@ def main() -> None:
         default=0,
         help="TransformerChainOfThoughtTorso sem_group_size (transformer/cnn+transformer): "
         "simplicial embedding group size; 0 disables SEM. Default 0.",
+    )
+    parser.add_argument(
+        "--latent-rms-norm",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent before SEM; feed back sqrt(V)*SEM(rms_norm(x)). Default false.",
+    )
+    parser.add_argument(
+        "--input-injection",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso input_injection (transformer arch only): re-inject the step-0 state token into every fed-back thought. Default false.",
+    )
+    parser.add_argument(
+        "--residual-scaling",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): FPRMCore coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
     )
     parser.add_argument(
         "--cnn-tokens",
@@ -1554,7 +1650,7 @@ def main() -> None:
     args.maze_size = [int(x) for x in args.maze_size.split(",")]
 
     for e in args.envs:
-        assert e in JUMANJI_ENVS, f"unknown env {e!r}, expected one of {list(JUMANJI_ENVS)}"
+        assert e in ALL_ENVS, f"unknown env {e!r}, expected one of {list(ALL_ENVS)}"
     for s in args.systems:
         assert s in SYSTEM_TO_SCRIPT, f"unknown system {s!r}, expected one of {list(SYSTEM_TO_SCRIPT)}"
     for a in args.architectures:

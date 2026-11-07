@@ -278,6 +278,13 @@ class Job:
     # (see torso_compute_transformer.py). Defaults reproduce the original torso.
     num_state_tokens: int = 1
     sem_group_size: int = 0
+    # Critic MLP (network.critic_network.pre_torso) overrides; empty keeps the network yaml.
+    critic_layer_sizes: str = ""
+    critic_activation: str = ""
+    vf_coef: float = 0.5
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
 
     @property
     def env(self) -> str:
@@ -371,6 +378,18 @@ class Job:
             extra.append(f"nst{self.num_state_tokens}")
         if self.sem_group_size > 0:
             extra.append(f"sem{self.sem_group_size}")
+        if self.vf_coef != 0.5:
+            extra.append(f"vf{self.vf_coef:g}")
+        if self.critic_layer_sizes:
+            extra.append("c" + self.critic_layer_sizes.replace(",", "x"))
+        if self.critic_activation:
+            extra.append(f"c{self.critic_activation}")
+        if self.latent_rms_norm:
+            extra.append("lrn")
+        if self.input_injection:
+            extra.append("inj")
+        if self.residual_scaling:
+            extra.append("rs")
         if extra:
             parts.append("-".join(extra))
 
@@ -410,7 +429,7 @@ class Job:
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
             "arch.num_evaluation=50",
-            "arch.num_eval_episodes=10",
+            "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # Independently swept - see the compute torsos' min_steps mechanism
@@ -477,6 +496,7 @@ class Job:
         # ff_ppo_explicit_cot.py's module docstrings.
         cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
         cmd.append(f"system.expectile={self.expectile:g}")
+        cmd.append(f"system.vf_coef={self.vf_coef:g}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
             # TransformerExplicitCoTTorso only (see
@@ -501,6 +521,9 @@ class Job:
                 f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
             )
             cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
+            cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
+            cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
+            cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso/
             # TransformerExplicitCoTTorso only, no other architecture has this param.
@@ -511,6 +534,10 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
+        if self.critic_layer_sizes:
+            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{self.critic_layer_sizes}]")
+        if self.critic_activation:
+            cmd.append(f"network.critic_network.pre_torso.activation={self.critic_activation}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the sweep lands in the same
             # W&B project.
@@ -895,6 +922,12 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 wandb_project=args.wandb_project,
                 num_state_tokens=args.num_state_tokens,
                 sem_group_size=args.sem_group_size,
+                critic_layer_sizes=args.critic_layer_sizes,
+                critic_activation=args.critic_activation,
+                vf_coef=args.vf_coef,
+                latent_rms_norm=args.latent_rms_norm,
+                input_injection=args.input_injection,
+                residual_scaling=args.residual_scaling,
             )
         )
 
@@ -915,6 +948,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             "to that job's system)."
         )
     return deduped_jobs
+
+CUDA_INIT_ERROR = "Unable to initialize backend 'cuda'"
+CUDA_INIT_RETRIES = 3
 
 
 def run_job(
@@ -956,9 +992,22 @@ def run_job(
             f"# CMD={' '.join(cmd)}\n\n"
         )
         log_file.flush()
-        proc = subprocess.run(
-            run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
-        )
+        # Many processes initializing CUDA at once (e.g. under MPS) occasionally fail with
+        # "Unable to initialize backend 'cuda'" before training starts; that is transient, so
+        # retry those (and only those) a few times, appending to the same log.
+        for attempt in range(1, CUDA_INIT_RETRIES + 1):
+            proc = subprocess.run(
+                run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
+            )
+            log_file.flush()
+            if proc.returncode == 0 or attempt == CUDA_INIT_RETRIES:
+                break
+            with open(log_path) as f:
+                if CUDA_INIT_ERROR not in f.read():
+                    break
+            log_file.write(f"\n# CUDA init failed (attempt {attempt}); retrying in 30s\n\n")
+            log_file.flush()
+            time.sleep(30)
     elapsed = time.time() - start
 
     result = {
@@ -1374,6 +1423,24 @@ def main() -> None:
         "otherwise. Default false.",
     )
     parser.add_argument(
+        "--critic-layer-sizes",
+        default="",
+        help="Comma-separated ints - network.critic_network.pre_torso.layer_sizes (critic MLP). "
+        "Empty (default) keeps the network yaml.",
+    )
+    parser.add_argument(
+        "--critic-activation",
+        default="",
+        help="network.critic_network.pre_torso.activation (e.g. gelu). Empty (default) keeps the "
+        "network yaml.",
+    )
+    parser.add_argument(
+        "--vf-coef",
+        type=float,
+        default=0.5,
+        help="system.vf_coef (PPO systems only): critic loss weight. Default 0.5 (ff_ppo.yaml).",
+    )
+    parser.add_argument(
         "--num-state-tokens",
         type=int,
         default=1,
@@ -1386,6 +1453,24 @@ def main() -> None:
         default=0,
         help="TransformerChainOfThoughtTorso sem_group_size (transformer arch only): "
         "simplicial embedding group size; 0 disables SEM. Default 0.",
+    )
+    parser.add_argument(
+        "--latent-rms-norm",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent before SEM; feed back sqrt(V)*SEM(rms_norm(x)). Default false.",
+    )
+    parser.add_argument(
+        "--input-injection",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso input_injection (transformer arch only): re-inject the step-0 state token into every fed-back thought. Default false.",
+    )
+    parser.add_argument(
+        "--residual-scaling",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): FPRMCore coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
     )
     parser.add_argument(
         "--use-rmsnorm",
