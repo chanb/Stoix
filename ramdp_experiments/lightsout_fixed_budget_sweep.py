@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import queue
 import re
 import shlex
@@ -228,6 +229,7 @@ class Job:
     input_injection: bool = False
     residual_scaling: bool = False
     block_init: str = "orthogonal"
+    critic_cot_steps: int = 0
 
     @property
     def env(self) -> str:
@@ -318,6 +320,8 @@ class Job:
             extra.append("rs")
         if self.block_init != "orthogonal":
             extra.append(f"bi{self.block_init}")
+        if self.critic_cot_steps:
+            extra.append(f"ccot{self.critic_cot_steps}")
         if extra:
             parts.append("-".join(extra))
 
@@ -356,7 +360,7 @@ class Job:
             f"arch.total_timesteps={self.total_timesteps:g}",
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
-            "arch.num_evaluation=50",
+            f"arch.num_evaluation={os.environ.get('NUM_EVALUATION', 50)}",  # NUM_EVALUATION: shorter smoke tests
             "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
@@ -452,6 +456,8 @@ class Job:
             cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{self.critic_layer_sizes}]")
         if self.critic_activation:
             cmd.append(f"network.critic_network.pre_torso.activation={self.critic_activation}")
+        if self.critic_cot_steps:
+            cmd.append(f"+network.critic_network.cot_steps={self.critic_cot_steps}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the sweep lands in the same
             # W&B project.
@@ -749,6 +755,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 input_injection=args.input_injection,
                 residual_scaling=args.residual_scaling,
                 block_init=args.block_init,
+                critic_cot_steps=args.critic_cot_steps,
             )
         )
 
@@ -1205,6 +1212,10 @@ def main() -> None:
         choices=("orthogonal", "trunc_normal"),
         default="orthogonal",
         help="TransformerChainOfThoughtTorso block_init (transformer arch only): kernel init of the TransformerBlock projections - orthogonal(sqrt(2)) or truncated_normal(1/sqrt(fan_in)). Default orthogonal.",
+    )
+    parser.add_argument(
+        "--critic-cot-steps", type=int, default=0,
+        help="If > 0, the critic is its own copy of the actor CoT torso, always looping this many steps. Default 0 (MLP critic).",
     )
     parser.add_argument(
         "--use-rmsnorm",

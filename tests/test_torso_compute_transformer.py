@@ -143,3 +143,18 @@ def test_block_init_default_is_orthogonal():
     # orthogonal(sqrt(2)): rows (or cols) have norm sqrt(2).
     norms = jnp.linalg.norm(k, axis=0 if k.shape[0] >= k.shape[1] else 1)
     np.testing.assert_allclose(norms, np.sqrt(2.0), rtol=1e-4)
+
+
+def test_cot_critic_torso_returns_embedding():
+    from stoix.networks.torso_compute_transformer import CoTCriticTorso
+
+    torso = TransformerChainOfThoughtTorso(
+        hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, min_steps=MAX_STEPS,
+        num_state_tokens=N, sem_group_size=G,
+    )
+    critic = CoTCriticTorso(torso)
+    obs = jax.random.normal(jax.random.PRNGKey(0), (7, 10))
+    params = critic.init(jax.random.PRNGKey(1), obs)
+    emb = critic.apply(params, obs)
+    np.testing.assert_allclose(emb, torso.apply({"params": params["params"]["torso"]}, obs, deterministic=True)[0])
+    assert emb.shape == (7, H)

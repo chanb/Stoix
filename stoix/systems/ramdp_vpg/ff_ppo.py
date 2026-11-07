@@ -42,6 +42,7 @@ from stoix.base_types import (
 )
 from stoix.networks.base import FeedForwardCritic
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
+from stoix.networks.torso_compute_transformer import CoTCriticTorso
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
 from stoix.systems.ramdp_vpg.ppo_types import PPOTransition
 from stoix.systems.ramdp_vpg.ramdp_vpg_types import (
@@ -913,7 +914,18 @@ def learner_setup(
     actor_action_head = hydra.utils.instantiate(
         config.network.actor_network.action_head, action_dim=num_actions
     )
-    critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
+    # cot_steps > 0: the critic is its own copy of the actor's CoT torso, always looping cot_steps.
+    critic_cot_steps = config.network.critic_network.get("cot_steps", 0)
+    if critic_cot_steps:
+        critic_torso = CoTCriticTorso(
+            hydra.utils.instantiate(
+                config.network.actor_network.pre_torso,
+                min_steps=critic_cot_steps,
+                max_steps=critic_cot_steps,
+            )
+        )
+    else:
+        critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
 
     # input_layer is optional - defaults to identity when absent.
     actor_kwargs = {}

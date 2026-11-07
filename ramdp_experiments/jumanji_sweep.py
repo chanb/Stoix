@@ -41,6 +41,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import queue
 import shlex
 import subprocess
@@ -709,7 +710,7 @@ class Job:
             f"arch.total_timesteps={self.total_timesteps:g}",
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
-            "arch.num_evaluation=50",
+            f"arch.num_evaluation={os.environ.get('NUM_EVALUATION', 50)}",  # NUM_EVALUATION: shorter smoke tests
             "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",

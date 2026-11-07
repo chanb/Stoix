@@ -932,3 +932,14 @@ class TransformerChainOfThoughtTorso(nn.Module):
                 per_step_halting_entropy,
             )
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
+
+
+class CoTCriticTorso(nn.Module):
+    """Critic torso: runs `torso` (a `TransformerChainOfThoughtTorso`, usually with
+    `min_steps == max_steps`) greedily and returns only its embedding."""
+
+    torso: nn.Module
+
+    @nn.compact
+    def __call__(self, observation: chex.Array) -> chex.Array:
+        return self.torso(observation, deterministic=True)[0]
