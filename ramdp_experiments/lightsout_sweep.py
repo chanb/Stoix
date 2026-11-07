@@ -522,7 +522,7 @@ class Job:
                 f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
-        if self.arch == "transformer":
+        if self.arch in TRANSFORMER_ARCHES:
             # TransformerChainOfThoughtTorso only - see its docstring.
             cmd.append(
                 f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
@@ -600,6 +600,19 @@ class Job:
             # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
             # 2 * grid_size vector for non-CNN torsos.
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
+        elif self.arch == "cnn+transformer":
+            # Same CNN as lightsout_fixed_budget_sweep.py and the round-2 grid envs: one actor token
+            # per last-layer channel (8 tokens of m * n features); the critic CNN is flattened into
+            # its MLP.
+            for net, channels in (("actor", "32,8"), ("critic", "32,64")):
+                cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{channels}]")
+                cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
+                cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
+                cmd.append(f"network.{net}_network.input_layer.activation=gelu")
+            cmd.append("network.critic_network.input_layer.hidden_sizes=[]")
+            cmd.append("++network.actor_network.input_layer.channel_tokens=True")
+            cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
+            cmd.append("network.actor_network.pre_torso.activation=gelu")
         else:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")

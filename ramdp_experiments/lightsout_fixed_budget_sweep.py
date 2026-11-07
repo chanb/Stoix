@@ -76,6 +76,7 @@ ARCH_TO_NETWORK = {
         "mlp": "mlp_compute",
         "iru_unshared": "iru_unshared_compute",
         "transformer": "transformer_compute",
+        "cnn+transformer": "cnn_transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
     },
@@ -86,6 +87,7 @@ ARCH_TO_NETWORK = {
 # UnsharedIRUAdaptiveComputationTimeTorso.
 NO_LAYER_NORM_ARCHES = (
     "transformer",
+    "cnn+transformer",
     "gru",
     "iru",
     "iru_unshared",
@@ -93,7 +95,7 @@ NO_LAYER_NORM_ARCHES = (
 # Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention heads / transformer
 # feedforward width) - TransformerChainOfThoughtTorso and TransformerExplicitCoTTorso; every
 # other torso has no such concept.
-TRANSFORMER_ARCHES = ("transformer",)
+TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
@@ -126,6 +128,7 @@ EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 # -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru/iru_unshared are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
+    "cnn+transformer": "cnn+TF-iCoT",
     EXPLICIT_COT_ARCH: "TF-eCoT",
 }
 
@@ -435,7 +438,7 @@ class Job:
                 f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
-        if self.arch == "transformer":
+        if self.arch in TRANSFORMER_ARCHES:
             # TransformerChainOfThoughtTorso only - see its docstring.
             cmd.append(
                 f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
@@ -489,10 +492,24 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
-        # LightsOutEnv's native observation is (m, n, 2) (see
-        # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
-        # 2 * grid_size vector.
-        cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
+        if self.arch == "cnn+transformer":
+            # Same CNN as the round-2 grid envs (jumanji_sweep.py ENV_CNN_ARCH): the actor gets one
+            # token per last-layer channel (8 tokens of m * n features); the critic CNN is flattened
+            # into its MLP.
+            for net, channels in (("actor", "32,8"), ("critic", "32,64")):
+                cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{channels}]")
+                cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
+                cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
+                cmd.append(f"network.{net}_network.input_layer.activation=gelu")
+            cmd.append("network.critic_network.input_layer.hidden_sizes=[]")
+            cmd.append("++network.actor_network.input_layer.channel_tokens=True")
+            cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
+            cmd.append("network.actor_network.pre_torso.activation=gelu")
+        else:
+            # LightsOutEnv's native observation is (m, n, 2) (see
+            # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
+            # 2 * grid_size vector.
+            cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         return cmd
 
     def run_dir(self) -> Path:
@@ -1397,6 +1414,7 @@ def main() -> None:
         "mlp",
         "iru_unshared",
         "transformer",
+        "cnn+transformer",
         "gru",
         "iru",
         EXPLICIT_COT_ARCH,
