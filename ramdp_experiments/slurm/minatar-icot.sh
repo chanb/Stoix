@@ -29,7 +29,7 @@ echo "starting at: $(date)"
 
 project_name=nov06
 
-common_args="--systems ff_ppo_reinforce --seeds 5 --runs-per-gpu 3 --architectures cnn+transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --total-num-envs 128 --rollout-length 64 --envs ${game} --gamma 0.99 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --clip-eps 0.2 --clip-value-loss false --ent-coef 0.01 --gae-lambda 0.95 --standardize-advantages true --critic-before-actor false --use-input-layer-norm true --actor-weight-decay 0.0 --max-grad-norm 0.5 --wandb true --wandb-project minatar-icot-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/minatar-icot-${project_name} --gpus 0,1 --server vulcan --yes"
+common_args="--systems ff_ppo_reinforce --seeds 5 --runs-per-gpu 3 --architectures cnn+transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --total-num-envs 128 --rollout-length 64 --envs ${game} --gamma 0.99 --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --clip-eps 0.2 --clip-value-loss false --ent-coef 0.01 --gae-lambda 0.95 --standardize-advantages true --critic-before-actor false --use-input-layer-norm true --actor-weight-decay 0.0 --max-grad-norm 0.5 --use-expectile-value-loss true --expectile 0.2 --wandb true --wandb-project minatar-icot-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/minatar-icot-${project_name} --gpus 0,1 --server vulcan --yes"
 
 python ramdp_experiments/jumanji_fixed_budget_sweep.py ${common_args} --budget 1,2,3,4,5 &
 
