@@ -6,7 +6,7 @@ from typing import Any, Callable, Tuple
 import hydra
 import jax
 from colorama import Fore, Style
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 from stoa import (
     AddStartFlagAndPrevAction,
     AutoResetWrapper,
@@ -486,7 +486,8 @@ def make_lightsout_env(scenario_name: str, config: DictConfig) -> Tuple[Environm
         eval_env_config.difficulty_threshold = difficulty_threshold
 
     env = LightsOutEnv(env_config, eval=False)
-    eval_env = LightsOutEnv(eval_env_config, eval=True)
+    # `eval_on_train` is set by `make_train_eval_env`: evaluate on the training (easy) goals.
+    eval_env = LightsOutEnv(eval_env_config, eval=not config.env.get("eval_on_train", False))
 
     env = NoExtrasWrapper(env)
     eval_env = NoExtrasWrapper(eval_env)
@@ -620,6 +621,19 @@ def make(config: DictConfig) -> Tuple[Environment, Environment]:
         f"Scenario: {scenario_name}{Style.RESET_ALL}"
     )
     return envs
+
+
+def make_train_eval_env(config: DictConfig) -> Environment:
+    """An evaluation env (no auto-reset or core wrappers, like `make`'s eval env) on the
+    training distribution: the eval-only overrides (`env.eval_kwargs`, LightsOut's hard goals
+    and `eval_episode_length`) are dropped. Used when `env.train_eval` is True."""
+    config = copy.deepcopy(config)
+    with open_dict(config):
+        config.env.pop("eval_kwargs", None)
+        if config.env.get("kwargs"):
+            config.env.kwargs.pop("eval_episode_length", None)
+        config.env.eval_on_train = True
+    return make(config)[1]
 
 
 def make_factory(config: DictConfig) -> EnvFactory:

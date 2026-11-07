@@ -34,3 +34,7 @@ eval_kwargs:
 
 solved_final_reward_threshold: 1.0
 eval_metric: episode_return
+
+# Also evaluate on the training distribution (train/test instances are disjoint),
+# logged as evaluator/train/* - see stoix.utils.make_env.make_train_eval_env.
+train_eval: True

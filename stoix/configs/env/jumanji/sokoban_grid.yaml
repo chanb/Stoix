@@ -45,3 +45,7 @@ eval_metric: episode_return
 
 wrapper:
   _target_: stoix.wrappers.sokoban_grid.SokobanGridObservationWrapper
+
+# Also evaluate on the training distribution (train/test instances are disjoint),
+# logged as evaluator/train/* - see stoix.utils.make_env.make_train_eval_env.
+train_eval: True

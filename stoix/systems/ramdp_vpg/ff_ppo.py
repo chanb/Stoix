@@ -1096,6 +1096,18 @@ def run_experiment(_config: DictConfig) -> float:
             config=config,
         )
     )
+    # Second evaluator on the training distribution (`env.train_eval`: LightsOut,
+    # sliding puzzle, Sokoban - their train/test instances are disjoint).
+    # Logged as evaluator/train/*.
+    train_evaluator = None
+    if config.env.get("train_eval", False):
+        train_evaluator = evaluator_setup_with_compute_time(
+            eval_env=environments.make_train_eval_env(config),
+            key_e=key_e,
+            eval_act_fn=get_distribution_act_fn_with_compute_time(config, actor_network.apply),
+            params=learner_state.params.actor_params,
+            config=config,
+        )[0]
 
     steps_per_rollout = (
         n_devices
@@ -1155,6 +1167,10 @@ def run_experiment(_config: DictConfig) -> float:
         steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
         evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
         logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
+        if train_evaluator is not None:
+            train_output = train_evaluator(trained_params, eval_keys)
+            train_metrics = {f"train/{k}": v for k, v in train_output.episode_metrics.items()}
+            logger.log(train_metrics, t, eval_step, LogEvent.EVAL)
 
         if save_checkpoint:
             checkpointer.save(

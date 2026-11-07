@@ -111,7 +111,7 @@ HALTING_TEMPERATURE_ARCHES = (
 # stoix/networks/torso_compute_transformer.py.
 HALTING_HIDDEN_DIMS_ARCHES = TRANSFORMER_ARCHES
 
-JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze", "pacman")
+JUMANJI_ENVS = ("sokoban", "slidingtile", "knapsack", "maze", "pacman", "slidingtile_bank")
 
 # TransformerExplicitCoTTorso (see stoix/networks/torso_compute_explicit_cot.py) doesn't
 # fit ARCH_TO_NETWORK/SYSTEM_TO_SCRIPT's (system, arch) -> network lookup: it's only trained by
@@ -180,6 +180,8 @@ def _cap_tag_length(parts: List[str], max_len: int) -> List[str]:
 ENV_SCENARIOS = {
     "sokoban": ("jumanji/sokoban", "jumanji/sokoban_grid"),
     "slidingtile": ("jumanji/slidingtile", "jumanji/slidingtile_grid"),
+    # Level banks split by optimal solution length - see jumanji/slidingtile_bank.yaml.
+    "slidingtile_bank": ("jumanji/slidingtile_bank", "jumanji/slidingtile_bank_grid"),
     "knapsack": ("jumanji/knapsack", None),
     "maze": ("jumanji/maze", "jumanji/maze_grid"),
     "pacman": ("jumanji/pacman", "jumanji/pacman_grid"),
@@ -194,7 +196,7 @@ ENV_SUPPORTS_CNN = {env: grid is not None for env, (_, grid) in ENV_SCENARIOS.it
 # lightsout/minatar-style jobs use, which would conflict.
 ENV_HAS_BUILTIN_WRAPPER = {
     "sokoban": False,
-    "slidingtile": False,
+    "slidingtile": False, "slidingtile_bank": False,
     "knapsack": True,
     "maze": True,
     "pacman": True,
@@ -206,6 +208,17 @@ ENV_HAS_BUILTIN_WRAPPER = {
 # stoix/configs/env/jumanji/sokoban_grid.yaml) - gets a deep conv stack and wide MLPs (matches
 # cnn_mlp_compute.yaml's own defaults throughout).
 ENV_CNN_ARCH = {
+    # Last conv layer has 4 channels so --cnn-tokens yields N=4 state tokens (one per kernel,
+    # H*W features each); the critic keeps a flattened CNN+MLP.
+    "slidingtile_bank": {
+        "channel_sizes": (32, 4),
+        "kernel_sizes": (3, 3),
+        "strides": (1, 1),
+        "hidden_sizes": (128,),
+        "critic_channel_sizes": "32,64",
+        "critic_hidden_sizes": (128,),
+        "critic_layer_sizes": (256, 256),
+    },
     # "sokoban": {
     #     "channel_sizes": (128, 128, 128),
     #     "kernel_sizes": (3, 3, 3),
@@ -443,9 +456,34 @@ def _pacman_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
     return [EnvDifficulty(tag="default")]
 
 
+def _slidingtile_bank_difficulty_axis(args: argparse.Namespace) -> List[EnvDifficulty]:
+    # Boards come from the <gs>x<gs> train/test banks (see stoix/envs/slidingpuzzle/generator.py);
+    # --slidingtile-num-random-moves/--slidingtile-eval-num-random-moves are not used.
+    eval_time_limit = args.slidingtile_eval_time_limit
+    eval_overrides = ()
+    eval_tag = ""
+    if eval_time_limit != "same":
+        eval_overrides = (f"+env.eval_kwargs.time_limit={eval_time_limit}",)
+        eval_tag = f"-evaltl{eval_time_limit}"
+    return [
+        EnvDifficulty(
+            tag=f"bank-gs{gs}{'' if tl is None else f'-tl{tl}'}{eval_tag}",
+            overrides=(
+                f"env.kwargs.generator.grid_size={gs}",
+                f"env.eval_kwargs.generator.grid_size={gs}",
+            )
+            + (() if tl is None else (f"env.kwargs.time_limit={tl}",))
+            + eval_overrides,
+        )
+        for gs in args.slidingtile_grid_size
+        for tl in args.slidingtile_time_limit
+    ]
+
+
 ENV_DIFFICULTY_AXES = {
     "sokoban": _sokoban_difficulty_axis,
     "slidingtile": _slidingtile_difficulty_axis,
+    "slidingtile_bank": _slidingtile_bank_difficulty_axis,
     "knapsack": _knapsack_difficulty_axis,
     "maze": _maze_difficulty_axis,
     "pacman": _pacman_difficulty_axis,
@@ -506,6 +544,11 @@ class Job:
     output_dir: Path
     wandb: bool
     wandb_project: str
+    # TransformerChainOfThoughtTorso state tokenization / simplicial embedding
+    # (see torso_compute_transformer.py). Defaults reproduce the original torso.
+    num_state_tokens: int = 1
+    sem_group_size: int = 0
+    cnn_tokens: bool = False
 
     @property
     def group_tag_parts(self) -> List[str]:
@@ -584,6 +627,12 @@ class Job:
             extra.append("sn")
         if self.use_rmsnorm:
             extra.append("rms")
+        if self.cnn_tokens and self.arch == "cnn+transformer":
+            extra.append("ctok")
+        elif self.num_state_tokens != 1 and self.arch == "transformer":
+            extra.append(f"nst{self.num_state_tokens}")
+        if self.sem_group_size > 0:
+            extra.append(f"sem{self.sem_group_size}")
         if extra:
             parts.append("-".join(extra))
 
@@ -706,6 +755,17 @@ class Job:
                 f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
+        if self.arch in ("transformer", "cnn+transformer"):
+            # TransformerChainOfThoughtTorso only - see its docstring.
+            cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
+            if self.arch == "cnn+transformer" and self.cnn_tokens:
+                # One state token per last-layer CNN kernel (CNNTorso.channel_tokens).
+                cmd.append("++network.actor_network.input_layer.channel_tokens=True")
+                cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
+            else:
+                cmd.append(
+                    f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
+                )
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso only,
             # no other architecture has this param.
@@ -1118,6 +1178,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     output_dir=args.output_dir,
                     wandb=args.wandb,
                     wandb_project=args.wandb_project,
+                    num_state_tokens=args.num_state_tokens,
+                    sem_group_size=args.sem_group_size,
+                    cnn_tokens=args.cnn_tokens,
                 )
             )
 
@@ -1496,6 +1559,27 @@ def main() -> None:
         "stoix/networks/torso_compute_transformer.py's TransformerBlock docstring. Only applies "
         "to TRANSFORMER_ARCHES/EXPLICIT_COT_ARCHES (every other architecture has no "
         "TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
+    )
+    parser.add_argument(
+        "--num-state-tokens",
+        type=int,
+        default=1,
+        help="TransformerChainOfThoughtTorso num_state_tokens (transformer arch): the observation "
+        "is projected to this many tokens. Default 1 (original torso).",
+    )
+    parser.add_argument(
+        "--sem-group-size",
+        type=int,
+        default=0,
+        help="TransformerChainOfThoughtTorso sem_group_size (transformer/cnn+transformer): "
+        "simplicial embedding group size; 0 disables SEM. Default 0.",
+    )
+    parser.add_argument(
+        "--cnn-tokens",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="cnn+transformer only: feed one token per last-layer CNN kernel to the transformer "
+        "(CNNTorso.channel_tokens + pre_torso.input_is_tokens) instead of one flattened token.",
     )
     parser.add_argument(
         "--use-rmsnorm",

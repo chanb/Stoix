@@ -50,3 +50,7 @@ wrapper:
   _target_: stoix.wrappers.grid_observation.GridObservationWrapper
   dtype: float32
   add_channel_dim: True
+
+# Also evaluate on the training distribution (train/test instances are disjoint),
+# logged as evaluator/train/* - see stoix.utils.make_env.make_train_eval_env.
+train_eval: True

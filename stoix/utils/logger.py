@@ -345,6 +345,9 @@ class JsonLogger(BaseLogger):
         "num_close_steps/mean",
         "solved_episode/mean",
     ]
+    # The same metrics from the training-distribution evaluator (`env.train_eval`), logged as
+    # evaluator/train/* - see stoix.utils.make_env.make_train_eval_env.
+    _METRICS_TO_LOG += [f"train/{k}" for k in _METRICS_TO_LOG]
 
     def __init__(
         self,
