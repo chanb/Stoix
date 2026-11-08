@@ -301,6 +301,10 @@ from `launch_arch_budget_screen_b.sh` on the GPUs freed by stopping budgets 2–
 | ~~V6-hd64-1layer~~ | — | hidden_dim 64, num_layers 1 | stopped partway, same reason |
 | V7-nolatentrms | 0,4 | latent RMSNorm off | The fourth stabilizer, by itself |
 | V8-noresscale-noinject | 1,5 | residual_scaling and input_injection off (SEM kept) | Both fixed-point mechanisms off |
+| V9-noresscale-semreadout | 0,1 | residual_scaling off, sem_readout_only on (SEM only on what the heads read; fed-back thoughts and state tokens skip SEM) | Does a non-SEM feedback path add to V1's gap? (`launch_arch_v9.sh`, 2026-11-08) |
+| V10-noresscale-16tok | 2,3 | residual_scaling off, 16 state tokens (actor CNN [32, 16]; with CNN tokens the token count is the last-layer channel count) | Do more observation tokens help? (`launch_arch_v10.sh`, 2026-11-08) |
+| V11-noresscale-cnn64x8 | 4,5 | residual_scaling off, actor CNN [64, 8] (wider first layer, still 8 tokens) | Does a wider encoder help? (`launch_arch_v11.sh`, 2026-11-08) |
+| V12-noresscale-4096env-r16 | 0,1 | residual_scaling off, total_num_envs 4096, rollout_length 16 (batch 65,536 and minibatch 1,024 unchanged) | More, shorter rollouts (`launch_arch_v12.sh`, 2026-11-08) |
 
 Results (train/episode_return @5e7, mean of the last 5 logs ± s.e. over 2 seeds). Plot for V0:
 `/home/bryanpu1/scratch/logs/ramdp/sem-round2/analysis/v0.png`.
@@ -314,6 +318,19 @@ Results (train/episode_return @5e7, mean of the last 5 logs ± s.e. over 2 seeds
 | V4-plain | 0.766 ± 0.005 | 0.772 ± 0.002 | +0.007 | |
 | V7-nolatentrms | 0.597 ± 0.020 | 0.605 ± 0.036 | +0.009 | |
 | V8-noresscale-noinject | 0.708 ± 0.108 | 0.641 ± 0.061 | −0.066 | |
+| V9-noresscale-semreadout | 0.822 ± 0.016 | 0.707 ± 0.062 | −0.115 | |
+
+V9 (plot: `/home/bryanpu1/scratch/logs/ramdp/sem-round2/analysis/v9_vs_v1_v0.png`): budget 1 is the best
+single result in the screen, but budget 5 is worse than budget 1. sem_readout_only removes SEM from two
+inputs at once: the state tokens (the only change at budget 1, where it helps: 0.634 → 0.822) and the
+fed-back thoughts (only at budget 5, where it hurts: 0.787 → 0.707). Untested next step: SEM on the
+fed-back thoughts only, not on the state tokens (needs a new torso option).
+
+| Variant | Budget 1 | Budget 5 | Gap (5 − 1) | Eval (harder) gap |
+|---|---|---|---|---|
+| V10-noresscale-16tok | pending | | | |
+| V11-noresscale-cnn64x8 | pending | | | |
+| V12-noresscale-4096env-r16 | pending | | | |
 
 Plot: `/home/bryanpu1/scratch/logs/ramdp/sem-round2/analysis/screen_gap.png`. V1 has the largest gap, but
 mostly because its budget-1 return is lower than V0's; its budget-5 return is about the same as V0's.

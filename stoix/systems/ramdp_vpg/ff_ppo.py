@@ -99,6 +99,7 @@ def pondernet_mixture(
     action: chex.Array,
     max_steps: int,
     prior_lambda: float,
+    action_logit_accum: str = "last",
 ) -> Tuple:
     """PonderNet (Banino et al. 2021) halting: p_n = lam_n * prod_{j<n} (1 - lam_j). The
     policy is the mixture pi(a|s) = sum_n p_n pi_n(a|s), with pi_n = action_head(state_n).
@@ -106,10 +107,16 @@ def pondernet_mixture(
     PPO's ratio on it is exact, and the halting head gets gradient through p_n (no
     REINFORCE). Returns `(log_prob, entropy, states_history, per_step_halting_entropy,
     kl)`. `entropy` is sum_n p_n H(pi_n), with p held fixed. `kl` is KL(p || truncated
-    Geometric(prior_lambda))."""
+    Geometric(prior_lambda)). `action_logit_accum` ("sum"/"mean") makes pi_n read the
+    sum/mean of states 1..n, as the torso does (see TransformerChainOfThoughtTorso)."""
     states, lam, step_lp, step_ent = _replay_all_steps(actor_apply, actor_params, obs, max_steps)
     log_p = jnp.cumsum(step_lp, -1) - step_lp + jnp.log(jnp.maximum(lam, 1e-30))
-    step_pi = _action_head(actor_apply, actor_params, states)
+    head_in = states
+    if action_logit_accum != "last":
+        head_in = jnp.cumsum(states, -2)
+        if action_logit_accum == "mean":
+            head_in = head_in / jnp.arange(1, max_steps + 1)[:, None]
+    step_pi = _action_head(actor_apply, actor_params, head_in)
     log_prob = jax.nn.logsumexp(
         log_p + step_pi.log_prob(jnp.expand_dims(action, log_p.ndim - 1)), axis=-1
     )
@@ -195,6 +202,9 @@ def get_learner_fn(
     max_steps = config.network.actor_network.pre_torso.max_steps
     halting_loss_type = config.system.get("halting_loss_type", "pg")
     assert halting_loss_type in ("pg", "pondernet", "act"), halting_loss_type
+    action_logit_accum = config.network.actor_network.pre_torso.get("action_logit_accum", "last")
+    # ACT's action head already reads its own weighted mean of the states.
+    assert halting_loss_type != "act" or action_logit_accum == "last", action_logit_accum
 
     def _actor_forward(actor_params: FrozenDict, traj_batch: PPOTransition) -> Tuple:
         """Per-example `(env_log_prob, entropy, new_latent_states, halting_log_prob,
@@ -204,7 +214,7 @@ def get_learner_fn(
         if halting_loss_type == "pondernet":
             log_prob, entropy, states, step_ent, kl = pondernet_mixture(
                 actor_apply_fn, actor_params, traj_batch.obs, traj_batch.action, max_steps,
-                config.system.pondernet_prior_lambda,
+                config.system.pondernet_prior_lambda, action_logit_accum,
             )
             aux = config.system.pondernet_kl_coef * kl.mean()
             return log_prob, entropy, states, traj_batch.halting_log_prob, step_ent, aux
@@ -275,7 +285,7 @@ def get_learner_fn(
                 # Sampling a halt step, then an action, samples the mixture policy.
                 env_log_prob = pondernet_mixture(
                     actor_apply_fn, params.actor_params, last_timestep.observation, action,
-                    max_steps, config.system.pondernet_prior_lambda,
+                    max_steps, config.system.pondernet_prior_lambda, action_logit_accum,
                 )[0]
 
             # Second replay-mode pass to get halting_log_prob at these same (rollout-time) params,

@@ -291,6 +291,7 @@ class Job:
     cnn_tokens: bool = False
     halting_loss_type: str = "pg"
     extra_overrides: str = ""  # raw space-separated Hydra overrides, appended last
+    actor_cnn_channels: str = ""  # --cnn-tokens actor CNN channel sizes, e.g. "64,8"
 
     @property
     def env(self) -> str:
@@ -406,6 +407,8 @@ class Job:
             extra.append(f"hl{self.halting_loss_type}")
         if self.extra_overrides:
             extra.append(self.extra_overrides.replace(" ", "-"))
+        if self.actor_cnn_channels:
+            extra.append("acnn" + self.actor_cnn_channels.replace(",", "x"))
         if extra:
             parts.append("-".join(extra))
 
@@ -619,7 +622,10 @@ class Job:
         elif self.cnn_tokens:
             # SEM round 2's sliding-puzzle encoders (jumanji_sweep.ENV_CNN_ARCH["slidingtile_bank"]):
             # actor CNN [32, 8] -> 8 tokens, critic CNN [32, 64] flattened into its MLP, GELU.
-            for net, ch in (("actor", "32,8"), ("critic", "32,64")):
+            # One state token per last-layer actor channel: --num-state-tokens sets that count (default 8).
+            n_tok = self.num_state_tokens if self.num_state_tokens != 1 else 8
+            actor_ch = self.actor_cnn_channels or f"32,{n_tok}"
+            for net, ch in (("actor", actor_ch), ("critic", "32,64")):
                 cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{ch}]")
                 cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
                 cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
@@ -975,6 +981,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 cnn_tokens=args.cnn_tokens,
                 halting_loss_type=halting_loss_type,
                 extra_overrides=args.extra_overrides,
+                actor_cnn_channels=args.actor_cnn_channels,
             )
         )
 
@@ -1539,6 +1546,12 @@ def main() -> None:
         default=None,
         help="Comma-separated fixed compute budgets: one job per b with min_steps == max_steps "
         "== b (every step forced, so the halting head is unused). Overrides --min/max-steps.",
+    )
+    parser.add_argument(
+        "--actor-cnn-channels",
+        default="",
+        help="--cnn-tokens only: actor CNN channel sizes, e.g. '64,8' (the last one is the number "
+        "of state tokens). Default '32,<num-state-tokens or 8>'.",
     )
     parser.add_argument(
         "--extra-overrides",
