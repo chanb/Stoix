@@ -288,6 +288,9 @@ class Job:
     input_injection: bool = False
     residual_scaling: bool = False
     block_init: str = "orthogonal"
+    cnn_tokens: bool = False
+    halting_loss_type: str = "pg"
+    extra_overrides: str = ""  # raw space-separated Hydra overrides, appended last
 
     @property
     def env(self) -> str:
@@ -397,6 +400,12 @@ class Job:
             extra.append("rs")
         if self.block_init != "orthogonal":
             extra.append(f"bi{self.block_init}")
+        if self.cnn_tokens:
+            extra.append("cnntok")
+        if self.halting_loss_type != "pg":
+            extra.append(f"hl{self.halting_loss_type}")
+        if self.extra_overrides:
+            extra.append(self.extra_overrides.replace(" ", "-"))
         if extra:
             parts.append("-".join(extra))
 
@@ -504,6 +513,8 @@ class Job:
         cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
         cmd.append(f"system.expectile={self.expectile:g}")
         cmd.append(f"system.vf_coef={self.vf_coef:g}")
+        if self.system in LATENT_KL_PPO_SYSTEMS:
+            cmd.append(f"system.halting_loss_type={self.halting_loss_type}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
             # TransformerExplicitCoTTorso only (see
@@ -524,9 +535,14 @@ class Job:
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
         if self.arch in TRANSFORMER_ARCHES:
             # TransformerChainOfThoughtTorso only - see its docstring.
-            cmd.append(
-                f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
-            )
+            if self.cnn_tokens:
+                # One state token per last-layer CNN kernel (CNNTorso.channel_tokens).
+                cmd.append("++network.actor_network.input_layer.channel_tokens=True")
+                cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
+            else:
+                cmd.append(
+                    f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
+                )
             cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
             cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
             cmd.append(f"++network.actor_network.pre_torso.sem_readout_only={self.sem_readout_only}")
@@ -600,18 +616,15 @@ class Job:
             # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
             # 2 * grid_size vector for non-CNN torsos.
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
-        elif self.arch == "cnn+transformer":
-            # Same CNN as lightsout_fixed_budget_sweep.py and the round-2 grid envs: one actor token
-            # per last-layer channel (8 tokens of m * n features); the critic CNN is flattened into
-            # its MLP.
-            for net, channels in (("actor", "32,8"), ("critic", "32,64")):
-                cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{channels}]")
+        elif self.cnn_tokens:
+            # SEM round 2's sliding-puzzle encoders (jumanji_sweep.ENV_CNN_ARCH["slidingtile_bank"]):
+            # actor CNN [32, 8] -> 8 tokens, critic CNN [32, 64] flattened into its MLP, GELU.
+            for net, ch in (("actor", "32,8"), ("critic", "32,64")):
+                cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{ch}]")
                 cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
                 cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
                 cmd.append(f"network.{net}_network.input_layer.activation=gelu")
             cmd.append("network.critic_network.input_layer.hidden_sizes=[]")
-            cmd.append("++network.actor_network.input_layer.channel_tokens=True")
-            cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
             cmd.append("network.actor_network.pre_torso.activation=gelu")
         else:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
@@ -623,6 +636,7 @@ class Job:
             cmd.append(f"network.critic_network.input_layer.strides=[1]")
             cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
             cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
+        cmd.extend(self.extra_overrides.split())
         return cmd
 
     def run_dir(self) -> Path:
@@ -774,8 +788,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         for max_steps in args.max_steps
         if min_steps <= max_steps
     ]
+    if args.budgets:  # fixed budgets: min_steps == max_steps == b (overrides --min/max-steps)
+        step_combos = [(b, b) for b in args.budgets]
     n_skipped_step_combos = len(args.min_steps) * len(args.max_steps) - len(step_combos)
-    if n_skipped_step_combos:
+    if n_skipped_step_combos and not args.budgets:
         print(
             f"Skipping {n_skipped_step_combos} (min_steps, max_steps) combo(s) with "
             "min_steps > max_steps."
@@ -826,6 +842,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         halting_hidden_dims,
         (use_dpo_loss, dpo_alpha, dpo_beta),
         (use_expectile_value_loss, expectile),
+        halting_loss_type,
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -848,6 +865,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.halting_hidden_dims,
         dpo_combos,
         expectile_combos,
+        args.halting_loss_type,
         range(args.seeds),
     ):
         # latent_kl_coef only exists on ff_ppo.py's own systems
@@ -881,6 +899,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         # every other architecture.
         if arch not in HALTING_HIDDEN_DIMS_ARCHES:
             halting_hidden_dims = args.halting_hidden_dims[0]
+        if system not in LATENT_KL_PPO_SYSTEMS:
+            halting_loss_type = "pg"
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         eval_episode_length = (
@@ -952,6 +972,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 input_injection=args.input_injection,
                 residual_scaling=args.residual_scaling,
                 block_init=args.block_init,
+                cnn_tokens=args.cnn_tokens,
+                halting_loss_type=halting_loss_type,
+                extra_overrides=args.extra_overrides,
             )
         )
 
@@ -1501,6 +1524,34 @@ def main() -> None:
         type=lambda x: x.strip().lower() in ("1", "true", "yes"),
         default=False,
         help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
+    )
+    parser.add_argument(
+        "--cnn-tokens",
+        type=lambda v: v.lower() in ("1", "true", "yes"),
+        default=False,
+        help="cnn+transformer only: use SEM round 2's sliding-puzzle CNN encoders (actor CNN "
+        "[32,8] -> one state token per last-layer kernel, critic CNN [32,64] -> MLP, GELU) "
+        "instead of the default [16] CNN.",
+    )
+    parser.add_argument(
+        "--budgets",
+        type=lambda v: [int(x) for x in v.split(",")],
+        default=None,
+        help="Comma-separated fixed compute budgets: one job per b with min_steps == max_steps "
+        "== b (every step forced, so the halting head is unused). Overrides --min/max-steps.",
+    )
+    parser.add_argument(
+        "--extra-overrides",
+        default="",
+        help="Raw space-separated Hydra overrides appended to every job's command (and to its "
+        "run name), e.g. 'system.pondernet_kl_coef=0.001'.",
+    )
+    parser.add_argument(
+        "--halting-loss-type",
+        type=lambda v: v.split(","),
+        default=["pg"],
+        help="Comma-separated system.halting_loss_type values (pg, pondernet, act), swept. "
+        "ff_ppo.py's own systems only. Default pg.",
     )
     parser.add_argument(
         "--block-init",

@@ -332,13 +332,16 @@ class HaltingHead(nn.Module):
     hidden_dims: Tuple[int, ...] = ()
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    bias_init: float = 0.0  # initial halting logit offset; < 0 starts with low halting probs
 
     @nn.compact
     def __call__(self, x: chex.Array) -> chex.Array:
         for dim in self.hidden_dims:
             x = nn.Dense(dim, kernel_init=self.kernel_init)(x)
             x = parse_activation_fn(self.activation)(x)
-        return nn.Dense(1, kernel_init=self.kernel_init)(x)
+        return nn.Dense(
+            1, kernel_init=self.kernel_init, bias_init=nn.initializers.constant(self.bias_init)
+        )(x)
 
 
 class _CoTStep(nn.Module):
@@ -386,6 +389,7 @@ class _CoTStep(nn.Module):
     alpha_1_init: float = 0.75
     alpha_2_init: float = 0.25
     block_init: str = "orthogonal"
+    halting_bias_init: float = 0.0
 
     @nn.compact
     def __call__(
@@ -441,7 +445,7 @@ class _CoTStep(nn.Module):
             for _ in range(self.num_layers)
         ]
         halting_head = HaltingHead(
-            self.halting_hidden_dims, self.activation, self.kernel_init
+            self.halting_hidden_dims, self.activation, self.kernel_init, self.halting_bias_init
         )
 
         # Coupled residual scaling: learned per-dim a1 (block residuals) and a2 (input mixing), with b1/b2 tied to
@@ -755,6 +759,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     stop_gradient_halting_input: bool = False
     halting_temperature: float = 1.0
     halting_hidden_dims: Tuple[int, ...] = ()
+    halting_bias_init: float = 0.0
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
@@ -904,6 +909,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             alpha_1_init=self.alpha_1_init,
             alpha_2_init=self.alpha_2_init,
             block_init=self.block_init,
+            halting_bias_init=self.halting_bias_init,
         )
 
         initial_carry = (
