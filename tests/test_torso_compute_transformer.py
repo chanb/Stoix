@@ -177,3 +177,21 @@ def test_sem_readout_only_skips_sem_on_fed_back_and_state_tokens():
     np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
     full_sem = torso.clone(sem_readout_only=False).apply(params, obs, target_compute_time=compute_time)[0]
     assert not np.allclose(emb, full_sem)
+
+
+def test_action_logit_accum_sums_or_averages_taken_states():
+    """With a linear action head, summing per-step logits == head(sum of states)."""
+    obs = jax.random.normal(jax.random.PRNGKey(0), (7, 10))
+    for accum in ("sum", "mean"):
+        torso = TransformerChainOfThoughtTorso(
+            hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, num_state_tokens=N,
+            sem_group_size=G, action_logit_accum=accum,
+        )
+        params = torso.init(jax.random.PRNGKey(1), obs, deterministic=True)
+        emb, ct, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2))
+        replay_emb, _, hist, _, _ = torso.apply(params, obs, target_compute_time=ct)
+        taken = (jnp.arange(MAX_STEPS) < ct[:, None])[..., None]
+        expected = (hist * taken).sum(1) / (ct[:, None] if accum == "mean" else 1.0)
+        assert not jnp.all(ct == 1)  # some examples take several steps
+        np.testing.assert_allclose(emb, expected, atol=1e-5)
+        np.testing.assert_allclose(replay_emb, expected, atol=1e-5)
