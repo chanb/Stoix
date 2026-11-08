@@ -75,6 +75,10 @@ class CNNTorso(nn.Module):
     # If True, return one token per last-layer kernel: (..., channels, height * width).
     # The MLP is not used.
     channel_tokens: bool = False
+    # Conv/pool padding ("SAME" keeps H and W, "VALID" shrinks them).
+    padding: str = "SAME"
+    # If > 0, max-pool with this window (stride 1) before the last conv layer.
+    pool_before_last: int = 0
 
     @nn.compact
     def __call__(self, observation: chex.Array) -> chex.Array:
@@ -90,9 +94,17 @@ class CNNTorso(nn.Module):
             x = x.transpose((0, 2, 3, 1))
 
         # Convolutional layers
-        for channel, kernel, stride in zip(self.channel_sizes, self.kernel_sizes, self.strides):
+        layers = list(zip(self.channel_sizes, self.kernel_sizes, self.strides))
+        for i, (channel, kernel, stride) in enumerate(layers):
+            if self.pool_before_last and i == len(layers) - 1:
+                window = (self.pool_before_last, self.pool_before_last)
+                x = nn.max_pool(x, window, strides=(1, 1), padding=self.padding)
             x = nn.Conv(
-                channel, (kernel, kernel), (stride, stride), use_bias=not self.use_layer_norm
+                channel,
+                (kernel, kernel),
+                (stride, stride),
+                padding=self.padding,
+                use_bias=not self.use_layer_norm,
             )(x)
             if self.use_layer_norm:
                 x = nn.LayerNorm(reduction_axes=(-3, -2, -1))(x)

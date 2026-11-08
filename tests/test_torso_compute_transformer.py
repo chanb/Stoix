@@ -177,3 +177,48 @@ def test_sem_readout_only_skips_sem_on_fed_back_and_state_tokens():
     np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
     full_sem = torso.clone(sem_readout_only=False).apply(params, obs, target_compute_time=compute_time)[0]
     assert not np.allclose(emb, full_sem)
+
+
+def test_cnn_valid_padding_and_pool_before_last():
+    from stoix.networks.torso import CNNTorso
+
+    obs = jnp.zeros((7, 5, 4, 2))
+    cnn = CNNTorso(channel_sizes=[32, 8], kernel_sizes=[3, 1], strides=[1, 1], channel_tokens=True,
+                   padding="VALID", pool_before_last=2)
+    tokens = cnn.apply(cnn.init(jax.random.PRNGKey(0), obs), obs)
+    # 5x4 -> conv 3x3 -> 3x2 -> max-pool 2x2 (stride 1) -> 2x1 -> conv 1x1 -> 8 tokens of 2 features.
+    assert tokens.shape == (7, 8, 2)
+
+
+def test_attention_weights_sown_per_position():
+    torso, obs, params = _setup()
+    _, state = torso.apply(params, obs, deterministic=True, mutable=True)
+    blocks = state["intermediates"]["Scan_CoTStep_0"]
+    attn = [blocks[b]["attn_weights"][0] for b in sorted(blocks)]
+    num_positions = MAX_STEPS + N - 1
+    assert len(attn) == 2  # one per layer
+    assert blocks["TransformerBlock_0"]["v"][0].shape == (num_positions, 7, 2, H // 2)
+    for name in ("x_in", "x_out"):  # block input/output tokens, for rank collapse
+        assert blocks["TransformerBlock_1"][name][0].shape == (num_positions, 7, H)
+    for w in attn:
+        # (position, batch, heads, keys); rows are causal distributions.
+        assert w.shape == (num_positions, 7, 2, num_positions + 1)
+        np.testing.assert_allclose(w.sum(-1), 1.0, atol=1e-5)
+        for p in range(num_positions):
+            assert np.all(np.asarray(w)[p, ..., p + 1:] < 1e-6)
+
+
+def test_register_token_adds_learned_position_zero():
+    torso = TransformerChainOfThoughtTorso(
+        hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, num_state_tokens=N,
+        sem_group_size=G, register_token=True,
+    )
+    obs = jax.random.normal(jax.random.PRNGKey(0), (7, 10))
+    params = torso.init(jax.random.PRNGKey(1), obs, deterministic=True)
+    assert params["params"]["register_token"].shape == (H,)
+    emb, compute_time, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2))
+    replay_emb = torso.apply(params, obs, target_compute_time=compute_time)[0]
+    np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
+    _, state = torso.apply(params, obs, deterministic=True, mutable=True)
+    w = state["intermediates"]["Scan_CoTStep_0"]["TransformerBlock_0"]["attn_weights"][0]
+    assert w.shape == (MAX_STEPS + N, 7, 2, MAX_STEPS + N + 1)  # one more prefill position

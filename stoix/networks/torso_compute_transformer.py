@@ -295,6 +295,8 @@ class TransformerBlock(nn.Module):
 
         Returns `(new_token, updated_keys, updated_values)`.
         """
+        # Sows are no-ops unless "intermediates" is mutable (used to inspect the model).
+        self.sow("intermediates", "x_in", token)
         y = self.attn_norm(token)
         q, k, v = self.query_proj(y), self.key_proj(y), self.value_proj(y)
 
@@ -309,12 +311,16 @@ class TransformerBlock(nn.Module):
         scores = jnp.einsum("...hd,...khd->...hk", q, cached_keys) * scale
         scores = jnp.where(key_mask, scores, _NEG_INF)
         weights = jax.nn.softmax(scores, axis=-1)
+        self.sow("intermediates", "attn_weights", weights)
+        self.sow("intermediates", "v", v)
         attn_out = jnp.einsum("...hk,...khd->...hd", weights, cached_values)
 
         token = self._residual(token, self.out_proj(attn_out), res_scale)
         if self.use_sandwich_norm:
             token = self.attn_post_norm(token)
-        return self._mlp(token, res_scale), cached_keys, cached_values
+        token = self._mlp(token, res_scale)
+        self.sow("intermediates", "x_out", token)
+        return token, cached_keys, cached_values
 
 
 class HaltingHead(nn.Module):
@@ -714,6 +720,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
     F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
     `num_state_tokens` is not used.
 
+    `register_token` (default `False`) puts one learned, input-independent token
+    at position 0, before the state tokens, as a prefill position. Heads can
+    attend to it as a no-op (an attention-sink register).
+
     Three options keep the weight-tied loop stable, so more CoT steps refine the latent
     instead of compounding its scale. All are off by default:
 
@@ -769,6 +779,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     alpha_1_init: float = 0.75
     alpha_2_init: float = 0.25
     block_init: str = "orthogonal"
+    register_token: bool = False
 
     @nn.compact
     def __call__(
@@ -839,6 +850,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.sem_readout_only,
         )
         initial_token = state_tokens[..., -1, :]
+        if self.register_token:
+            register = self.param("register_token", normal(stddev=0.02), (self.hidden_dim,))
+            register = jnp.broadcast_to(register, batch_shape + (1, self.hidden_dim))
+            state_tokens = jnp.concatenate([register, state_tokens], axis=-2)
+            n += 1
         num_positions = self.max_steps + n - 1
         # Per-position scan input: state token p at position p < N, else unused.
         step_inputs = jnp.concatenate(
@@ -875,6 +891,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         cot_step = nn.scan(
             _CoTStep,
             variable_broadcast="params",
+            variable_axes={"intermediates": 0},
             split_rngs={"params": False},
         )(
             self.hidden_dim,

@@ -371,6 +371,8 @@ class Job:
             extra.append("iln")
         if self.stop_gradient_halting_input:
             extra.append("sgh")
+        if (self.rollout_length, self.total_num_envs) != (64, 1024):  # round-2 values: untagged
+            extra.append(f"rl{self.rollout_length}-ne{self.total_num_envs}")
         if self.use_latent_feedback:
             extra.append("lf")
         if self.use_sandwich_norm:

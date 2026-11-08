@@ -234,6 +234,7 @@ class Job:
     residual_scaling: bool = False
     block_init: str = "orthogonal"
     critic_cot_steps: int = 0
+    cnn_pool: bool = False
 
     @property
     def env(self) -> str:
@@ -328,6 +329,10 @@ class Job:
             extra.append(f"bi{self.block_init}")
         if self.critic_cot_steps:
             extra.append(f"ccot{self.critic_cot_steps}")
+        if self.cnn_pool:
+            extra.append("vpool")
+        if (self.rollout_length, self.total_num_envs) != (64, 1024):  # round-2 values: untagged
+            extra.append(f"rl{self.rollout_length}-ne{self.total_num_envs}")
         if extra:
             parts.append("-".join(extra))
 
@@ -496,9 +501,14 @@ class Job:
             # Same CNN as the round-2 grid envs (jumanji_sweep.py ENV_CNN_ARCH): the actor gets one
             # token per last-layer channel (8 tokens of m * n features); the critic CNN is flattened
             # into its MLP.
+            # cnn_pool: VALID padding, a 2x2 max-pool (stride 1) before a 1x1 last conv, both nets.
+            kernels = "3,1" if self.cnn_pool else "3,3"
             for net, channels in (("actor", "32,8"), ("critic", "32,64")):
                 cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{channels}]")
-                cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
+                cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[{kernels}]")
+                if self.cnn_pool:
+                    cmd.append(f"++network.{net}_network.input_layer.padding=VALID")
+                    cmd.append(f"++network.{net}_network.input_layer.pool_before_last=2")
                 cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
                 cmd.append(f"network.{net}_network.input_layer.activation=gelu")
             cmd.append("network.critic_network.input_layer.hidden_sizes=[]")
@@ -778,6 +788,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 residual_scaling=args.residual_scaling,
                 block_init=args.block_init,
                 critic_cot_steps=args.critic_cot_steps,
+                cnn_pool=args.cnn_pool,
             )
         )
 
@@ -1240,6 +1251,12 @@ def main() -> None:
         choices=("orthogonal", "trunc_normal"),
         default="orthogonal",
         help="TransformerChainOfThoughtTorso block_init (transformer arch only): kernel init of the TransformerBlock projections - orthogonal(sqrt(2)) or truncated_normal(1/sqrt(fan_in)). Default orthogonal.",
+    )
+    parser.add_argument(
+        "--cnn-pool",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="cnn+transformer only: VALID padding and a 2x2 max-pool (stride 1) before a 1x1 last conv, actor and critic CNNs. Default false.",
     )
     parser.add_argument(
         "--critic-cot-steps", type=int, default=0,
