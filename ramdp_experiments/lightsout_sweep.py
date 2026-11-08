@@ -282,6 +282,7 @@ class Job:
     # Critic MLP (network.critic_network.pre_torso) overrides; empty keeps the network yaml.
     critic_layer_sizes: str = ""
     critic_activation: str = ""
+    critic_sem_group_size: int = 0
     vf_coef: float = 0.5
     latent_rms_norm: bool = False
     sem_readout_only: bool = False
@@ -390,6 +391,8 @@ class Job:
             extra.append("c" + self.critic_layer_sizes.replace(",", "x"))
         if self.critic_activation:
             extra.append(f"c{self.critic_activation}")
+        if self.critic_sem_group_size > 0:
+            extra.append(f"csem{self.critic_sem_group_size}")
         if self.latent_rms_norm:
             extra.append("lrn")
         if self.sem_readout_only:
@@ -461,6 +464,11 @@ class Job:
             f"system.max_grad_norm={self.max_grad_norm:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
+            # Keep the final learner state for post-hoc evaluation (ff_ppo.py saves only the
+            # last eval step) in the run dir, not the cwd.
+            "logger.checkpointing.save_model=True",
+            f"logger.checkpointing.save_args.rel_dir={self.output_dir / self.run_name / 'checkpoints'}",
+            "logger.checkpointing.save_args.checkpoint_uid=final",
         ]
         # epochs/num_minibatches/clip_eps: PPO-specific hyperparameters -
         # see ff_ppo.yaml.
@@ -563,6 +571,11 @@ class Job:
             cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{self.critic_layer_sizes}]")
         if self.critic_activation:
             cmd.append(f"network.critic_network.pre_torso.activation={self.critic_activation}")
+        if self.critic_sem_group_size > 0:
+            # SEM on the critic MLP output, right before ScalarCriticHead - see MLPTorso.
+            cmd.append(
+                f"++network.critic_network.pre_torso.sem_group_size={self.critic_sem_group_size}"
+            )
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the sweep lands in the same
             # W&B project.
@@ -966,6 +979,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 sem_group_size=args.sem_group_size,
                 critic_layer_sizes=args.critic_layer_sizes,
                 critic_activation=args.critic_activation,
+                critic_sem_group_size=args.critic_sem_group_size,
                 vf_coef=args.vf_coef,
                 latent_rms_norm=args.latent_rms_norm,
                 sem_readout_only=args.sem_readout_only,
@@ -1482,6 +1496,13 @@ def main() -> None:
         "network yaml.",
     )
     parser.add_argument(
+        "--critic-sem-group-size",
+        type=int,
+        default=0,
+        help="SEM group size on the critic MLP output, right before the scalar critic head "
+        "(MLPTorso.sem_group_size); 0 (default) disables it.",
+    )
+    parser.add_argument(
         "--vf-coef",
         type=float,
         default=0.5,
@@ -1635,7 +1656,8 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results_lightsout_sweep",
+        # $SCRATCH, not the repo in $HOME: run outputs and checkpoints go here.
+        default=Path(os.environ.get("SCRATCH", REPO_ROOT)) / "results_lightsout_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")

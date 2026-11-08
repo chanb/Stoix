@@ -1305,7 +1305,9 @@ def run_experiment(_config: DictConfig) -> float:
             train_metrics = {f"train/{k}": v for k, v in train_output.episode_metrics.items()}
             logger.log(train_metrics, t, eval_step, LogEvent.EVAL)
 
-        if save_checkpoint:
+        # Final eval step only: with max_to_keep=1 Orbax keeps the best-return checkpoint, so
+        # saving every step would not leave the last one.
+        if save_checkpoint and eval_step == config.arch.num_evaluation - 1:
             checkpointer.save(
                 timestep=int(steps_per_rollout * (eval_step + 1)),
                 unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
