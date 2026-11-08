@@ -22,11 +22,19 @@ things break for that combination:
 `GridObservationWrapper` fixes both without flattening: it casts the
 observation to `dtype` (default float32) and, if `add_channel_dim=True`
 (default), appends a trailing singleton channel axis.
+
+`one_hot=True` instead one-hot encodes each cell over the values
+`0..maximum` of the original (bounded, minimum 0) space, giving
+(height, width, maximum + 1) - e.g. the sliding puzzle's tile ids 0..N^2-1
+become N^2 binary channels, so tile ids are categorical rather than
+ordinal. `add_channel_dim` is ignored in that case.
 """
 
 from typing import Optional, Tuple
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 from chex import PRNGKey
 from stoa.core_wrappers.wrapper import Wrapper
 from stoa.env_types import Action, EnvParams, State, TimeStep
@@ -35,14 +43,30 @@ from stoa.spaces import ArraySpace, BoundedArraySpace, Space
 
 
 class GridObservationWrapper(Wrapper[State]):
-    """Casts a grid observation's dtype and optionally adds a channel axis."""
+    """Casts a grid observation's dtype and adds a channel axis (singleton or one-hot)."""
 
-    def __init__(self, env: Environment, dtype: str = "float32", add_channel_dim: bool = True):
+    def __init__(
+        self,
+        env: Environment,
+        dtype: str = "float32",
+        add_channel_dim: bool = True,
+        one_hot: bool = False,
+    ):
         super().__init__(env)
         self._dtype = jnp.dtype(dtype)
         self._add_channel_dim = add_channel_dim
+        self._num_classes: Optional[int] = None
+        if one_hot:
+            orig_space = self._env.observation_space()
+            if not isinstance(orig_space, BoundedArraySpace):
+                raise ValueError("one_hot=True needs a bounded observation space.")
+            if np.any(np.asarray(orig_space.minimum) != 0):
+                raise ValueError(f"one_hot=True needs minimum 0, got {orig_space.minimum}.")
+            self._num_classes = int(np.max(orig_space.maximum)) + 1
 
     def _prepare(self, observation: jnp.ndarray) -> jnp.ndarray:
+        if self._num_classes is not None:
+            return jax.nn.one_hot(observation, self._num_classes, dtype=self._dtype)
         observation = jnp.asarray(observation, dtype=self._dtype)
         if self._add_channel_dim:
             observation = observation[..., None]
@@ -64,6 +88,14 @@ class GridObservationWrapper(Wrapper[State]):
 
     def observation_space(self, env_params: Optional[EnvParams] = None) -> Space:
         orig_space = self._env.observation_space(env_params)
+        if self._num_classes is not None:
+            return BoundedArraySpace(
+                shape=(*orig_space.shape, self._num_classes),
+                dtype=self._dtype,
+                minimum=0.0,
+                maximum=1.0,
+                name=orig_space.name,
+            )
         new_shape = (*orig_space.shape, 1) if self._add_channel_dim else orig_space.shape
 
         if isinstance(orig_space, BoundedArraySpace):

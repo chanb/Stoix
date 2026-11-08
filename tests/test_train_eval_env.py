@@ -49,5 +49,6 @@ def test_slidingtile_train_eval_env_uses_train_bank():
     train_eval_env = make_train_eval_env(cfg)
     _, ts = jax.vmap(train_eval_env.reset)(jax.random.split(jax.random.PRNGKey(0), 256))
     train = {p.astype(np.int8).tobytes() for p in np.load(os.path.join(BANK, "train.npz"))["puzzle"]}
-    boards = np.asarray(getattr(ts.observation, "agent_view", ts.observation))[..., 0].astype(np.int8)
+    # Observations are one-hot tile ids (GridObservationWrapper one_hot=True).
+    boards = np.asarray(getattr(ts.observation, "agent_view", ts.observation)).argmax(-1).astype(np.int8)
     assert all(b.tobytes() in train for b in boards)

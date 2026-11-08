@@ -308,7 +308,18 @@ Results (train/episode_return @5e7, mean of the last 5 logs ± s.e. over 2 seeds
 | Variant | Budget 1 | Budget 5 | Gap (5 − 1) | Eval (harder) gap |
 |---|---|---|---|---|
 | V0 | 0.735 ± 0.002 | 0.777 ± 0.036 | +0.042 (inside seed noise; the curves separate only after ~3.5e7) | about +0.08 (0.68 vs 0.60) |
-| V1–V6 | pending | | | |
+| V1-noresscale | 0.634 ± 0.066 | 0.787 ± 0.004 | **+0.153** | |
+| V2-noinject | 0.803 ± 0.015 | 0.646 ± 0.001 | −0.157 | |
+| V3-nosem | 0.788 ± 0.006 | 0.805 ± 0.003 | +0.018 | |
+| V4-plain | 0.766 ± 0.005 | 0.772 ± 0.002 | +0.007 | |
+| V7-nolatentrms | 0.597 ± 0.020 | 0.605 ± 0.036 | +0.009 | |
+| V8-noresscale-noinject | 0.708 ± 0.108 | 0.641 ± 0.061 | −0.066 | |
+
+Plot: `/home/bryanpu1/scratch/logs/ramdp/sem-round2/analysis/screen_gap.png`. V1 has the largest gap, but
+mostly because its budget-1 return is lower than V0's; its budget-5 return is about the same as V0's.
+Removing input injection (V2, V8) makes budget 5 worse than budget 1. At budget 5 near the end of
+training, V1 converges more than V0 (num close steps 1.39 vs 0.23 of 4), so the "fixed point" idea
+above is not supported: V0's state keeps changing between steps, but this does not help.
 
 ### Residual scaling off, fixed budgets 1–5 (queued 2026-11-08, starts when the screen ends)
 
