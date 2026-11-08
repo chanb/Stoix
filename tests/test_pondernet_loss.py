@@ -69,3 +69,17 @@ def test_act_halts_where_cumulative_prob_reaches_threshold():
         return -pi.log_prob(action).mean() + 0.01 * cost.mean()
 
     _halt_grad_is_finite_and_nonzero(loss, params)
+
+
+def test_negative_halting_bias_makes_act_ponder_longer():
+    actor = FeedForwardActorWithComputeTime(
+        torso=TransformerChainOfThoughtTorso(
+            hidden_dim=16, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, halting_bias_init=-4.0
+        ),
+        action_head=CategoricalHead(action_dim=A),
+    )
+    obs = jax.random.normal(jax.random.PRNGKey(0), (B, 10))
+    params = actor.init(jax.random.PRNGKey(1), obs, torso_kwargs={"deterministic": True})
+    params["params"]["torso"]["Scan_CoTStep_0"]["HaltingHead_0"]["Dense_0"]["kernel"] *= 0.0
+    _, n, _, _, _ = act_policy(actor.apply, params, obs, MAX_STEPS, eps=0.01)
+    np.testing.assert_array_equal(n, MAX_STEPS)  # sigmoid(-4) * 4 < 0.99
