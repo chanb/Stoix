@@ -14,6 +14,10 @@ steps, so the return recursion is
 
 The advantage is G - V, with `G` computed via GAE(lambda)
 (`config.system.gae_lambda`) and a plain V-only critic.
+
+`config.system.halting_loss_type` picks how the halting head is trained: "pg" (the
+per-step PPO/REINFORCE surrogate above), "pondernet" (`pondernet_mixture`) or "act"
+(`act_policy`, which also changes the forward pass to ACT's deterministic halting).
 """
 
 import copy
@@ -70,6 +74,76 @@ from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
 
+def _action_head(actor_apply: ActorApply, actor_params: FrozenDict, x: chex.Array) -> Any:
+    return actor_apply(actor_params, x, method=lambda m, x: m.action_head(x))
+
+
+def _replay_all_steps(
+    actor_apply: ActorApply, actor_params: FrozenDict, obs: chex.Array, max_steps: int
+) -> Tuple:
+    """Replays the CoT to `max_steps` (attention is causal, so step n's state is the same
+    as in any shorter run). Returns `(states_history, lam, step_lp, per_step_halting_entropy)`:
+    `lam[..., n]` is step n's halting prob (0 before min_steps, 1 at the last step) and
+    `step_lp[..., n] = log(1 - lam[..., n])` (0 at forced steps)."""
+    _, _, states, step_lp, step_ent = actor_apply(
+        actor_params, obs, torso_kwargs={"target_compute_time": jnp.float32(max_steps)}
+    )
+    lam = (-jnp.expm1(step_lp)).at[..., -1].set(1.0)
+    return states, lam, step_lp, step_ent
+
+
+def pondernet_mixture(
+    actor_apply: ActorApply,
+    actor_params: FrozenDict,
+    obs: chex.Array,
+    action: chex.Array,
+    max_steps: int,
+    prior_lambda: float,
+) -> Tuple:
+    """PonderNet (Banino et al. 2021) halting: p_n = lam_n * prod_{j<n} (1 - lam_j). The
+    policy is the mixture pi(a|s) = sum_n p_n pi_n(a|s), with pi_n = action_head(state_n).
+    Sampling a halt step and then an action (the rollout) samples from this mixture, so
+    PPO's ratio on it is exact, and the halting head gets gradient through p_n (no
+    REINFORCE). Returns `(log_prob, entropy, states_history, per_step_halting_entropy,
+    kl)`. `entropy` is sum_n p_n H(pi_n), with p held fixed. `kl` is KL(p || truncated
+    Geometric(prior_lambda))."""
+    states, lam, step_lp, step_ent = _replay_all_steps(actor_apply, actor_params, obs, max_steps)
+    log_p = jnp.cumsum(step_lp, -1) - step_lp + jnp.log(jnp.maximum(lam, 1e-30))
+    step_pi = _action_head(actor_apply, actor_params, states)
+    log_prob = jax.nn.logsumexp(
+        log_p + step_pi.log_prob(jnp.expand_dims(action, log_p.ndim - 1)), axis=-1
+    )
+    entropy = jnp.sum(jax.lax.stop_gradient(jnp.exp(log_p)) * step_pi.entropy(), -1)
+    log_q = jnp.arange(max_steps) * jnp.log1p(-prior_lambda) + jnp.log(prior_lambda)
+    log_q = log_q - jax.nn.logsumexp(log_q)
+    kl = jnp.sum(jnp.exp(log_p) * (log_p - log_q), -1)
+    return log_prob, entropy, states, step_ent, kl
+
+
+def act_policy(
+    actor_apply: ActorApply,
+    actor_params: FrozenDict,
+    obs: chex.Array,
+    max_steps: int,
+    eps: float,
+) -> Tuple:
+    """ACT (Graves 2016) halting: halt at the first step N where the summed halting probs
+    reach 1 - eps. The action head reads the mean state sum_n p_n state_n, with p_n = lam_n
+    before N and the remainder R = 1 - sum_{n<N} lam_n at N. Halting is deterministic. The
+    halting head gets gradient through p_n and the ponder cost N + R. Returns `(policy,
+    compute_time, ponder_cost, states_history, per_step_halting_entropy)`."""
+    states, lam, _, step_ent = _replay_all_steps(actor_apply, actor_params, obs, max_steps)
+    before = jnp.cumsum(lam, -1) - lam
+    halted = before >= 1.0 - eps  # steps after N
+    is_halt = (before + lam >= 1.0 - eps) & ~halted
+    remainder = jnp.where(is_halt, 1.0 - before, 0.0)
+    p = jnp.where(halted, 0.0, jnp.where(is_halt, remainder, lam))
+    policy = _action_head(actor_apply, actor_params, jnp.sum(p[..., None] * states, -2))
+    compute_time = jnp.sum(~halted, -1).astype(jnp.float32)
+    ponder_cost = compute_time + jnp.sum(remainder, -1)
+    return policy, compute_time, ponder_cost, states, step_ent
+
+
 def get_distribution_act_fn_with_compute_time(
     config: DictConfig,
     actor_apply: ActorApply,
@@ -82,6 +156,13 @@ def get_distribution_act_fn_with_compute_time(
     def act_fn(
         params: FrozenDict, observation: chex.Array, key: chex.PRNGKey
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+        if config.system.get("halting_loss_type", "pg") == "act":
+            pi, compute_time, _, _, _ = act_policy(
+                actor_apply, params, observation,
+                config.network.actor_network.pre_torso.max_steps, config.system.act_eps,
+            )
+            action = pi.mode() if config.arch.evaluation_greedy else pi.sample(seed=key)
+            return action, compute_time, jnp.full_like(compute_time, -1.0), jnp.zeros_like(compute_time)
         if config.arch.evaluation_greedy:
             pi, compute_time, first_convergence_step, num_close_steps = actor_apply(
                 params, observation, torso_kwargs={"deterministic": True}
@@ -112,6 +193,34 @@ def get_learner_fn(
     # Needed to build the "was this pondering step actually taken" mask used
     # by the optional latent KL penalty below - see `_actor_loss_fn`.
     max_steps = config.network.actor_network.pre_torso.max_steps
+    halting_loss_type = config.system.get("halting_loss_type", "pg")
+    assert halting_loss_type in ("pg", "pondernet", "act"), halting_loss_type
+
+    def _actor_forward(actor_params: FrozenDict, traj_batch: PPOTransition) -> Tuple:
+        """Per-example `(env_log_prob, entropy, new_latent_states, halting_log_prob,
+        per_step_halting_entropy, halting_aux_loss)` for `config.system.halting_loss_type`.
+        For "pondernet"/"act", `halting_aux_loss` replaces the PG halting loss (the
+        returned `halting_log_prob` is just the rollout one, so it has no gradient)."""
+        if halting_loss_type == "pondernet":
+            log_prob, entropy, states, step_ent, kl = pondernet_mixture(
+                actor_apply_fn, actor_params, traj_batch.obs, traj_batch.action, max_steps,
+                config.system.pondernet_prior_lambda,
+            )
+            aux = config.system.pondernet_kl_coef * kl.mean()
+            return log_prob, entropy, states, traj_batch.halting_log_prob, step_ent, aux
+        if halting_loss_type == "act":
+            pi, _, cost, states, step_ent = act_policy(
+                actor_apply_fn, actor_params, traj_batch.obs, max_steps, config.system.act_eps
+            )
+            aux = config.system.act_ponder_cost_coef * cost.mean()
+            log_prob = pi.log_prob(traj_batch.action)
+            return log_prob, pi.entropy(), states, traj_batch.halting_log_prob, step_ent, aux
+        pi, _, states, halting_log_prob, step_ent = actor_apply_fn(
+            actor_params,
+            traj_batch.obs,
+            torso_kwargs={"target_compute_time": traj_batch.compute_time},
+        )
+        return pi.log_prob(traj_batch.action), pi.entropy(), states, halting_log_prob, step_ent, 0.0
 
     def _value_loss_fn(
         pred: chex.Array, behavior: chex.Array, targets: chex.Array, use_expectile: bool = False
@@ -145,13 +254,29 @@ def get_learner_fn(
             ) = learner_state
 
             key, policy_key, halting_key = jax.random.split(key, 3)
-            actor_policy, compute_time, first_convergence_step, num_close_steps = actor_apply_fn(
-                params.actor_params,
-                last_timestep.observation,
-                torso_kwargs={"rng": halting_key},
-            )
+            if halting_loss_type == "act":  # deterministic ACT halting, no convergence stats
+                actor_policy, compute_time, _, _, _ = act_policy(
+                    actor_apply_fn, params.actor_params, last_timestep.observation, max_steps,
+                    config.system.act_eps,
+                )
+                first_convergence_step = jnp.full_like(compute_time, -1.0)
+                num_close_steps = jnp.zeros_like(compute_time)
+            else:
+                actor_policy, compute_time, first_convergence_step, num_close_steps = (
+                    actor_apply_fn(
+                        params.actor_params,
+                        last_timestep.observation,
+                        torso_kwargs={"rng": halting_key},
+                    )
+                )
             action = actor_policy.sample(seed=policy_key)
             env_log_prob = actor_policy.log_prob(action)
+            if halting_loss_type == "pondernet":
+                # Sampling a halt step, then an action, samples the mixture policy.
+                env_log_prob = pondernet_mixture(
+                    actor_apply_fn, params.actor_params, last_timestep.observation, action,
+                    max_steps, config.system.pondernet_prior_lambda,
+                )[0]
 
             # Second replay-mode pass to get halting_log_prob at these same (rollout-time) params,
             # giving PPO a fixed "old" per-step log_prob (the summed scalar is discarded - PPO clips
@@ -263,17 +388,13 @@ def get_learner_fn(
             """Calculate the actor loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
             (
-                actor_policy,
-                _,
+                env_log_prob,
+                entropy,
                 new_latent_states,
                 halting_log_prob,
                 per_step_halting_entropy,
-            ) = actor_apply_fn(
-                actor_params,
-                traj_batch.obs,
-                torso_kwargs={"target_compute_time": traj_batch.compute_time},
-            )
-            env_log_prob = actor_policy.log_prob(traj_batch.action)
+                halting_aux_loss,
+            ) = _actor_forward(actor_params, traj_batch)
 
             if config.system.use_dpo_loss:
                 action_loss = dpo_loss(
@@ -291,7 +412,7 @@ def get_learner_fn(
             action_clip_fraction = jnp.mean(
                 (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
             )
-            entropy = actor_policy.entropy().mean()
+            entropy = entropy.mean()
 
             step_idx = jnp.arange(max_steps)
             valid_step = (step_idx < traj_batch.compute_time[..., None]).astype(jnp.float32)
@@ -317,6 +438,8 @@ def get_learner_fn(
                 )
                 halting_per_step_loss = -jnp.minimum(halting_surrogate1, halting_surrogate2)
             halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
+            if halting_loss_type != "pg":
+                halting_loss = halting_aux_loss
             halting_clip_fraction = (
                 jnp.sum(
                     (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
@@ -554,17 +677,13 @@ def get_learner_fn(
                     # Replay the halting trajectory actually taken during rollout, mirroring
                     # log_prob(traj_batch.action) below.
                     (
-                        actor_policy,
-                        _,
+                        env_log_prob,
+                        entropy,
                         new_latent_states,
                         halting_log_prob,
                         per_step_halting_entropy,
-                    ) = actor_apply_fn(
-                        actor_params,
-                        traj_batch.obs,
-                        torso_kwargs={"target_compute_time": traj_batch.compute_time},
-                    )
-                    env_log_prob = actor_policy.log_prob(traj_batch.action)
+                        halting_aux_loss,
+                    ) = _actor_forward(actor_params, traj_batch)
 
                     if config.system.use_dpo_loss:
                         action_loss = dpo_loss(
@@ -584,7 +703,7 @@ def get_learner_fn(
                             jnp.float32
                         )
                     )
-                    entropy = actor_policy.entropy().mean()
+                    entropy = entropy.mean()
 
                     # `halting_log_prob`/`traj_batch.halting_log_prob`: `(*batch, max_steps)`,
                     # zeroed at forced steps or past the step each example actually halted at.
@@ -623,6 +742,8 @@ def get_learner_fn(
                     # valid steps don't get down-weighted relative to
                     # shorter ones.
                     halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
+                    if halting_loss_type != "pg":
+                        halting_loss = halting_aux_loss
                     halting_clip_fraction = (
                         jnp.sum(
                             (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(
