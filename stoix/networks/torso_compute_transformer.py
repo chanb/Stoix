@@ -214,6 +214,8 @@ class TransformerBlock(nn.Module):
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
+    # Attention-weight dropout in `step`, applied only when `dropout_key` is given.
+    attention_dropout: float = 0.0
 
     def setup(self) -> None:
         qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
@@ -283,8 +285,12 @@ class TransformerBlock(nn.Module):
         step_idx: chex.Array,
         max_steps: int,
         res_scale: Optional[Tuple[chex.Array, chex.Array]] = None,
+        dropout_key: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
+        dropout_key: optional per-example keys `(*batch, 2)`. With
+            `attention_dropout > 0`, the mask is a function of (key, step_idx)
+            only, so the same keys drop the same weights in rollout and replay.
         res_scale: optional `(a1, b1)` - both residuals become `a1 * h + b1 *
             sublayer(norm(h))` instead of `h + sublayer(norm(h))`.
         token: `(*batch, hidden_dim)` - this layer's input at this step.
@@ -309,6 +315,13 @@ class TransformerBlock(nn.Module):
         scores = jnp.einsum("...hd,...khd->...hk", q, cached_keys) * scale
         scores = jnp.where(key_mask, scores, _NEG_INF)
         weights = jax.nn.softmax(scores, axis=-1)
+        if self.attention_dropout > 0.0 and dropout_key is not None:
+            keep_prob = 1.0 - self.attention_dropout
+            mask_fn = lambda k: jax.random.bernoulli(  # noqa: E731
+                jax.random.fold_in(k, step_idx), keep_prob, weights.shape[-2:]
+            )
+            keep = jax.vmap(mask_fn)(dropout_key.reshape(-1, 2)).reshape(weights.shape)
+            weights = jnp.where(keep, weights / keep_prob, 0.0)
         attn_out = jnp.einsum("...hk,...khd->...hd", weights, cached_values)
 
         token = self._residual(token, self.out_proj(attn_out), res_scale)
@@ -392,6 +405,7 @@ class _CoTStep(nn.Module):
     halting_bias_init: float = 0.0
     action_logit_accum: str = "last"
     action_logit_discount: float = 1.0
+    attention_dropout: float = 0.0
 
     @nn.compact
     def __call__(
@@ -421,6 +435,7 @@ class _CoTStep(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            dropout_key,
         ) = carry
         # Prefill positions are never "running": they cannot halt, count as
         # compute, or add halting log prob.
@@ -443,6 +458,7 @@ class _CoTStep(nn.Module):
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
                 self.qkv_dim,
+                self.attention_dropout,
             )
             for _ in range(self.num_layers)
         ]
@@ -487,9 +503,14 @@ class _CoTStep(nn.Module):
         new_cached_keys = []
         new_cached_values = []
         for layer_idx, block in enumerate(blocks):
+            layer_key = None
+            if dropout_key is not None:  # one key stream per layer
+                layer_key = jax.vmap(jax.random.fold_in, (0, None))(
+                    dropout_key.reshape(-1, 2), layer_idx + 1
+                ).reshape(dropout_key.shape)
             x, k, v = block.step(
                 x, cached_keys[layer_idx], cached_values[layer_idx], pos, num_positions,
-                res_scale,
+                res_scale, layer_key,
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
@@ -612,6 +633,7 @@ class _CoTStep(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            dropout_key,
         )
         return new_carry, None
 
@@ -793,6 +815,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     block_init: str = "orthogonal"
     action_logit_accum: str = "last"
     action_logit_discount: float = 1.0
+    attention_dropout: float = 0.0
 
     @nn.compact
     def __call__(
@@ -801,6 +824,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         rng: Optional[chex.PRNGKey] = None,
         target_compute_time: Optional[chex.Array] = None,
         deterministic: bool = False,
+        dropout_key: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, ...]:
         """
         Args:
@@ -817,6 +841,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
             deterministic: if True (and `target_compute_time` is None), halt
                 as soon as the halting probability crosses 0.5 instead of
                 sampling. Useful for greedy evaluation.
+            dropout_key: per-example keys `(*batch, 2)`. With `attention_dropout
+                > 0`, drops attention weights with a mask set by (key, layer,
+                position), so the same keys give the same mask in rollout and
+                replay. `None` (e.g. evaluation, critic) means no dropout.
 
         Returns:
             `(embedding, compute_time, first_convergence_step,
@@ -944,6 +972,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             halting_bias_init=self.halting_bias_init,
             action_logit_accum=self.action_logit_accum,
             action_logit_discount=self.action_logit_discount,
+            attention_dropout=self.attention_dropout,
         )
 
         initial_carry = (
@@ -962,6 +991,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            dropout_key,
         )
         (
             _,
@@ -979,6 +1009,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            _,
         ), _ = cot_step(initial_carry, (jnp.arange(num_positions), step_inputs, inject_inputs))
         if self.action_logit_accum == "mean":
             final_state = final_state / num_steps_taken[..., None]

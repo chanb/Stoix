@@ -214,3 +214,19 @@ def test_concat_input_tokens_makes_one_state_token():
     emb, compute_time, _, _ = torso.apply(params, tokens, rng=jax.random.PRNGKey(2))
     replay_emb = torso.apply(params, tokens, target_compute_time=compute_time)[0]
     np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
+
+
+def test_attention_dropout_same_mask_in_rollout_and_replay():
+    _, obs, params = _setup()
+    torso = TransformerChainOfThoughtTorso(
+        hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS,
+        num_state_tokens=N, sem_group_size=G, attention_dropout=0.5,
+    )
+    keys = jax.random.split(jax.random.PRNGKey(3), 7)
+    emb, ct, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2), dropout_key=keys)
+    replay_emb = torso.apply(params, obs, target_compute_time=ct, dropout_key=keys)[0]
+    np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
+    # No key: no dropout. With a key: the output changes.
+    clean = torso.apply(params, obs, target_compute_time=ct)[0]
+    np.testing.assert_allclose(clean, _setup()[0].apply(params, obs, target_compute_time=ct)[0], atol=1e-6)
+    assert not np.allclose(clean, replay_emb, atol=1e-3)
