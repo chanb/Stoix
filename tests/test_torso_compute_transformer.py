@@ -197,3 +197,20 @@ def test_action_logit_accum_sums_or_averages_taken_states():
         assert not jnp.all(ct == 1)  # some examples take several steps
         np.testing.assert_allclose(emb, expected, atol=1e-5)
         np.testing.assert_allclose(replay_emb, expected, atol=1e-5)
+
+
+def test_concat_input_tokens_makes_one_state_token():
+    # C=4 kernels, each with its own Dense(F -> H/C); the C outputs are concatenated into 1 token.
+    C, F = 4, 30
+    torso = TransformerChainOfThoughtTorso(
+        hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, input_is_tokens=True,
+        concat_input_tokens=True,
+    )
+    tokens = jax.random.normal(jax.random.PRNGKey(0), (7, C, F))
+    params = torso.init(jax.random.PRNGKey(1), tokens, deterministic=True)
+    assert params["params"]["VmapDense_0"]["kernel"].shape == (C, F, H // C)
+    pos_emb = [v for k, v in jax.tree_util.tree_leaves_with_path(params) if "pos" in jax.tree_util.keystr(k)]
+    assert pos_emb[0].shape[0] == MAX_STEPS + 1  # no prefill positions: N = 1
+    emb, compute_time, _, _ = torso.apply(params, tokens, rng=jax.random.PRNGKey(2))
+    replay_emb = torso.apply(params, tokens, target_compute_time=compute_time)[0]
+    np.testing.assert_allclose(emb, replay_emb, atol=1e-5)

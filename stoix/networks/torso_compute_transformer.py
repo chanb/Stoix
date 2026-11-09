@@ -722,7 +722,9 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
     `input_is_tokens` (default `False`) takes an input of shape `(*batch, N,
     F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
-    `num_state_tokens` is not used.
+    `num_state_tokens` is not used. `concat_input_tokens` (default `False`)
+    instead gives each of the N input tokens its own `Dense(F -> hidden_dim /
+    N)` and concatenates the N outputs into 1 state token of width `hidden_dim`.
 
     Three options keep the weight-tied loop stable, so more CoT steps refine the latent
     instead of compounding its scale. All are off by default:
@@ -782,6 +784,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     sem_temperature: float = 1.0
     sem_readout_only: bool = False
     input_is_tokens: bool = False
+    concat_input_tokens: bool = False
     latent_rms_norm: bool = False
     input_injection: bool = False
     residual_scaling: bool = False
@@ -847,7 +850,19 @@ class TransformerChainOfThoughtTorso(nn.Module):
             # `observation` is already `(*batch, N, F)` (e.g. CNN kernel
             # features). One shared Dense maps each token to `hidden_dim`.
             batch_shape, n = observation.shape[:-2], observation.shape[-2]
-            state_tokens = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+            if self.concat_input_tokens:
+                # Token i gets its own Dense(F -> hidden_dim / N); the N outputs make 1 token.
+                assert self.hidden_dim % n == 0, f"hidden_dim ({self.hidden_dim}) % N ({n}) != 0"
+                per_token_dense = nn.vmap(
+                    nn.Dense, in_axes=-2, out_axes=-2,
+                    variable_axes={"params": 0}, split_rngs={"params": True},
+                )
+                state_tokens = per_token_dense(self.hidden_dim // n, kernel_init=self.kernel_init)(
+                    observation
+                ).reshape(batch_shape + (1, self.hidden_dim))
+                n = 1
+            else:
+                state_tokens = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
         else:
             n = self.num_state_tokens
             state_tokens = nn.Dense(n * self.hidden_dim, kernel_init=self.kernel_init)(observation)
