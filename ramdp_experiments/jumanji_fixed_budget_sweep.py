@@ -539,6 +539,8 @@ class Job:
     block_init: str = "orthogonal"
     cnn_tokens: bool = False
     vf_coef: float = 0.5
+    actor_cnn_channels: str = ""  # overrides ENV_CNN_ARCH's actor channel_sizes, e.g. "32,4"
+    extra_overrides: str = ""  # raw space-separated Hydra overrides, appended last
 
     @property
     def group_tag_parts(self) -> List[str]:
@@ -623,6 +625,10 @@ class Job:
             extra.append("rs")
         if self.block_init != "orthogonal":
             extra.append(f"bi{self.block_init}")
+        if self.actor_cnn_channels:
+            extra.append("acnn" + self.actor_cnn_channels.replace(",", "x"))
+        if self.extra_overrides:
+            extra.append(self.extra_overrides.replace(" ", "-"))
         if extra:
             parts.append("-".join(extra))
 
@@ -676,6 +682,11 @@ class Job:
             f"system.max_grad_norm={self.max_grad_norm:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
+            # Keep the final learner state for post-hoc evaluation (ff_ppo.py saves only the
+            # last eval step) in the run dir, not the cwd.
+            "logger.checkpointing.save_model=True",
+            f"logger.checkpointing.save_args.rel_dir={self.output_dir / self.run_name / 'checkpoints'}",
+            "logger.checkpointing.save_args.checkpoint_uid=final",
         ]
         cmd.extend(self.difficulty.overrides)
 
@@ -785,6 +796,7 @@ class Job:
         if is_cnn:
             cnn_arch = ENV_CNN_ARCH[self.env]
             critic_channel_sizes = channel_sizes = ",".join(str(c) for c in cnn_arch["channel_sizes"])
+            channel_sizes = self.actor_cnn_channels or channel_sizes
             critic_kernel_sizes = kernel_sizes = ",".join(str(k) for k in cnn_arch["kernel_sizes"])
             critic_strides = strides = ",".join(str(s) for s in cnn_arch["strides"])
             if "critic_channel_sizes" in cnn_arch:
@@ -820,6 +832,7 @@ class Job:
             # non-CNN architectures - knapsack/maze already declare
             # ConcatObservationWrapper in their yaml (see ENV_HAS_BUILTIN_WRAPPER).
             cmd.append("+env.wrapper._target_=stoa.FlattenObservationWrapper")
+        cmd.extend(self.extra_overrides.split())
         return cmd
 
     def run_dir(self) -> Path:
@@ -1093,6 +1106,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     block_init=args.block_init,
                     cnn_tokens=args.cnn_tokens,
                     vf_coef=args.vf_coef,
+                    actor_cnn_channels=args.actor_cnn_channels,
+                    extra_overrides=" ".join(args.extra_overrides),
                 )
             )
 
@@ -1458,6 +1473,19 @@ def main() -> None:
         help="TransformerChainOfThoughtTorso block_init (transformer arch only): kernel init of the TransformerBlock projections - orthogonal(sqrt(2)) or truncated_normal(1/sqrt(fan_in)). Default orthogonal.",
     )
     parser.add_argument(
+        "--actor-cnn-channels",
+        default="",
+        help="cnn+* only: actor CNN channel sizes, e.g. '32,4' (with --cnn-tokens the last one is "
+        "the number of state tokens). Default: ENV_CNN_ARCH's. The critic CNN is unchanged.",
+    )
+    parser.add_argument(
+        "--extra-overrides",
+        action="append",
+        default=[],
+        help="Raw space-separated Hydra overrides appended to every job's command (and to its "
+        "run name). Repeatable.",
+    )
+    parser.add_argument(
         "--cnn-tokens",
         type=lambda x: x.strip().lower() in ("1", "true", "yes"),
         default=False,
@@ -1582,7 +1610,7 @@ def main() -> None:
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids, or 'auto' to detect via nvidia-smi.")
     parser.add_argument("--runs-per-gpu", type=int, default=2, help="Concurrent runs per GPU.")
     parser.add_argument(
-        "--output-dir", type=Path, default=REPO_ROOT / "results_jumanji_fixed_budget_sweep",
+        "--output-dir", type=Path, default=Path(os.environ.get("SCRATCH", REPO_ROOT)) / "results_jumanji_fixed_budget_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")

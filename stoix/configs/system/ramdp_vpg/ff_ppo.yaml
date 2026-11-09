@@ -73,6 +73,8 @@ halting_loss_type: pg # How the halting head is trained. "pg" (default, original
   # pondernet_prior_lambda)). "act" (Graves 2016): deterministic halting at the first step
   # where summed halting probs reach 1 - act_eps; the action head reads the p_n-weighted mean
   # state; plus act_ponder_cost_coef * (N + R). See ff_ppo.py's pondernet_mixture/act_policy.
+joint_clip: False # "pg" only. True: one PPO ratio/clip over the env action and all halting
+  # decisions (log-probs summed), instead of a separate clip for the action and each halting step.
 pondernet_kl_coef: 0.01 # beta on the KL to the geometric prior ("pondernet" only).
 pondernet_prior_lambda: 0.2 # Geometric prior's per-step halting prob ("pondernet" only).
 act_ponder_cost_coef: 0.01 # tau on ACT's ponder cost N + R ("act" only).

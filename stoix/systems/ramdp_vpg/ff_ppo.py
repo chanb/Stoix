@@ -4,7 +4,8 @@ The actor's torso is an Adaptive Computation Time torso (see
 `stoix.networks.torso_compute`) that samples a "halt now?" decision at each
 pondering step, so `compute_time` is the sampled number of steps taken. The
 halting trajectory is trained alongside the environment action, each with its
-own per-decision PPO ratio/clip.
+own per-decision PPO ratio/clip, or (`config.system.joint_clip`) with one joint
+ratio over the action and all halting decisions.
 
 Compute cost is folded into the discounting rather than the reward: a
 transition that took `C_h` pondering steps is treated as `C_h` elapsed time
@@ -210,6 +211,8 @@ def get_learner_fn(
     assert halting_loss_type in ("pg", "pondernet", "act"), halting_loss_type
     action_logit_accum = config.network.actor_network.pre_torso.get("action_logit_accum", "last")
     action_logit_discount = config.network.actor_network.pre_torso.get("action_logit_discount", 1.0)
+    joint_clip = config.system.get("joint_clip", False)
+    assert not joint_clip or halting_loss_type == "pg", halting_loss_type
     # ACT's action head already reads its own weighted mean of the states.
     assert halting_loss_type != "act" or action_logit_accum == "last", action_logit_accum
 
@@ -413,19 +416,24 @@ def get_learner_fn(
                 halting_aux_loss,
             ) = _actor_forward(actor_params, traj_batch)
 
+            old_log_prob = traj_batch.env_log_prob
+            if joint_clip:  # one PPO ratio over the action and every halting decision
+                env_log_prob = env_log_prob + halting_log_prob.sum(-1)
+                old_log_prob = old_log_prob + traj_batch.halting_log_prob.sum(-1)
+
             if config.system.use_dpo_loss:
                 action_loss = dpo_loss(
                     env_log_prob,
-                    traj_batch.env_log_prob,
+                    old_log_prob,
                     advantage,
                     config.system.dpo_alpha,
                     config.system.dpo_beta,
                 )
             else:
                 action_loss = ppo_clip_loss(
-                    env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
+                    env_log_prob, old_log_prob, advantage, config.system.clip_eps
                 )
-            action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
+            action_ratio = jnp.exp(env_log_prob - old_log_prob)
             action_clip_fraction = jnp.mean(
                 (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
             )
@@ -457,6 +465,8 @@ def get_learner_fn(
             halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
             if halting_loss_type != "pg":
                 halting_loss = halting_aux_loss
+            if joint_clip:
+                halting_loss = 0.0
             halting_clip_fraction = (
                 jnp.sum(
                     (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(jnp.float32)
@@ -702,19 +712,24 @@ def get_learner_fn(
                         halting_aux_loss,
                     ) = _actor_forward(actor_params, traj_batch)
 
+                    old_log_prob = traj_batch.env_log_prob
+                    if joint_clip:  # one PPO ratio over the action and every halting decision
+                        env_log_prob = env_log_prob + halting_log_prob.sum(-1)
+                        old_log_prob = old_log_prob + traj_batch.halting_log_prob.sum(-1)
+
                     if config.system.use_dpo_loss:
                         action_loss = dpo_loss(
                             env_log_prob,
-                            traj_batch.env_log_prob,
+                            old_log_prob,
                             advantage,
                             config.system.dpo_alpha,
                             config.system.dpo_beta,
                         )
                     else:
                         action_loss = ppo_clip_loss(
-                            env_log_prob, traj_batch.env_log_prob, advantage, config.system.clip_eps
+                            env_log_prob, old_log_prob, advantage, config.system.clip_eps
                         )
-                    action_ratio = jnp.exp(env_log_prob - traj_batch.env_log_prob)
+                    action_ratio = jnp.exp(env_log_prob - old_log_prob)
                     action_clip_fraction = jnp.mean(
                         (jnp.abs(action_ratio - 1.0) > config.system.clip_eps).astype(
                             jnp.float32
@@ -761,6 +776,8 @@ def get_learner_fn(
                     halting_loss = jnp.sum(halting_per_step_loss * valid_step) / num_valid_steps
                     if halting_loss_type != "pg":
                         halting_loss = halting_aux_loss
+                    if joint_clip:
+                        halting_loss = 0.0
                     halting_clip_fraction = (
                         jnp.sum(
                             (jnp.abs(halting_ratio - 1.0) > config.system.clip_eps).astype(
