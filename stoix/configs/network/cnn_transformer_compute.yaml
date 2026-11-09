@@ -7,6 +7,7 @@
 # thinking?" decision at each step from a learned probability (see
 # stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso).
 actor_network:
+  input_dropout: 0.0 # Feature-wise dropout on the CNN output; same mask in rollout and update.
   input_layer:
     _target_: stoix.networks.torso.CNNTorso
     channel_sizes: [32, 64]

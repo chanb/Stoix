@@ -76,7 +76,14 @@ from stoix.utils.training import make_learning_rate
 
 
 def _action_head(actor_apply: ActorApply, actor_params: FrozenDict, x: chex.Array) -> Any:
-    return actor_apply(actor_params, x, method=lambda m, x: m.action_head(x))
+    return actor_apply(actor_params, x, method=lambda m, x, **_: m.action_head(x))
+
+
+def _with_dropout(actor_apply: ActorApply, dropout_key: chex.Array) -> ActorApply:
+    """`actor_apply` with the per-example input-dropout keys bound (see
+    `FeedForwardActorWithComputeTime.input_dropout`). Rollout and update bind the same
+    stored keys, so both see the same mask and the PPO ratio is exact."""
+    return lambda params, x, **kw: actor_apply(params, x, dropout_key=dropout_key, **kw)
 
 
 def _replay_all_steps(
@@ -221,21 +228,22 @@ def get_learner_fn(
         per_step_halting_entropy, halting_aux_loss)` for `config.system.halting_loss_type`.
         For "pondernet"/"act", `halting_aux_loss` replaces the PG halting loss (the
         returned `halting_log_prob` is just the rollout one, so it has no gradient)."""
+        actor_apply = _with_dropout(actor_apply_fn, traj_batch.dropout_key)
         if halting_loss_type == "pondernet":
             log_prob, entropy, states, step_ent, kl = pondernet_mixture(
-                actor_apply_fn, actor_params, traj_batch.obs, traj_batch.action, max_steps,
+                actor_apply, actor_params, traj_batch.obs, traj_batch.action, max_steps,
                 config.system.pondernet_prior_lambda, action_logit_accum, action_logit_discount,
             )
             aux = config.system.pondernet_kl_coef * kl.mean()
             return log_prob, entropy, states, traj_batch.halting_log_prob, step_ent, aux
         if halting_loss_type == "act":
             pi, _, cost, states, step_ent = act_policy(
-                actor_apply_fn, actor_params, traj_batch.obs, max_steps, config.system.act_eps
+                actor_apply, actor_params, traj_batch.obs, max_steps, config.system.act_eps
             )
             aux = config.system.act_ponder_cost_coef * cost.mean()
             log_prob = pi.log_prob(traj_batch.action)
             return log_prob, pi.entropy(), states, traj_batch.halting_log_prob, step_ent, aux
-        pi, _, states, halting_log_prob, step_ent = actor_apply_fn(
+        pi, _, states, halting_log_prob, step_ent = actor_apply(
             actor_params,
             traj_batch.obs,
             torso_kwargs={"target_compute_time": traj_batch.compute_time},
@@ -274,16 +282,20 @@ def get_learner_fn(
             ) = learner_state
 
             key, policy_key, halting_key = jax.random.split(key, 3)
+            # fold_in (not a 4-way split) keeps the old RNG stream for runs without dropout.
+            dropout_key = jax.random.fold_in(halting_key, 1)
+            dropout_key = jax.random.split(dropout_key, last_timestep.reward.shape[0])
+            actor_apply = _with_dropout(actor_apply_fn, dropout_key)
             if halting_loss_type == "act":  # deterministic ACT halting, no convergence stats
                 actor_policy, compute_time, _, _, _ = act_policy(
-                    actor_apply_fn, params.actor_params, last_timestep.observation, max_steps,
+                    actor_apply, params.actor_params, last_timestep.observation, max_steps,
                     config.system.act_eps,
                 )
                 first_convergence_step = jnp.full_like(compute_time, -1.0)
                 num_close_steps = jnp.zeros_like(compute_time)
             else:
                 actor_policy, compute_time, first_convergence_step, num_close_steps = (
-                    actor_apply_fn(
+                    actor_apply(
                         params.actor_params,
                         last_timestep.observation,
                         torso_kwargs={"rng": halting_key},
@@ -294,14 +306,14 @@ def get_learner_fn(
             if halting_loss_type == "pondernet":
                 # Sampling a halt step, then an action, samples the mixture policy.
                 env_log_prob = pondernet_mixture(
-                    actor_apply_fn, params.actor_params, last_timestep.observation, action,
+                    actor_apply, params.actor_params, last_timestep.observation, action,
                     max_steps, config.system.pondernet_prior_lambda, action_logit_accum, action_logit_discount,
                 )[0]
 
             # Second replay-mode pass to get halting_log_prob at these same (rollout-time) params,
             # giving PPO a fixed "old" per-step log_prob (the summed scalar is discarded - PPO clips
             # each step individually, see module docstring).
-            _, _, old_latent_states, halting_log_prob, _ = actor_apply_fn(
+            _, _, old_latent_states, halting_log_prob, _ = actor_apply(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_compute_time": compute_time},
@@ -345,6 +357,7 @@ def get_learner_fn(
                 env_log_prob,
                 halting_log_prob,
                 old_latent_states,
+                dropout_key,
             )
             learner_state = RamdpOnPolicyLearnerState(
                 params,
@@ -1094,7 +1107,12 @@ def learner_setup(
             config.network.critic_network.input_layer
         )
 
-    actor_network = Actor(torso=actor_torso, action_head=actor_action_head, **actor_kwargs)
+    actor_network = Actor(
+        torso=actor_torso,
+        action_head=actor_action_head,
+        input_dropout=config.network.actor_network.get("input_dropout", 0.0),
+        **actor_kwargs,
+    )
 
     critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
     critic_network = FeedForwardCritic(torso=critic_torso, critic_head=critic_head, **critic_kwargs)

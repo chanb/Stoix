@@ -21,3 +21,4 @@ class PPOTransition(NamedTuple):
     env_log_prob: chex.Array
     halting_log_prob: chex.Array
     old_latent_states: chex.Array
+    dropout_key: chex.Array  # per-example input-dropout keys (see ff_ppo._with_dropout)

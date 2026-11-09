@@ -19,7 +19,10 @@ left untouched.
 
 from typing import Dict, Optional, Tuple
 
+import chex
 import distrax
+import jax
+import jax.numpy as jnp
 from flax import linen as nn
 
 from stoix.base_types import Observation
@@ -32,6 +35,10 @@ class FeedForwardActorWithComputeTime(nn.Module):
     action_head: nn.Module
     torso: nn.Module
     input_layer: nn.Module = ArrayInput()
+    # Feature-wise dropout rate on the input_layer output. Applied only when `dropout_key`
+    # (one key per example, shape (*batch, 2)) is given, so the same key gives the same mask
+    # in rollout and in the PPO update.
+    input_dropout: float = 0.0
 
     @nn.compact
     def __call__(
@@ -40,9 +47,17 @@ class FeedForwardActorWithComputeTime(nn.Module):
         input_kwargs: Optional[Dict] = None,
         torso_kwargs: Optional[Dict] = None,
         head_kwargs: Optional[Dict] = None,
+        dropout_key: Optional[chex.PRNGKey] = None,
     ) -> Tuple[distrax.DistributionLike, ...]:
 
         obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
+        if self.input_dropout > 0.0 and dropout_key is not None:
+            keep_prob = 1.0 - self.input_dropout
+            feature_shape = obs_embedding.shape[dropout_key.ndim - 1 :]
+            keep = jax.vmap(lambda k: jax.random.bernoulli(k, keep_prob, feature_shape))(
+                dropout_key.reshape(-1, 2)
+            ).reshape(obs_embedding.shape)
+            obs_embedding = jnp.where(keep, obs_embedding / keep_prob, 0.0)
         obs_embedding, *torso_extra = self.torso(obs_embedding, **(torso_kwargs or {}))
         action_distribution = self.action_head(obs_embedding, **(head_kwargs or {}))
 
