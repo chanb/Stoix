@@ -994,7 +994,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 block_init=args.block_init,
                 cnn_tokens=args.cnn_tokens,
                 halting_loss_type=halting_loss_type,
-                extra_overrides=args.extra_overrides,
+                extra_overrides=" ".join(args.extra_overrides),
                 actor_cnn_channels=args.actor_cnn_channels,
             )
         )
@@ -1576,9 +1576,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--extra-overrides",
-        default="",
+        action="append",
+        default=[],
         help="Raw space-separated Hydra overrides appended to every job's command (and to its "
-        "run name), e.g. 'system.pondernet_kl_coef=0.001'.",
+        "run name), e.g. 'system.pondernet_kl_coef=0.001'. Repeatable.",
     )
     parser.add_argument(
         "--halting-loss-type",

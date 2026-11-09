@@ -391,6 +391,7 @@ class _CoTStep(nn.Module):
     block_init: str = "orthogonal"
     halting_bias_init: float = 0.0
     action_logit_accum: str = "last"
+    action_logit_discount: float = 1.0
 
     @nn.compact
     def __call__(
@@ -588,8 +589,9 @@ class _CoTStep(nn.Module):
         num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
         if self.action_logit_accum == "last":
             final_state = jnp.where(halts_this_step[..., None], state, final_state)
-        else:  # running sum of the states of the steps taken
-            final_state = final_state + jnp.where(still_running[..., None], state, 0.0)
+        else:  # running (discounted) sum of the states of the steps taken
+            gamma = self.action_logit_discount if self.action_logit_accum == "discount" else 1.0
+            final_state = jnp.where(still_running[..., None], gamma * final_state + state, final_state)
 
         still_running = all_running & (~halts_this_step)
         current_token = fed_back
@@ -751,9 +753,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
 
     `action_logit_accum` (default `"last"`) sets the embedding the action head
     reads: `"last"` is the state at the halt step, `"sum"`/`"mean"` the sum/mean
-    of the states of all steps taken. With a linear action head, `"sum"` equals
-    adding each step's logits (the bias is added once, not T times), so every
-    step gets a direct gradient from the action loss.
+    of the states of all steps taken, `"discount"` the discounted sum
+    `gamma^(t-1) s_1 + ... + gamma s_(t-1) + s_t` with `gamma = action_logit_discount`.
+    With a linear action head, `"sum"` equals adding each step's logits (the bias
+    is added once, not T times), so every step gets a direct gradient from the
+    action loss.
     """
 
     hidden_dim: int
@@ -785,6 +789,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     alpha_2_init: float = 0.25
     block_init: str = "orthogonal"
     action_logit_accum: str = "last"
+    action_logit_discount: float = 1.0
 
     @nn.compact
     def __call__(
@@ -876,7 +881,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
         halting_log_prob = jnp.zeros(batch_shape)
-        assert self.action_logit_accum in ("last", "sum", "mean"), self.action_logit_accum
+        assert self.action_logit_accum in ("last", "sum", "mean", "discount"), self.action_logit_accum
         final_state = initial_token if self.action_logit_accum == "last" else jnp.zeros_like(initial_token)
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
@@ -923,6 +928,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             block_init=self.block_init,
             halting_bias_init=self.halting_bias_init,
             action_logit_accum=self.action_logit_accum,
+            action_logit_discount=self.action_logit_discount,
         )
 
         initial_carry = (
