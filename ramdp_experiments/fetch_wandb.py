@@ -43,6 +43,8 @@ ABSOLUTE_METRICS = [
 OPTIONAL_METRICS = [
     "actor/solved_episode/mean",
     "evaluator/solved_episode/mean",
+    # Greedy eval on the training distribution (see stoix.utils.make_env.make_train_eval_env).
+    "evaluator/train/episode_discounted_return/mean",
 ]
 OPTIONAL_ABSOLUTE_METRICS = [
     "absolute/solved_episode/mean",
@@ -70,7 +72,8 @@ def cfg_get(c: dict, path: str, default=None):
         if not isinstance(cur, dict) or p not in cur:
             return default
         cur = cur[p]
-    return cur
+    # Some wandb configs store Python None as the string "None"; treat it as missing.
+    return default if cur is None or cur == "None" else cur
 
 
 VOCAB_SIZE_NA = -1  # sentinel: architecture has no vocab_size (only Transformer-ExplicitCoT does)
@@ -192,7 +195,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
     elif project == "sokoban-shallow_cnn":
         run_filter = sokoban_filter
     else:
-        run_filter = lambda c: True
+        run_filter = lambda c: False
     for r in runs:
         c = r.config
         arch_full = cfg_get(c, "network.actor_network.pre_torso._target_")
@@ -363,9 +366,9 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=str)
     args = parser.parse_args()
 
-    print(f"Fetching run list from {args.project} (hidden_dim=64) ...")
+    print(f"Fetching run list from {args.project} ...")
     all_rows = fetch_run_metas(args.project)
-    print(f"  {len(all_rows)} runs match hidden_dim=64")
+    print(f"  {len(all_rows)} runs match")
     deduped = dedupe_latest(all_rows)
     print(f"  {len(deduped)} runs after dedup by full config identity")
 

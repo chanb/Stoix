@@ -1,0 +1,73 @@
+\begin{table}[p]
+\centering
+\caption{
+Hyperparameters used by transformer with iCoT. Values spanning all three environment columns are shared across environments.
+}
+\small
+\begin{tabular}{llccc}
+\toprule
+Category & Hyperparameter & Lightsout & Sliding puzzle & Sokoban \\
+\toprule
+Environment
+  & Grid size & $5\times4$ & $3\times3$ & $10\times10$ \\
+  & Episode length (train) & 10 & 40 & 120 \\
+  & Episode length (eval) & 20 & 80 & 120 \\
+  & Difficulty threshold & 0.5 & -- & -- \\
+  & Scramble moves & -- & 200 & -- \\
+  & Levels (train / eval) & -- & -- & Sokoban unfiltered (train / valid) \\
+\midrule
+Actor
+  & Observation encoder & Flatten & CNN & CNN \\
+  & CNN channels & -- & [8, 8] & [64] \\
+  & CNN kernel sizes & -- & [2, 1] & [3] \\
+  & CNN strides & -- & [1] & [2] \\
+  & CNN output MLP & -- & [64] & [128] \\
+  & Hidden dim & 128 & 16 & 128 \\
+  & MLP dim & 256 & 256 & 512 \\
+  & QKV dim & 256 & 256 & 512 \\
+  & Num.\ heads & 8 & 16 & 16 \\
+  & Num.\ layers & \multicolumn{3}{c}{2} \\
+  & Activation & GELU & ReLU & ReLU \\
+\midrule
+Critic
+  & Architecture & MLP & CNN + MLP & CNN + MLP \\
+  & CNN output MLP & -- & [64] & [128] \\
+  & Layer sizes & [256, 256] & [64, 64] & [128, 128] \\
+  & Activation & \multicolumn{3}{c}{ReLU} \\
+\midrule
+Optimization (PPO)
+  & Actor learning rate & \multicolumn{3}{c}{$3\times10^{-4}$} \\
+  & Critic learning rate & \multicolumn{3}{c}{$3\times10^{-4}$} \\
+  & Actor weight decay & 0.1 & 0.02 & 0.01 \\
+  & Epochs per update & 4 & 4 & 2 \\
+  & Num.\ minibatches & 8 & 8 & 4 \\
+  & Rollout length & 32 & 32 & 20 \\
+  & Discount $\gamma$ & \multicolumn{3}{c}{0.999} \\
+  & GAE $\lambda$ & \multicolumn{3}{c}{0.95} \\
+  & PPO clip $\epsilon$ & \multicolumn{3}{c}{0.2} \\
+  & Clip value loss & False & True & False \\
+  & Value loss & \multicolumn{3}{c}{Expectile} \\
+  & Expectile $\alpha$ & 0.1 & 0.2 & 0.9 \\
+  & Value loss coefficient & \multicolumn{3}{c}{0.5} \\
+  & Entropy coefficient & \multicolumn{3}{c}{0.01} \\
+  & Max.\ grad.\ norm & 0.5 & 0.5 & 5.0 \\
+  & Standardize advantages & \multicolumn{3}{c}{True} \\
+\midrule
+Training budget
+  & Total environment steps & $3\times10^{8}$ & $1\times10^{8}$ & $3\times10^{9}$ \\
+  & Parallel envs & 1024 & 256 & 128 \\
+  & Num.\ updates & 9155 & 12207 & 1171875 \\
+  & Updates per eval & 183 & 244 & 23437 \\
+  & Num.\ seeds & 10 & 10 & 5 \\
+\midrule
+Halting mechanism
+  & Max.\ compute steps & \multicolumn{3}{c}{5} \\
+  & Halting temperature & 5.0 & 1.0 & 1.0 \\
+  & Halting entropy coefficient & 0.01 & 0.001 & 0.01 \\
+  & Halting learning rate & $3\times10^{-4}$ & $3\times10^{-4}$ & $1\times10^{-3}$ \\
+  & Halting weight decay & \multicolumn{3}{c}{0} \\
+  & Clip halting-head gradients & \multicolumn{3}{c}{True} \\
+\bottomrule
+\end{tabular}
+\label{tab:hyperparams_main}
+\end{table}
