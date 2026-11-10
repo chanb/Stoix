@@ -59,7 +59,10 @@ class FeedForwardActorWithComputeTime(nn.Module):
             ).reshape(obs_embedding.shape)
             obs_embedding = jnp.where(keep, obs_embedding / keep_prob, 0.0)
         torso_kwargs = dict(torso_kwargs or {})
-        if dropout_key is not None and getattr(self.torso, "attention_dropout", 0.0) > 0.0:
+        if dropout_key is not None and (
+            getattr(self.torso, "attention_dropout", 0.0) > 0.0
+            or getattr(self.torso, "context_dropout", 0.0) > 0.0
+        ):
             torso_kwargs["dropout_key"] = dropout_key  # see TransformerChainOfThoughtTorso
         obs_embedding, *torso_extra = self.torso(obs_embedding, **torso_kwargs)
         action_distribution = self.action_head(obs_embedding, **(head_kwargs or {}))

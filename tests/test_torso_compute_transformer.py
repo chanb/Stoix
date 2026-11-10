@@ -230,3 +230,26 @@ def test_attention_dropout_same_mask_in_rollout_and_replay():
     clean = torso.apply(params, obs, target_compute_time=ct)[0]
     np.testing.assert_allclose(clean, _setup()[0].apply(params, obs, target_compute_time=ct)[0], atol=1e-6)
     assert not np.allclose(clean, replay_emb, atol=1e-3)
+
+
+def test_context_dropout_hides_state_tokens_and_matches_replay():
+    _, obs, params = _setup()
+    keys = jax.random.split(jax.random.PRNGKey(3), 7)
+    # p=1: every compute step masks the state contexts, so state token 0 has no effect.
+    torso = TransformerChainOfThoughtTorso(
+        hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS,
+        num_state_tokens=N, sem_group_size=G, context_dropout=1.0,
+    )
+    params2 = jax.tree_util.tree_map(lambda x: x, params)
+    params2["params"]["Dense_0"]["kernel"] = params["params"]["Dense_0"]["kernel"].at[:, :H].set(0.0)
+    ct = jnp.full((7,), MAX_STEPS)
+    emb = torso.apply(params, obs, target_compute_time=ct, dropout_key=keys)[0]
+    emb2 = torso.apply(params2, obs, target_compute_time=ct, dropout_key=keys)[0]
+    np.testing.assert_allclose(emb, emb2, atol=1e-6)
+    # No key: no dropout, so state token 0 matters again.
+    assert not np.allclose(torso.apply(params, obs, target_compute_time=ct)[0],
+                           torso.apply(params2, obs, target_compute_time=ct)[0])
+    # p=0.5: same mask in rollout and replay.
+    torso = torso.clone(context_dropout=0.5)
+    emb, ct, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2), dropout_key=keys)
+    np.testing.assert_allclose(emb, torso.apply(params, obs, target_compute_time=ct, dropout_key=keys)[0], atol=1e-5)

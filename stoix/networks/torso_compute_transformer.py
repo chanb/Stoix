@@ -286,8 +286,11 @@ class TransformerBlock(nn.Module):
         max_steps: int,
         res_scale: Optional[Tuple[chex.Array, chex.Array]] = None,
         dropout_key: Optional[chex.Array] = None,
+        context_keep: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
+        context_keep: optional bool `(*batch, 1, max_steps + 1)` - False hides that
+            cache position from attention (see `context_dropout`).
         dropout_key: optional per-example keys `(*batch, 2)`. With
             `attention_dropout > 0`, the mask is a function of (key, step_idx)
             only, so the same keys drop the same weights in rollout and replay.
@@ -310,6 +313,8 @@ class TransformerBlock(nn.Module):
         # True for cache positions written by step `step_idx` or earlier;
         # `key`/`value` for later positions are still zero (not yet written).
         key_mask = jnp.arange(max_steps + 1) <= step_idx
+        if context_keep is not None:
+            key_mask = key_mask & context_keep
         head_dim = q.shape[-1]
         scale = 1.0 / jnp.sqrt(jnp.array(head_dim, dtype=q.dtype))
         scores = jnp.einsum("...hd,...khd->...hk", q, cached_keys) * scale
@@ -406,6 +411,8 @@ class _CoTStep(nn.Module):
     action_logit_accum: str = "last"
     action_logit_discount: float = 1.0
     attention_dropout: float = 0.0
+    # Prob. that a compute step cannot attend to the state-token positions (its own position stays visible).
+    context_dropout: float = 0.0
 
     @nn.compact
     def __call__(
@@ -500,6 +507,16 @@ class _CoTStep(nn.Module):
             # (`a2 * thought + b2 * s`). Step 0 already *is* that token.
             token = jnp.where(pos >= self.num_state_tokens, a2 * token + b2 * inject_token, token)
         x = token + pos_embedding[pos]
+        context_keep = None
+        if self.context_dropout > 0.0 and dropout_key is not None:
+            drop = jax.vmap(  # key stream 0; layers use 1..L
+                lambda k: jax.random.bernoulli(
+                    jax.random.fold_in(jax.random.fold_in(k, 0), pos), self.context_dropout
+                )
+            )(dropout_key.reshape(-1, 2)).reshape(dropout_key.shape[:-1]) & (step_idx >= 0)
+            positions = jnp.arange(num_positions + 1)
+            is_context = (positions < self.num_state_tokens) & (positions != pos)
+            context_keep = ~(drop[..., None, None] & is_context)
         new_cached_keys = []
         new_cached_values = []
         for layer_idx, block in enumerate(blocks):
@@ -510,7 +527,7 @@ class _CoTStep(nn.Module):
                 ).reshape(dropout_key.shape)
             x, k, v = block.step(
                 x, cached_keys[layer_idx], cached_values[layer_idx], pos, num_positions,
-                res_scale, layer_key,
+                res_scale, layer_key, context_keep,
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
@@ -816,6 +833,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     action_logit_accum: str = "last"
     action_logit_discount: float = 1.0
     attention_dropout: float = 0.0
+    context_dropout: float = 0.0
 
     @nn.compact
     def __call__(
@@ -844,7 +862,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
             dropout_key: per-example keys `(*batch, 2)`. With `attention_dropout
                 > 0`, drops attention weights with a mask set by (key, layer,
                 position), so the same keys give the same mask in rollout and
-                replay. `None` (e.g. evaluation, critic) means no dropout.
+                replay. With `context_dropout > 0`, each compute step (per
+                example) hides the state-token cache positions from attention
+                with that prob., set by (key, position). `None` (e.g.
+                evaluation, critic) means no dropout.
 
         Returns:
             `(embedding, compute_time, first_convergence_step,
@@ -973,6 +994,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             action_logit_accum=self.action_logit_accum,
             action_logit_discount=self.action_logit_discount,
             attention_dropout=self.attention_dropout,
+            context_dropout=self.context_dropout,
         )
 
         initial_carry = (
