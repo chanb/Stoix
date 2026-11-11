@@ -66,6 +66,9 @@ halting_ent_coef: 0.0 # Entropy regularisation term for the halting decision's o
   # compute-time before discovering genuine per-example structure. 0.0 (default) disables
   # it exactly, recovering the original ff_ppo.py behaviour. See ff_ppo.py's module
   # docstring.
+halting_ent_value: False # True ("pg" only): halting_ent_coef weighs an entropy RETURN instead
+  # of the mean-H bonus - r_ent = sum_c gamma^(c-1) H(lam_c) per env step, a second linear critic
+  # head V_ent, halting advantage A + halting_ent_coef * A_ent (env action keeps A). See ff_ppo.py.
 halting_loss_type: pg # How the halting head is trained. "pg" (default, original behaviour):
   # per-step PPO surrogate on the sampled halting decisions. "pondernet" (Banino et al. 2021):
   # the policy is the mixture sum_n p_n pi_n(a|s) over halt steps, with PPO on its ratio; the

@@ -16,6 +16,12 @@ steps, so the return recursion is
 The advantage is G - V, with `G` computed via GAE(lambda)
 (`config.system.gae_lambda`) and a plain V-only critic.
 
+`config.system.halting_ent_value=True` ("pg" only) trains the halting head on an entropy-regularized
+return: each env step earns r_ent = sum_c gamma^(c-1) H(lam_c) over its non-forced halting
+decisions, discounted across env steps like the reward. A second linear critic head learns V_ent,
+the halting surrogate uses A + halting_ent_coef * A_ent (the env action keeps A), and the mean-H
+halting bonus is replaced by halting_ent_coef * mean(r_ent) (see `halting_entropy_reward`).
+
 `config.system.halting_loss_type` picks how the halting head is trained: "pg" (the
 per-step PPO/REINFORCE surrogate above), "pondernet" (`pondernet_mixture`) or "act"
 (`act_policy`, which also changes the forward pass to ACT's deterministic halting).
@@ -46,6 +52,7 @@ from stoix.base_types import (
     LearnerFn,
 )
 from stoix.networks.base import FeedForwardCritic
+from stoix.networks.heads import ScalarCriticHeadWithEntValue
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor
 from stoix.networks.torso_compute_transformer import CoTCriticTorso
 from stoix.systems.ramdp_vpg.evaluator import ComputeAwareActFn, evaluator_setup_with_compute_time
@@ -73,6 +80,44 @@ from stoix.utils.loss import (
 from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
+
+
+def halting_entropy_reward(per_step_halting_entropy: chex.Array, gamma: float) -> chex.Array:
+    """r_ent = sum_c gamma^(c-1) H(lam_c) over one env step's halting decisions. The torso already
+    zeroes forced steps and steps after the halt, so at gamma = 1 its mean over N is H(N)."""
+    steps = per_step_halting_entropy.shape[-1]
+    return jnp.sum(per_step_halting_entropy * gamma ** jnp.arange(steps), -1)
+
+
+def targets_and_advantages(
+    r_t: chex.Array,
+    d_t: chex.Array,
+    value: chex.Array,
+    last_val: chex.Array,
+    gae_lambda: float,
+    standardize: bool,
+    r_ent: chex.Array = None,
+    ent_coef: float = 0.0,
+) -> Tuple[chex.Array, chex.Array]:
+    """GAE targets G and advantages A = G - V, all `[B, T]`. With `r_ent` (halting_ent_value),
+    `value`/`last_val` hold [V, V_ent] on a last axis of 2 and the outputs are targets [G, G_ent]
+    and advantages [A, A + ent_coef * A_ent] (env action, halting head)."""
+
+    def gae(r, v, last):
+        v_t = jnp.concatenate([v, last[..., jnp.newaxis]], axis=-1)[:, 1:]
+        _, g = batch_truncated_generalized_advantage_estimation(
+            r, d_t, gae_lambda, v_tm1=v, v_t=v_t, stop_target_gradients=True
+        )
+        return g, g - v
+
+    std = lambda x: jax.nn.standardize(x, axis=(0, 1)) if standardize else x  # noqa: E731
+    if r_ent is None:
+        g, adv = gae(r_t, value, last_val)
+        return g, std(adv)
+    g, adv = gae(r_t, value[..., 0], last_val[..., 0])
+    g_ent, adv_ent = gae(r_ent, value[..., 1], last_val[..., 1])
+    halting_adv = adv + ent_coef * adv_ent
+    return jnp.stack([g, g_ent], -1), jnp.stack([std(adv), std(halting_adv)], -1)
 
 
 def _action_head(actor_apply: ActorApply, actor_params: FrozenDict, x: chex.Array) -> Any:
@@ -222,6 +267,35 @@ def get_learner_fn(
     assert not joint_clip or halting_loss_type == "pg", halting_loss_type
     # ACT's action head already reads its own weighted mean of the states.
     assert halting_loss_type != "act" or action_logit_accum == "last", action_logit_accum
+    ent_value = config.system.get("halting_ent_value", False)
+    assert not ent_value or (halting_loss_type == "pg" and not joint_clip), "halting_ent_value: pg only"
+
+    def _split_advantage(advantage: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        """(env-action advantage, halting advantage) - the same array unless halting_ent_value."""
+        return (advantage[..., 0], advantage[..., 1]) if ent_value else (advantage, advantage)
+
+    def _halting_ent_bonus(per_step_halting_entropy, valid_step, num_valid_steps) -> chex.Array:
+        """What halting_ent_coef multiplies: mean r_ent per env step with halting_ent_value, else
+        the mean Bernoulli entropy over the halting steps taken."""
+        if ent_value:
+            return halting_entropy_reward(per_step_halting_entropy, config.system.gamma).mean()
+        return jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
+
+    def _critic_loss(value, behavior, targets) -> Tuple[chex.Array, dict]:
+        """vf_coef * (value loss [+ V_ent loss with halting_ent_value])."""
+        use_expectile = config.system.use_expectile_value_loss
+        if not ent_value:
+            value_loss = _value_loss_fn(value, behavior, targets, use_expectile=use_expectile)
+            return config.system.vf_coef * value_loss, {"value_loss": value_loss}
+        value_loss = _value_loss_fn(value[..., 0], behavior[..., 0], targets[..., 0], use_expectile)
+        ent_value_loss = _value_loss_fn(value[..., 1], behavior[..., 1], targets[..., 1])
+        info = {
+            "value_loss": value_loss,
+            "ent_value_loss": ent_value_loss,
+            "ent_value": value[..., 1],
+            "ent_target": targets[..., 1],
+        }
+        return config.system.vf_coef * (value_loss + ent_value_loss), info
 
     def _actor_forward(actor_params: FrozenDict, traj_batch: PPOTransition) -> Tuple:
         """Per-example `(env_log_prob, entropy, new_latent_states, halting_log_prob,
@@ -313,7 +387,7 @@ def get_learner_fn(
             # Second replay-mode pass to get halting_log_prob at these same (rollout-time) params,
             # giving PPO a fixed "old" per-step log_prob (the summed scalar is discarded - PPO clips
             # each step individually, see module docstring).
-            _, _, old_latent_states, halting_log_prob, _ = actor_apply(
+            _, _, old_latent_states, halting_log_prob, rollout_step_ent = actor_apply(
                 params.actor_params,
                 last_timestep.observation,
                 torso_kwargs={"target_compute_time": compute_time},
@@ -358,6 +432,7 @@ def get_learner_fn(
                 halting_log_prob,
                 old_latent_states,
                 dropout_key,
+                halting_entropy_reward(rollout_step_ent, config.system.gamma),
             )
             learner_state = RamdpOnPolicyLearnerState(
                 params,
@@ -393,19 +468,17 @@ def get_learner_fn(
         # (see module docstring).
         compute_time = traj_batch.compute_time
         r_t = traj_batch.reward * config.system.gamma ** (compute_time - 1)
-        v_t = jnp.concatenate([traj_batch.value, last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
         not_done = 1.0 - traj_batch.done.astype(jnp.float32)
         d_t = (not_done * config.system.gamma**compute_time).astype(jnp.float32)
-        _, g_targets = batch_truncated_generalized_advantage_estimation(
-            r_t, d_t, config.system.gae_lambda, v_tm1=traj_batch.value, v_t=v_t,
-            stop_target_gradients=True,
-        )
 
-        advantages = g_targets - traj_batch.value  # G - V
-        targets = g_targets
+        def _gae(value: chex.Array, last_val: chex.Array) -> Tuple[chex.Array, chex.Array]:
+            return targets_and_advantages(
+                r_t, d_t, value, last_val, config.system.gae_lambda,
+                config.system.standardize_advantages,
+                traj_batch.ent_reward if ent_value else None, config.system.halting_ent_coef,
+            )
 
-        if config.system.standardize_advantages:
-            advantages = jax.nn.standardize(advantages, axis=(0, 1))
+        targets, advantages = _gae(traj_batch.value, last_val)  # G, G - V
 
         # --- config.system.critic_before_actor machinery (see module docstring) -
         # `_actor_loss_fn`/`_critic_loss_fn` below are exact copies of the ones nested inside the
@@ -428,6 +501,7 @@ def get_learner_fn(
                 per_step_halting_entropy,
                 halting_aux_loss,
             ) = _actor_forward(actor_params, traj_batch)
+            advantage, halting_advantage = _split_advantage(advantage)
 
             old_log_prob = traj_batch.env_log_prob
             if joint_clip:  # one PPO ratio over the action and every halting decision
@@ -457,7 +531,7 @@ def get_learner_fn(
             num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
 
             halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
-            advantage_per_step = advantage[..., None]
+            advantage_per_step = halting_advantage[..., None]
             if config.system.use_dpo_loss:
                 halting_per_step_loss = dpo_surrogate(
                     halting_log_prob,
@@ -492,7 +566,7 @@ def get_learner_fn(
             # (`actor_policy.entropy()` is only the environment action's distribution), so without
             # this nothing keeps the halting policy from collapsing to a degenerate, non-adaptive
             # compute-time before it discovers any genuine per-example structure.
-            halting_entropy = jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
+            halting_entropy = _halting_ent_bonus(per_step_halting_entropy, valid_step, num_valid_steps)
 
             loss_actor = action_loss + halting_loss
 
@@ -514,6 +588,7 @@ def get_learner_fn(
                 "entropy": entropy,
                 "halting_entropy": halting_entropy,
                 "advantages": advantage,
+                "halting_advantages": halting_advantage,
                 "compute_time": traj_batch.compute_time,
                 "first_convergence_step": traj_batch.first_convergence_step,
                 "num_close_steps": traj_batch.num_close_steps,
@@ -531,16 +606,7 @@ def get_learner_fn(
             """Calculate the critic loss (see the identical copy nested in
             the joint `_update_minibatch` below for the full explanation)."""
             value = critic_apply_fn(critic_params, traj_batch.obs)
-            value_loss = _value_loss_fn(
-                value,
-                traj_batch.value,
-                targets,
-                use_expectile=config.system.use_expectile_value_loss,
-            )
-
-            critic_total_loss = config.system.vf_coef * value_loss
-            loss_info = {"value_loss": value_loss}
-            return critic_total_loss, loss_info
+            return _critic_loss(value, traj_batch.value, targets)
 
         def _apply_actor_update(
             params: ActorCriticParams,
@@ -607,20 +673,10 @@ def get_learner_fn(
         ) -> Tuple[chex.Array, chex.Array]:
             """Recompute `targets`/`advantages` from `critic_params`, mirroring the joint path's
             `recompute_advantages` refresh further down."""
-            new_value = critic_apply_fn(critic_params, traj_batch.obs)
-            new_last_val = critic_apply_fn(critic_params, last_timestep.observation)
-
-            v_t = jnp.concatenate([new_value, new_last_val[..., jnp.newaxis]], axis=-1)[:, 1:]
-            _, refreshed_targets = batch_truncated_generalized_advantage_estimation(
-                r_t, d_t, config.system.gae_lambda, v_tm1=new_value, v_t=v_t,
-                stop_target_gradients=True,
+            return _gae(
+                critic_apply_fn(critic_params, traj_batch.obs),
+                critic_apply_fn(critic_params, last_timestep.observation),
             )
-
-            refreshed_advantages = refreshed_targets - new_value
-
-            if config.system.standardize_advantages:
-                refreshed_advantages = jax.nn.standardize(refreshed_advantages, axis=(0, 1))
-            return refreshed_targets, refreshed_advantages
 
         def _update_minibatch_critic_only(train_state: Tuple, batch_info: Tuple) -> Tuple:
             """`critic_before_actor`'s critic-only minibatch step."""
@@ -724,6 +780,7 @@ def get_learner_fn(
                         per_step_halting_entropy,
                         halting_aux_loss,
                     ) = _actor_forward(actor_params, traj_batch)
+                    advantage, halting_advantage = _split_advantage(advantage)
 
                     old_log_prob = traj_batch.env_log_prob
                     if joint_clip:  # one PPO ratio over the action and every halting decision
@@ -759,7 +816,7 @@ def get_learner_fn(
                     num_valid_steps = jnp.maximum(jnp.sum(valid_step), 1.0)
 
                     halting_ratio = jnp.exp(halting_log_prob - traj_batch.halting_log_prob)
-                    advantage_per_step = advantage[..., None]
+                    advantage_per_step = halting_advantage[..., None]
                     if config.system.use_dpo_loss:
                         halting_per_step_loss = dpo_surrogate(
                             halting_log_prob,
@@ -806,8 +863,8 @@ def get_learner_fn(
                     # without this nothing keeps the halting policy from collapsing to a degenerate,
                     # non-adaptive compute-time before it discovers any genuine per-example
                     # structure.
-                    halting_entropy = (
-                        jnp.sum(per_step_halting_entropy * valid_step) / num_valid_steps
+                    halting_entropy = _halting_ent_bonus(
+                        per_step_halting_entropy, valid_step, num_valid_steps
                     )
 
                     loss_actor = action_loss + halting_loss
@@ -833,6 +890,7 @@ def get_learner_fn(
                         "entropy": entropy,
                         "halting_entropy": halting_entropy,
                         "advantages": advantage,
+                        "halting_advantages": halting_advantage,
                         "compute_time": traj_batch.compute_time,
                         "first_convergence_step": traj_batch.first_convergence_step,
                         "num_close_steps": traj_batch.num_close_steps,
@@ -849,18 +907,7 @@ def get_learner_fn(
                 ) -> Tuple:
                     """Calculate the critic loss."""
                     value = critic_apply_fn(critic_params, traj_batch.obs)
-                    value_loss = _value_loss_fn(
-                        value,
-                        traj_batch.value,
-                        targets,
-                        use_expectile=config.system.use_expectile_value_loss,
-                    )
-
-                    critic_total_loss = config.system.vf_coef * value_loss
-                    loss_info = {
-                        "value_loss": value_loss,
-                    }
-                    return critic_total_loss, loss_info
+                    return _critic_loss(value, traj_batch.value, targets)
 
                 actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
                 actor_grads, actor_loss_info = actor_grad_fn(
@@ -942,24 +989,11 @@ def get_learner_fn(
                 # rollout-time bootstrap across every epoch would leave the critic regressing
                 # towards a target built from an increasingly stale value function as the critic
                 # itself moves epoch to epoch.
-                new_value = critic_apply_fn(params.critic_params, traj_batch.obs)
-                new_last_val = critic_apply_fn(params.critic_params, last_timestep.observation)
-
-                v_t = jnp.concatenate(
-                    [new_value, new_last_val[..., jnp.newaxis]], axis=-1
-                )[:, 1:]
-                _, targets = batch_truncated_generalized_advantage_estimation(
-                    r_t, d_t, config.system.gae_lambda, v_tm1=new_value, v_t=v_t,
-                    stop_target_gradients=True,
+                # Both terms of G - V are this epoch's fresh critic output.
+                targets, advantages = _gae(
+                    critic_apply_fn(params.critic_params, traj_batch.obs),
+                    critic_apply_fn(params.critic_params, last_timestep.observation),
                 )
-
-                # Both terms of G - V are this epoch's fresh critic output:
-                # `new_value` for V, and `targets` above (itself bootstrapped
-                # off `new_value`/`new_last_val`) for G.
-                advantages = targets - new_value
-
-                if config.system.standardize_advantages:
-                    advantages = jax.nn.standardize(advantages, axis=(0, 1))
 
             update_state = (
                 params,
@@ -1115,6 +1149,8 @@ def learner_setup(
     )
 
     critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
+    if config.system.get("halting_ent_value", False):  # outputs [V, V_ent]
+        critic_head = ScalarCriticHeadWithEntValue(value_head=critic_head)
     critic_network = FeedForwardCritic(torso=critic_torso, critic_head=critic_head, **critic_kwargs)
 
     actor_lr = make_learning_rate(

@@ -135,6 +135,19 @@ class ScalarCriticHead(nn.Module):
         return nn.Dense(1, kernel_init=self.kernel_init)(embedding).squeeze(axis=-1)
 
 
+class ScalarCriticHeadWithEntValue(nn.Module):
+    """`value_head`'s V plus a linear V_ent head (halting entropy value, see ff_ppo
+    `halting_ent_value`) on the same critic embedding; returns `[..., 2]` = [V, V_ent]."""
+
+    value_head: nn.Module
+    kernel_init: Initializer = orthogonal(1.0)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+        ent_value = nn.Dense(1, kernel_init=self.kernel_init)(embedding).squeeze(axis=-1)
+        return jnp.stack([self.value_head(embedding), ent_value], axis=-1)
+
+
 class CategoricalCriticHead(nn.Module):
 
     num_atoms: int = 601
