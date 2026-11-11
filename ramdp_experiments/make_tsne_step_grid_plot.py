@@ -4,6 +4,7 @@ coloured by compute time and by shortest-path hardness.
 """
 
 import pickle
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -37,9 +38,8 @@ def perplexity_for(n):
 
 
 def main():
-    # envs = [load_plot_data("lightsout"), load_plot_data("slidingpuzzle")]
-    # envs = [load_plot_data("slidingpuzzle")]
-    envs = [load_plot_data("lightsout")]
+    # Usage: make_tsne_step_grid_plot.py [OUT.png [plot_data name ...]], e.g. OUT.png slidingpuzzle-bankfinal
+    envs = [load_plot_data(n) for n in sys.argv[2:] or ["lightsout"]]
     max_steps = envs[0]["max_steps"]
     assert all(env["max_steps"] == max_steps for env in envs), (
         "make_tsne_step_grid_plot.py assumes both environments share the same "
@@ -162,7 +162,7 @@ def main():
             )
 
     # fig.suptitle("t-SNE of CoT step latent states", y=0.98)
-    out_path = HERE / "analysis-tsne_step_grid.png"
+    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "analysis-tsne_step_grid.png"
     fig.savefig(out_path, dpi=600, format="png")
     print(f"Saved {out_path}")
 

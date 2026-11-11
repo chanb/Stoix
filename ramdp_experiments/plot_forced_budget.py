@@ -15,10 +15,15 @@ HERE = Path(__file__).resolve().parent
 plt.rcParams.update(base.pgf_with_latex)
 
 out = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "analysis-forced_budget-cnn16x4.pdf"
-Ns = sys.argv[2:] or ["1", "4", "8"]
 ENVS = [("lightsout", "Lightsout"), ("slidingpuzzle", "Sliding puzzle")]
+args = sys.argv[2:]
+if args[:1] == ["--env"]:  # one model/env only, e.g. --env slidingpuzzle-bankfinal var
+    ENVS = [(args[1], "Lightsout" if args[1].startswith("lightsout") else "Sliding puzzle")]
+    args = args[2:]
+Ns = args or ["1", "4", "8"]
 w, h = base.set_size(base.doc_width_pt, fraction=0.95, subplots=(1, 2))
-fig, axes = plt.subplots(2, len(Ns), figsize=(w * len(Ns) / 2, 2 * h), squeeze=False, sharex="row", sharey=True)
+fig, axes = plt.subplots(len(ENVS), len(Ns), figsize=(w * max(len(Ns), 2) / 2, len(ENVS) * h), squeeze=False,
+                         sharex="row", sharey=True)
 cmap = plt.get_cmap("viridis")
 # Per budget c (index 0 = own halting): dash pattern and marker, on top of colour.
 LINESTYLES = ["-", "-", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), "-", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1))]
@@ -39,7 +44,7 @@ for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
             if split == "test":  # test hardness range is disjoint from (above) train's
                 ax.axvspan(df["hardness"].min() - 0.5, df["hardness"].max() + 0.5, color="gray", alpha=0.12, lw=0)
                 ax.text(df["hardness"].min() - 0.3, 0.03, "test", fontsize=7, color="gray")
-        ax.set_title(f"{title}, adaptive $N\\in[1,8]$" if N == "var" else f"{title}, trained $N={N}$")
+        ax.set_title(f"{title}, adaptive $N\\in[1,{df['c'].max()}]$" if N == "var" else f"{title}, trained $N={N}$")
         ax.set_ylim(-0.02, 1.02)
         ax.grid(True, alpha=0.3)
         ax.set_xlabel("Shortest path length")
