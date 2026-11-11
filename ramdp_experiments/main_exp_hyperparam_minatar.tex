@@ -21,7 +21,7 @@ Env.
 \midrule
 Actor
   & Observation encoder & Flatten & CNN & CNN & CNN \\
-  & CNN channels & -- & [8, 8] & [64] & [32, 8] \\
+  & CNN channels & -- & [8, 8] & [64] & [32, 64] \\
   & CNN kernel sizes & -- & [2, 1] & [3] & [3, 3] \\
   & CNN strides & -- & [1] & [2] & [1, 1] \\
   & CNN output MLP & -- & [64] & [128] & [128] \\
@@ -30,14 +30,14 @@ Actor
   & QKV dim & 256 & 256 & 512 & 64 \\
   & Num.\ heads & 8 & 16 & 16 & 4 \\
   & Num.\ layers & \multicolumn{4}{c}{2} \\
-  & Activation & GELU & ReLU & ReLU & GELU \\
+  & Activation & GELU & ReLU & ReLU & ReLU \\
 \midrule
 Critic
   & Architecture & MLP & CNN + MLP & CNN + MLP & CNN + MLP \\
   & CNN channels & -- & [8, 8] & [64] & [32, 64] \\
-  & CNN output MLP & -- & [64] & [128] & -- \\
-  & Layer sizes & [256, 256] & [64, 64] & [128, 128] & [256]$\times$3 \\
-  & Activation & ReLU & ReLU & ReLU & GELU \\
+  & CNN output MLP & -- & [64] & [128] & [128] \\
+  & Layer sizes & [256, 256] & [64, 64] & [128, 128] & [256, 256] \\
+  & Activation & \multicolumn{4}{c}{ReLU} \\
 \midrule
 PPO
   & Actor learning rate & \multicolumn{4}{c}{$3\times10^{-4}$} \\
@@ -46,7 +46,7 @@ PPO
   & Epochs per update & 4 & 4 & 2 & 4 \\
   & Num.\ minibatches & 8 & 8 & 4 & 8 \\
   & Rollout length & 32 & 32 & 20 & 64 \\
-  & Discount $\gamma$ & \multicolumn{4}{c}{0.999} \\
+  & Discount $\gamma$ & 0.999 & 0.999 & 0.999 & 0.99999 \\
   & GAE $\lambda$ & \multicolumn{4}{c}{0.95} \\
   & PPO clip $\epsilon$ & \multicolumn{4}{c}{0.2} \\
   & Clip value loss & False & True & False & False \\
