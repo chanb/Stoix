@@ -93,7 +93,28 @@ def forced_act_fn(actor, c):
 TEST_MAX_STEPS = {"lightsout": 20, "slidingpuzzle": 40}  # eval_episode_length / eval time_limit
 
 
-def build(name, ckpt=None, split="train"):
+FIXED_CKPT = {  # fixed budget N twins of RUNS; best seed by final evaluator/train/episode_discounted_return
+    ("lightsout", 1): f"{SEM}/lightsout_cnn16x4concat_clip0.2_noresscale_nosem_acclast-sum_fixed_do0.0/last_N1_seed_{{}}/checkpoints",
+    ("lightsout", 4): f"{SEM}/lightsout_cnn16x4concat_clip0.2_noresscale_nosem_acclast-sum_fixed_do0.0/last_N4_seed_{{}}/checkpoints",
+    ("slidingpuzzle", 1): f"{SEM}/slidingpuzzle3x3_cnn16x4concat_clip0.2_acclast_fixed_do0.0/slidingtile_bank-bank-gs3-ppo_reinf-cnn+TF-iCoT-b1-g0.999-hd128-lr0.0003-clr0.0003-ec0.01-mgn1-nl2-nh4-md512-39e20ab8-seed_{{}}/checkpoints",
+    ("slidingpuzzle", 4): f"{SEM}/slidingpuzzle3x3_cnn16x4concat_clip0.2_acclast_fixed_do0.0/slidingtile_bank-bank-gs3-ppo_reinf-cnn+TF-iCoT-b4-g0.999-hd128-lr0.0003-clr0.0003-ec0.01-mgn1-nl2-nh4-md512-da3ac6f7-seed_{{}}/checkpoints",
+}
+
+
+def pad_pos_embedding(params, max_steps):
+    """Grow a N-step model's pos_embedding ((N+1, d), rows 0..N-1 trained) to max_steps+1 rows, reusing
+    the last trained row (step N-1) for every step past N, so the 8-step module can run it for c > N."""
+
+    def pad(path, x):
+        if "pos_embedding" not in jax.tree_util.keystr(path) or x.shape[0] >= max_steps + 1:
+            return x
+        n = x.shape[0] - 1
+        return jnp.concatenate([x[:n], jnp.repeat(x[n - 1 : n], max_steps + 1 - n, axis=0)])
+
+    return jax.tree_util.tree_map_with_path(pad, params)
+
+
+def build(name, ckpt=None, split="train", train_steps=8):
     run = RUNS[name]
     with initialize_config_dir(config_dir=str(REPO_ROOT / "stoix/configs/default/anakin"), version_base="1.2"):
         config = compose("default_ramdp_ff_ppo.yaml", overrides=(COMMON + " " + run["overrides"]).split())
@@ -104,12 +125,13 @@ def build(name, ckpt=None, split="train"):
         config.system.action_dim = num_actions
 
     a, c = config.network.actor_network, config.network.critic_network
-    actor = Actor(
+    make_actor = lambda steps: Actor(
         input_layer=hydra.utils.instantiate(a.input_layer),
-        torso=hydra.utils.instantiate(a.pre_torso),
+        torso=hydra.utils.instantiate(a.pre_torso, max_steps=steps, min_steps=1),
         action_head=hydra.utils.instantiate(a.action_head, action_dim=num_actions),
         input_dropout=a.get("input_dropout", 0.0),
     )
+    actor, ckpt_actor = make_actor(a.pre_torso.max_steps), make_actor(train_steps)
     critic = FeedForwardCritic(
         input_layer=hydra.utils.instantiate(c.input_layer),
         torso=hydra.utils.instantiate(c.pre_torso),
@@ -117,11 +139,12 @@ def build(name, ckpt=None, split="train"):
     )
     x = jax.tree_util.tree_map(lambda v: v[None], env.observation_space().generate_value())
     k1, k2 = jax.random.split(jax.random.PRNGKey(0))
-    params = ActorCriticParams(actor.init(k1, x, torso_kwargs={"rng": k1}), critic.init(k2, x))
+    params = ActorCriticParams(ckpt_actor.init(k1, x, torso_kwargs={"rng": k1}), critic.init(k2, x))
     params, _ = Checkpointer(model_name="ramdp_ff_ppo", rel_dir=ckpt or run["ckpt"], checkpoint_uid="final").restore_params(
         input_params=params
     )
-    return env, get_distribution_act_fn_with_compute_time(config, actor.apply), params.actor_params, actor
+    actor_params = pad_pos_embedding(params.actor_params, a.pre_torso.max_steps)
+    return env, get_distribution_act_fn_with_compute_time(config, actor.apply), actor_params, actor
 
 
 def rollout(env, act_fn, params, max_steps, get_board, get_goal):
