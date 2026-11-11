@@ -56,7 +56,7 @@ def objective(theta, row, n, g, adv, method, slack, rho):
 
 def exact_eval(params, a):
     """Exact E[G_root], P(correct chain), and mean action-head P(correct | enough compute)."""
-    theta, _, phi = params
+    theta, phi = params[0], params[2]
     p = jnp.exp(log_halt_dist(theta)[0])
     M = a.chains
     pi = jax.nn.softmax(phi)
@@ -68,10 +68,16 @@ def exact_eval(params, a):
     return jnp.stack([g, (p[:S] * p_ok).sum(-1).mean(), knows.mean()])
 
 
-def run(method, rho, a, seed):
+def run(method, rho, a, seed, ent_mode="none", ent_coef=0.0):
+    """ent_mode (bootstrapped mode only): "none"; "step" = Stoix halting_ent_coef (mean Bernoulli
+    entropy over visited halting decisions); "value" = entropy return V_ent, with per-env-step reward
+    r_ent = sum_{c<=N, c<C} gamma^(c-1) H(lam_c), discounted across env steps like the reward, its own
+    critic, and halting advantage A + ent_coef * A_ent (plus the direct grad of r_ent)."""
     M, L, B = a.chains, a.chain_len, a.batch
-    # halting rows: S roots, L chain steps; V: S roots, (chain step, correct?); action rows: (s, c) pairs + "unknown"
-    params = (jnp.zeros((S + L, C - 1)), jnp.zeros(S + 2 * L), jnp.zeros((S * M + 1, M)))
+    assert ent_mode == "none" or a.rollout, "entropy modes need --rollout > 0"
+    # halting rows: S roots, L chain steps; V: S roots, (chain step, correct?); action rows: (s, c) pairs
+    # + "unknown"; V_ent like V
+    params = (jnp.zeros((S + L, C - 1)), jnp.zeros(S + 2 * L), jnp.zeros((S * M + 1, M)), jnp.zeros(S + 2 * L))
     opt = optax.adam(a.lr)
 
     def act(phi, key, s, n):
@@ -98,7 +104,7 @@ def run(method, rho, a, seed):
         b = jax.ops.segment_sum(g, row, S + L) / jnp.maximum(jax.ops.segment_sum(jnp.ones_like(g), row, S + L), 1)
         adv = g - b[row]
         root_adv = adv.reshape(B, L + 1)[:, 0]
-        return row, n, g, adv, action_obj(params[2], arow, action, root_adv), 0.0
+        return row, n, g, adv, action_obj(params[2], arow, action, root_adv), 0.0, 0.0
 
     def env_step(params, env, key):  # continuing env; env = (phase, s, correct); phase 0 = root
         phase, s, correct = env
@@ -118,32 +124,45 @@ def run(method, rho, a, seed):
             lambda e, k: env_step(params, e, k), env, jax.random.split(key, a.rollout)
         )
         phase, s, correct = env
-        V = jax.lax.stop_gradient(params[1])
-        last_v = V[jnp.where(phase == 0, s, S + 2 * (phase - 1) + correct)]
-        v = V[vrow]
-        r_t = r * a.gamma ** (n - 1)
+        last_vrow = jnp.where(phase == 0, s, S + 2 * (phase - 1) + correct)
         d_t = a.gamma**n * (1 - done)
-        v_next = jnp.concatenate([v[1:], last_v[None]], 0)
-        delta = r_t + d_t * v_next - v
 
-        def gae(adv, x):
-            delta, d = x
-            adv = delta + d * a.gae_lambda * adv
-            return adv, adv
+        def gae(r_t, V):  # -> (advantage, critic loss)
+            Vs = jax.lax.stop_gradient(V)
+            v = Vs[vrow]
+            delta = r_t + d_t * jnp.concatenate([v[1:], Vs[last_vrow][None]], 0) - v
 
-        _, adv = jax.lax.scan(gae, jnp.zeros_like(last_v), (delta, d_t), reverse=True)
-        target = adv + v
-        critic_loss = jnp.mean((params[1][vrow] - target) ** 2)
+            def f(adv, x):
+                adv = x[0] + x[1] * a.gae_lambda * adv
+                return adv, adv
+
+            _, adv = jax.lax.scan(f, jnp.zeros_like(v[0]), (delta, d_t), reverse=True)
+            return adv, jnp.mean((V[vrow] - (adv + v)) ** 2)
+
+        adv, critic_loss = gae(r * a.gamma ** (n - 1), params[1])
+        target = adv + params[1][vrow]
+        x = params[0][row]  # halting logits of the visited rows [T, B, C-1]
+        H = jax.nn.softplus(x) - x * jax.nn.sigmoid(x)  # Bernoulli entropy of each decision
+        visited = jnp.arange(C - 1) < n[..., None]  # decisions at steps 1..min(N, C-1)
+        ent_obj, halt_adv = 0.0, adv
+        if ent_mode == "step":
+            ent_obj = ent_coef * jnp.sum(H * visited) / jnp.maximum(visited.sum(), 1)
+        if ent_mode == "value":
+            r_ent = jnp.sum(a.gamma ** jnp.arange(C - 1) * H * visited, -1)
+            adv_ent, ent_critic_loss = gae(jax.lax.stop_gradient(r_ent), params[3])
+            halt_adv = adv + ent_coef * adv_ent  # the action head keeps the plain advantage
+            ent_obj = ent_coef * jnp.mean(r_ent)  # direct gradient of this step's entropy reward
+            critic_loss = critic_loss + ent_critic_loss
         a_obj = action_obj(params[2], arow, action, adv * is_root) * is_root.size / jnp.maximum(is_root.sum(), 1)
-        return row.ravel(), n.ravel(), target.ravel(), adv.ravel(), a_obj, critic_loss, env
+        return row.ravel(), n.ravel(), target.ravel(), halt_adv.ravel(), a_obj, ent_obj, critic_loss, env
 
     def loss(params, key, env):
         if a.rollout:
-            row, n, g, adv, a_obj, critic_loss, env = td_batch(params, key, env)
+            row, n, g, adv, a_obj, ent_obj, critic_loss, env = td_batch(params, key, env)
         else:
-            row, n, g, adv, a_obj, critic_loss = mc_batch(params, key)
+            row, n, g, adv, a_obj, ent_obj, critic_loss = mc_batch(params, key)
         halt_obj = objective(params[0], row, n, g, adv, method, a.slack, rho)
-        return -(halt_obj + a_obj) + critic_loss, env
+        return -(halt_obj + a_obj + ent_obj) + critic_loss, env
 
     def step(carry, key):
         params, opt_state, env = carry
@@ -172,10 +191,17 @@ def main():
     ap.add_argument("--iters", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=1024)  # episodes (MC) or parallel envs (bootstrapped)
     ap.add_argument("--lr", type=float, default=0.03)
+    ap.add_argument("--compare", choices=["loss", "ent"], default="loss")  # halting losses, or PG entropy terms
+    ap.add_argument("--ent-coefs", type=float, nargs="+", default=[0.01, 0.1])
     ap.add_argument("--out", default="plots/halt_bandit.png")
     a = ap.parse_args()
-    methods = [("pg", 0, "PG"), ("as_written", 0, "as written (fail w=-1)"),
-               ("bounded", 1.0, "bounded, rho=1"), ("bounded", 9.0, "bounded, rho=9")]
+    if a.compare == "loss":
+        methods = [("pg", 0, "PG", "none", 0.0), ("as_written", 0, "as written (fail w=-1)", "none", 0.0),
+                   ("bounded", 1.0, "bounded, rho=1", "none", 0.0), ("bounded", 9.0, "bounded, rho=9", "none", 0.0)]
+    else:  # PG with halting entropy terms
+        methods = [("pg", 0, "PG, no entropy", "none", 0.0)] + [
+            ("pg", 0, f"PG + {mode} entropy {cf}", mode, cf) for mode in ("step", "value") for cf in a.ent_coefs
+        ]
 
     p_ok = lambda n, k: np.where(n >= k, 1.0, 1 / a.chains)
     v = np.array([[a.gamma**n * p_ok(n, k) for n in range(1, C + 1)] for k in range(1, S + 1)])
@@ -183,12 +209,13 @@ def main():
     best = [(v.max(1) * a.gamma**a.chain_len).mean(), np.mean([p_ok(n, k) for n, k in zip(best_n, range(1, S + 1))]), 1.0]
 
     fig, ax = plt.subplots(1, 5, figsize=(25, 4.5))
-    for j, (m, rho, label) in enumerate(methods):
-        res = [run(m, rho, a, sd) for sd in range(a.seeds)]
+    for j, (m, rho, label, ent_mode, ent_coef) in enumerate(methods):
+        res = [run(m, rho, a, sd, ent_mode, ent_coef) for sd in range(a.seeds)]
+        print(f"{label:24s} per-seed E[N | k=8] = {np.round([r[1][-1] for r in res], 2)}")
         hist = np.mean([r[0] for r in res], 0)
         e0, ec = np.mean([r[1] for r in res], 0), np.mean([r[2] for r in res], 0)
         c = f"C{j}"
-        ax[0].plot(K, e0, "o-", color=c, label=label)
+        ax[0].plot(K, e0, "o-", color=f"C{j}", label=label)
         ax[1].plot(np.arange(1, a.chain_len + 1), ec, "o-", color=c)
         for i in range(3):
             ax[2 + i].plot(hist[:, i], color=c)
