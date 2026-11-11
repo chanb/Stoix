@@ -192,7 +192,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
     elif project == "sokoban-shallow_cnn":
         run_filter = sokoban_filter
     else:
-        run_filter = lambda c: True
+        run_filter = lambda c: False  # filters return True = exclude; keep everything
     for r in runs:
         c = r.config
         arch_full = cfg_get(c, "network.actor_network.pre_torso._target_")
@@ -220,6 +220,7 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         halting_ent_coef_raw = cfg_get(c, "system.halting_ent_coef")
         actor_lr_raw = cfg_get(c, "system.actor_lr")
         halting_lr_raw = cfg_get(c, "system.halting_lr")
+        halting_lr_raw = None if str(halting_lr_raw) == "None" else halting_lr_raw
         # Default True matches stoix/configs/system/ramdp_vpg/ff_ppo.yaml.
         clip_halting_head = str(cfg_get(c, "system.clip_halting_head", True)) == "True"
         out.append(

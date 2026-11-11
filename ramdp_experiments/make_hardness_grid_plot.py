@@ -180,14 +180,11 @@ def main():
     }
 
     nrows = 1
-    ncols = 4
+    ncols = 2
     # doc_width_in = doc_width_pt / 72.27
     # fig, axes = plt.subplots(nrows, ncols, figsize=(doc_width_in * 1.3, doc_width_in * 0.42))
     figsize = set_size(doc_width_pt, fraction=0.95, subplots=(nrows, ncols), use_golden_ratio=False)
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
-
-    lightsout_actions, lightsout_step_compute_time = load_step_actions("lightsout")
-    slidingpuzzle_actions, slidingpuzzle_step_compute_time = load_step_actions("slidingpuzzle")
 
     handles = plot_violin_panel(
         axes[0],
@@ -197,26 +194,9 @@ def main():
     )
     plot_violin_panel(
         axes[1],
-        lightsout_actions,
-        lightsout_step_compute_time,
-        xlabel="Action (button)",
-        categorical=True,
-    )
-    # 20 buttons don't fit as individual tick labels in a quarter-width panel.
-    axes[1].set_xticks([0, 5, 10, 15])
-    plot_violin_panel(
-        axes[2],
         slidingpuzzle["hardness"],
         slidingpuzzle["first_step_compute_time"],
         xlabel="Shortest path length",
-    )
-    plot_violin_panel(
-        axes[3],
-        slidingpuzzle_actions,
-        slidingpuzzle_step_compute_time,
-        xlabel="Action",
-        categorical=True,
-        xticklabels=SLIDINGPUZZLE_ACTION_NAMES,
     )
     axes[0].set_ylabel("Compute steps")
 
@@ -233,7 +213,7 @@ def main():
     GROUP_TITLE_GAP_IN = 0.07  # group titles' bottom edge above the figure box
     GROUP_TITLE_HEIGHT_IN = 0.2  # room the legend leaves for the group titles
     fig_h = fig.get_figheight()
-    PANEL_GROUPS = [("Lightsout", [0, 1]), ("Sliding puzzle", [2, 3])]
+    PANEL_GROUPS = [("Lightsout", [0]), ("Sliding puzzle", [1])]
     for title, cols in PANEL_GROUPS:
         x0 = min(axes[i].get_position().x0 for i in cols)
         x1 = max(axes[i].get_position().x1 for i in cols)
