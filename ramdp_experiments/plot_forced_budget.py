@@ -32,8 +32,9 @@ if FRAC:
     figsize = base.set_size(base.doc_width_pt, fraction=FRAC, subplots=(len(ENVS), len(Ns)))
 fig, axes = plt.subplots(len(ENVS), len(Ns), figsize=figsize, squeeze=False, sharex="row", sharey=True)
 S = 0.5 if FRAC else 1.0  # line/marker scale
-cmap = plt.get_cmap("viridis")
-# Per budget c (index 0 = own halting): dash pattern and marker, on top of colour.
+# Per budget c (index 0 = own halting): colour from the dataviz skill's validated 8-slot categorical palette in
+# fixed order (viridis neighbours were indistinguishable), plus dash pattern and marker as secondary encoding.
+COLORS = ["black", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 LINESTYLES = ["-", "-", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), "-", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1))]
 MARKERS = ["o", "o", "s", "^", "v", "D", "P", "X", "*"]
 for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
@@ -44,11 +45,17 @@ for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
                 s = g.groupby("hardness")["solved"].agg(["mean", "size"])
                 s = s[s["size"] >= 100]  # drop near-empty bins (e.g. sliding test length 31)
                 half = 1.96 * np.sqrt(s["mean"] * (1 - s["mean"]) / s["size"])
-                color = cmap((c - 1) / 7) if c else "black"  # c=0: the adaptive model's own halting
+                color = COLORS[c]  # c=0: the adaptive model's own halting
                 label = (f"$c={c}$" if c else "own halting") if split == "train" else None
-                ax.plot(s.index, s["mean"], ls=LINESTYLES[c], marker=MARKERS[c], ms=2.5 * S, mew=0.6 * S, mfc="none",
-                        lw=(2 if str(c) == N or not c else 1) * S, color=color, label=label, zorder=3 if not c else 2)
-                ax.fill_between(s.index, s["mean"] - half, s["mean"] + half, color=color, alpha=0.2, lw=0)
+                if not c:  # wide, light reference line underneath, so it does not hide the budget lines
+                    ax.plot(s.index, s["mean"], color="black", alpha=0.25, lw=2.4 * S, label=label, zorder=1,
+                            solid_capstyle="round")
+                    continue
+                ax.plot(s.index, s["mean"], ls=LINESTYLES[c], marker=MARKERS[c], ms=2.5 * S, mew=0.5 * S, mfc="none",
+                        markevery=2 if FRAC else 1, lw=(1.6 if str(c) == N else 0.8) * S, color=color, label=label,
+                        zorder=2)
+                if not FRAC:  # at 0.3 linewidth the CI bands smear the lines together
+                    ax.fill_between(s.index, s["mean"] - half, s["mean"] + half, color=color, alpha=0.15, lw=0)
             if split == "test":  # test hardness range is disjoint from (above) train's
                 ax.axvspan(df["hardness"].min() - 0.5, df["hardness"].max() + 0.5, color="gray", alpha=0.12, lw=0)
                 ax.text(df["hardness"].min() - 0.3, 0.03, "test", fontsize=5 if FRAC else 7, color="gray")
