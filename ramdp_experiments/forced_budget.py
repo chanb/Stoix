@@ -41,7 +41,8 @@ for c in ([0] if N == "var" else []) + list(range(1, actor.torso.max_steps + 1))
             hard = [gf2_min_weight(A, np.logical_xor(i, g).reshape(-1)) for i, g in zip(b["initial"], b["goal"])]
         else:
             hard = [dist.get(tuple(p.reshape(-1).astype(int))) for p in b["initial"]]
-    rows.append(pd.DataFrame({"c": c, "hardness": hard, "solved": b["solved"], "episode_length": b["episode_length"]}))
+    rows.append(pd.DataFrame({"c": c, "hardness": hard, "solved": b["solved"], "episode_length": b["episode_length"],
+                              "total_compute": (b["compute_times"] * b["valid_steps"]).sum(-1)}))  # for the RAMDP return
     print(f"c={c} solved={b['solved'].mean():.3f}", flush=True)
 out = REPO_ROOT / "ramdp_experiments" / f"forced_budget-{name}-{split}-cnn16x4-N{N}-n{NUM_EPISODES}.pkl"
 pd.concat(rows).to_pickle(out)

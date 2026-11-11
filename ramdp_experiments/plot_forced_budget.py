@@ -21,6 +21,10 @@ if args[:1] == ["--env"]:  # one model/env only, e.g. --env slidingpuzzle-bankfi
     ENVS = [(args[1], "Lightsout" if args[1].startswith("lightsout") else "Sliding puzzle")]
     args = args[2:]
 FRAC = None
+DISC = args[:1] == ["--disc"]  # y = RAMDP compute-discounted return: solved * gamma^(total compute steps - 1)
+if DISC:
+    args = args[1:]
+GAMMA = 0.999  # system.gamma of every model plotted here
 if args[:1] == ["--frac"]:  # whole figure FRAC * \linewidth wide (e.g. 0.3): small fonts, compact legend
     FRAC, args = float(args[1]), args[2:]
     plt.rcParams.update({"font.size": 6, "axes.titlesize": 6, "axes.labelsize": 6, "xtick.labelsize": 5,
@@ -42,9 +46,10 @@ for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
         for split in ["train", "test"]:  # same style; the grey band marks the test range
             df = pd.read_pickle(HERE / f"forced_budget-{name}-{split}-cnn16x4-N{N}-n50000.pkl")
             for c, g in df.groupby("c"):
-                s = g.groupby("hardness")["solved"].agg(["mean", "size"])
+                y = g["solved"] * GAMMA ** (g["total_compute"] - 1) if DISC else g["solved"].astype(float)
+                s = y.groupby(g["hardness"]).agg(["mean", "std", "size"])
                 s = s[s["size"] >= 100]  # drop near-empty bins (e.g. sliding test length 31)
-                half = 1.96 * np.sqrt(s["mean"] * (1 - s["mean"]) / s["size"])
+                half = 1.96 * s["std"] / np.sqrt(s["size"])
                 color = COLORS[c]  # c=0: the adaptive model's own halting
                 label = (f"$c={c}$" if c else "own halting") if split == "train" else None
                 if not c:  # wide, light reference line underneath, so it does not hide the budget lines
@@ -68,7 +73,8 @@ for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
         ax.grid(True, alpha=0.3)
         ax.set_xlabel("Shortest path length")
 for ax, (_, title) in zip(axes[:, 0], ENVS):
-    ax.set_ylabel("Success rate" if FRAC else f"{title}\nSuccess rate")
+    ylabel = "Discounted return" if DISC else "Success rate"
+    ax.set_ylabel(ylabel if FRAC else f"{title}\n{ylabel}")
 fig.tight_layout(pad=0.1 if FRAC else 0.2, w_pad=1.0)
 by_label = {}
 for ax in axes[0]:
