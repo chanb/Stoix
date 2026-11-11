@@ -62,7 +62,8 @@ for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
         if FRAC:
             title = title.split()[0] if len(ENVS) > 1 else ""
         what = f"adaptive $N\\in[1,{df['c'].max()}]$" if N == "var" else f"trained $N={N}$"
-        ax.set_title(f"{title}, {what}" if title else what[0].upper() + what[1:])
+        if not FRAC:  # the small single-panel figure carries no title (the caption names the model)
+            ax.set_title(f"{title}, {what}" if title else what[0].upper() + what[1:])
         ax.set_ylim(-0.02, 1.02)
         ax.grid(True, alpha=0.3)
         ax.set_xlabel("Shortest path length")
