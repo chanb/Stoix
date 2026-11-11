@@ -1,0 +1,77 @@
+\begin{table}[p]
+\centering
+\caption{
+Hyperparameters used by transformer with iCoT. Values spanning all four environment columns are shared across environments.
+Sliding puzzle start states come from a fixed bank of $3\times3$ puzzles: during training, an optimal solution length is sampled uniformly and then a puzzle of that length is sampled uniformly from the train split; evaluation samples puzzles uniformly from the held-out test split.
+Sokoban uses the unfiltered Boxoban levels (train split for training, valid split for evaluation).
+MinAtar covers Asterix, Breakout, Freeway, Seaquest, and Space Invaders with the default MinAtar episode length.
+}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccc}
+\toprule
+& Hyperparameter & Lightsout & Sliding puzzle & Sokoban & MinAtar \\
+\toprule
+Env.
+  & Grid size & $5\times4$ & $3\times3$ & $10\times10$ & $10\times10$ \\
+  & Episode length (train) & 10 & 30 & 120 & Default \\
+  & Episode length (eval) & 20 & 32 & 120 & Default \\
+  & Difficulty threshold & 0.5 & -- & -- & -- \\
+  & Start states & -- & Bank & Boxoban & -- \\
+\midrule
+Actor
+  & Observation encoder & Flatten & CNN & CNN & CNN \\
+  & CNN channels & -- & [8, 8] & [64] & [32, 8] \\
+  & CNN kernel sizes & -- & [2, 1] & [3] & [3, 3] \\
+  & CNN strides & -- & [1] & [2] & [1, 1] \\
+  & CNN output MLP & -- & [64] & [128] & [128] \\
+  & Hidden dim & 128 & 16 & 128 & 64 \\
+  & MLP dim & 256 & 256 & 512 & 128 \\
+  & QKV dim & 256 & 256 & 512 & 64 \\
+  & Num.\ heads & 8 & 16 & 16 & 4 \\
+  & Num.\ layers & \multicolumn{4}{c}{2} \\
+  & Activation & GELU & ReLU & ReLU & GELU \\
+\midrule
+Critic
+  & Architecture & MLP & CNN + MLP & CNN + MLP & CNN + MLP \\
+  & CNN channels & -- & [8, 8] & [64] & [32, 64] \\
+  & CNN output MLP & -- & [64] & [128] & -- \\
+  & Layer sizes & [256, 256] & [64, 64] & [128, 128] & [256]$\times$3 \\
+  & Activation & ReLU & ReLU & ReLU & GELU \\
+\midrule
+PPO
+  & Actor learning rate & \multicolumn{4}{c}{$3\times10^{-4}$} \\
+  & Critic learning rate & \multicolumn{4}{c}{$3\times10^{-4}$} \\
+  & Actor weight decay & 0.1 & 0.02 & 0.01 & 0 \\
+  & Epochs per update & 4 & 4 & 2 & 4 \\
+  & Num.\ minibatches & 8 & 8 & 4 & 8 \\
+  & Rollout length & 32 & 32 & 20 & 64 \\
+  & Discount $\gamma$ & \multicolumn{4}{c}{0.999} \\
+  & GAE $\lambda$ & \multicolumn{4}{c}{0.95} \\
+  & PPO clip $\epsilon$ & \multicolumn{4}{c}{0.2} \\
+  & Clip value loss & False & True & False & False \\
+  & Value loss & \multicolumn{4}{c}{Expectile} \\
+  & Expectile $\alpha$ & 0.1 & 0.2 & 0.9 & 0.5 \\
+  & Value loss coef. & \multicolumn{4}{c}{0.5} \\
+  & Entropy coef. & \multicolumn{4}{c}{0.01} \\
+  & Max.\ grad.\ norm & 0.5 & 0.5 & 5.0 & 0.5 \\
+  & Standardize adv. & \multicolumn{4}{c}{True} \\
+\midrule
+Budget
+  & Total env.\ steps & $3\times10^{8}$ & $1\times10^{8}$ & $3\times10^{9}$ & $1\times10^{8}$ \\
+  & Parallel envs & 1024 & 256 & 128 & 128 \\
+  & Num.\ updates & 9155 & 12207 & 1171875 & 12207 \\
+  & Updates per eval & 183 & 244 & 23437 & 244 \\
+  & Num.\ seeds & 10 & 10 & 5 & 5 \\
+\midrule
+Halting
+  & Max.\ compute steps & \multicolumn{4}{c}{5} \\
+  & Temperature & 5.0 & 1.0 & 1.0 & 5.0 \\
+  & Entropy coef. & 0.01 & 0.001 & 0.01 & 0.01 \\
+  & Learning rate & $3\times10^{-4}$ & $3\times10^{-4}$ & $1\times10^{-3}$ & $3\times10^{-4}$ \\
+  & Weight decay & \multicolumn{4}{c}{0} \\
+  & Clip gradients & \multicolumn{4}{c}{True} \\
+\bottomrule
+\end{tabular}
+\label{tab:hyperparams_main}
+\end{table}
