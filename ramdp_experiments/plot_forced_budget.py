@@ -20,9 +20,12 @@ ENVS = [("lightsout", "Lightsout"), ("slidingpuzzle", "Sliding puzzle")]
 w, h = base.set_size(base.doc_width_pt, fraction=0.95, subplots=(1, 2))
 fig, axes = plt.subplots(2, len(Ns), figsize=(w * len(Ns) / 2, 2 * h), squeeze=False, sharex="row", sharey=True)
 cmap = plt.get_cmap("viridis")
+# Per budget c (index 0 = own halting): dash pattern and marker, on top of colour.
+LINESTYLES = ["-", "-", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), "-", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1))]
+MARKERS = ["o", "o", "s", "^", "v", "D", "P", "X", "*"]
 for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
     for ax, (name, title) in zip(col, ENVS):
-        for split, ls in [("train", "-"), ("test", "--")]:
+        for split in ["train", "test"]:  # same style; the grey band marks the test range
             df = pd.read_pickle(HERE / f"forced_budget-{name}-{split}-cnn16x4-N{N}-n50000.pkl")
             for c, g in df.groupby("c"):
                 s = g.groupby("hardness")["solved"].agg(["mean", "size"])
@@ -30,8 +33,8 @@ for col, N in zip(axes.T, Ns):  # rows: environment, columns: trained budget N
                 half = 1.96 * np.sqrt(s["mean"] * (1 - s["mean"]) / s["size"])
                 color = cmap((c - 1) / 7) if c else "black"  # c=0: the adaptive model's own halting
                 label = (f"$c={c}$" if c else "own halting") if split == "train" else None
-                ax.plot(s.index, s["mean"], ls=ls, marker="o", ms=1.5, lw=2 if str(c) == N or not c else 1,
-                        color=color, label=label, zorder=3 if not c else 2)
+                ax.plot(s.index, s["mean"], ls=LINESTYLES[c], marker=MARKERS[c], ms=2.5, mew=0.6, mfc="none",
+                        lw=2 if str(c) == N or not c else 1, color=color, label=label, zorder=3 if not c else 2)
                 ax.fill_between(s.index, s["mean"] - half, s["mean"] + half, color=color, alpha=0.2, lw=0)
             if split == "test":  # test hardness range is disjoint from (above) train's
                 ax.axvspan(df["hardness"].min() - 0.5, df["hardness"].max() + 0.5, color="gray", alpha=0.12, lw=0)
@@ -50,6 +53,6 @@ for ax in axes[0]:
 ls_ = sorted(by_label, key=lambda l: (l != "own halting", l))
 hs = [by_label[l] for l in ls_]
 fig.legend(hs, ls_, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncols=len(hs), frameon=True,
-           title="Forced compute budget $c$ (thick: $c=N$; dashed: test)")
+           title="Forced compute budget $c$ (thick: $c=N$; grey band: test instances)")
 fig.savefig(out, dpi=600, bbox_inches="tight")
 print("Saved", out)
