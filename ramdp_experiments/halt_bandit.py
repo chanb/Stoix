@@ -1,13 +1,14 @@
 """Toy multichain compute bandit: the first test for any halting-predictor loss.
 
-Root state s (one of S) has one correct chain out of M and needs k(s) compute steps to find it.
-At the root, the agent halts after N0 steps. If N0 >= k(s), it picks the correct chain (except with
-prob eps it picks at random); else it guesses at random (correct with prob 1/M). It then walks L
+Root state s (one of S) gets a correct chain c ~ U{0..M-1}, drawn fresh each episode. At the
+root, the agent halts after N0 compute steps, then a LEARNED action head picks a chain. The head
+sees (s, c) only if N0 >= k(s) = s + 1; with less compute it sees one shared "unknown" input, so it
+can do no better than 1/M (c is independent of everything it sees). So compute helps only once the action head has learned to use it. The agent then walks L
 chain states (one action each, halting there too) and gets +1 at the end of the correct chain,
 else +0. Compute is paid ONLY through the discount: every compute step multiplies by gamma.
-Best: N0 = argmax_N gamma^N P(correct | N), and N = 1 on chain states (compute cannot help).
+Best: N0 = k(s) (when gamma^k > gamma / M), the correct chain, and N = 1 on chain states.
 
-Two advantage modes:
+Two advantage modes (the action head and halting head both use the same advantage):
   --rollout 0 : Monte Carlo. Whole episodes, G_t = gamma^(compute from t to the end) * r,
                 advantage = G - (per-row batch mean).
   --rollout T : bootstrapped, as in Stoix ff_ppo. Continuing env, rollouts cut after T env
@@ -53,24 +54,35 @@ def objective(theta, row, n, g, adv, method, slack, rho):
     return jnp.mean(jnp.where(good, jnp.where(n > 1, g * lt, 0.0), jnp.where(n < C, rho * gt, 0.0)))
 
 
-def exact_eval(theta, a):
-    """Exact E[G_root] (gamma^(total compute) * r) and P(correct chain) of the halting tables."""
+def exact_eval(params, a):
+    """Exact E[G_root], P(correct chain), and mean action-head P(correct | enough compute)."""
+    theta, _, phi = params
     p = jnp.exp(log_halt_dist(theta)[0])
+    M = a.chains
+    pi = jax.nn.softmax(phi)
+    knows = pi[:-1].reshape(S, M, M).diagonal(axis1=1, axis2=2).mean(-1)  # mean_c pi(c | s, c)
+    guess = pi[-1].mean()  # mean_c pi(c | unknown) = 1/M
+    p_ok = jnp.where(STEPS[None] >= K[:, None], knows[:, None], guess)  # [S, C]
     disc = a.gamma**STEPS
-    p_ok = jnp.where(STEPS[None] >= K[:, None], 1 - a.eps + a.eps / a.chains, 1 / a.chains)
-    root_g = (p[:S] * disc * p_ok).sum(-1)
-    return root_g.mean() * jnp.prod(p[S:] @ disc), (p[:S] * p_ok).sum(-1).mean()
+    g = (p[:S] * disc * p_ok).sum(-1).mean() * jnp.prod(p[S:] @ disc)
+    return jnp.stack([g, (p[:S] * p_ok).sum(-1).mean(), knows.mean()])
 
 
 def run(method, rho, a, seed):
     M, L, B = a.chains, a.chain_len, a.batch
-    params = (jnp.zeros((S + L, C - 1)), jnp.zeros(S + 2 * L))  # halting rows: S roots, L chain steps; V
+    # halting rows: S roots, L chain steps; V: S roots, (chain step, correct?); action rows: (s, c) pairs + "unknown"
+    params = (jnp.zeros((S + L, C - 1)), jnp.zeros(S + 2 * L), jnp.zeros((S * M + 1, M)))
     opt = optax.adam(a.lr)
 
-    def pick_correct(key, s, n):
+    def act(phi, key, s, n):
         k1, k2 = jax.random.split(key)
-        knows = (n >= K[s]) & (jax.random.uniform(k1, s.shape) > a.eps)
-        return knows | (jax.random.randint(k2, s.shape, 0, M) == 0)
+        c = jax.random.randint(k1, s.shape, 0, M)  # correct chain, fresh each episode
+        arow = jnp.where(n >= K[s], s * M + c, S * M)  # the head sees (s, c) only with enough compute
+        act = jax.random.categorical(k2, phi[arow])
+        return arow, act, act == c
+
+    def action_obj(phi, arow, act, adv):
+        return jnp.mean(adv * jax.nn.log_softmax(phi)[arow, act])
 
     def mc_batch(params, key):  # whole episodes, Monte Carlo reward-to-go
         ks = jax.random.split(key, 4)
@@ -78,13 +90,15 @@ def run(method, rho, a, seed):
         s = jax.random.randint(ks[0], (B,), 0, S)
         n0 = jax.random.categorical(ks[1], lp[s]) + 1
         nc = jax.random.categorical(ks[2], lp[S:], shape=(B, L)) + 1
-        correct = pick_correct(ks[3], s, n0)
+        arow, action, correct = act(params[2], ks[3], s, n0)
         to_go = jnp.cumsum(nc[:, ::-1], -1)[:, ::-1]
         g = jnp.concatenate([a.gamma ** (n0 + to_go[:, 0])[:, None], a.gamma**to_go], -1) * correct[:, None]
         row = jnp.concatenate([s[:, None], jnp.broadcast_to(S + jnp.arange(L), (B, L))], -1).ravel()
         n, g = jnp.concatenate([n0[:, None], nc], -1).ravel(), g.ravel()
         b = jax.ops.segment_sum(g, row, S + L) / jnp.maximum(jax.ops.segment_sum(jnp.ones_like(g), row, S + L), 1)
-        return row, n, g, g - b[row], 0.0
+        adv = g - b[row]
+        root_adv = adv.reshape(B, L + 1)[:, 0]
+        return row, n, g, adv, action_obj(params[2], arow, action, root_adv), 0.0
 
     def env_step(params, env, key):  # continuing env; env = (phase, s, correct); phase 0 = root
         phase, s, correct = env
@@ -92,14 +106,15 @@ def run(method, rho, a, seed):
         row = jnp.where(phase == 0, s, S + phase - 1)
         vrow = jnp.where(phase == 0, s, S + 2 * (phase - 1) + correct)
         n = jax.random.categorical(ks[0], log_halt_dist(params[0])[0][row]) + 1
-        correct = jnp.where(phase == 0, pick_correct(ks[1], s, n), correct)
+        arow, action, new_correct = act(params[2], ks[1], s, n)
+        correct = jnp.where(phase == 0, new_correct, correct)
         done = phase == L
         reward = (done & correct).astype(jnp.float32)
         env = (jnp.where(done, 0, phase + 1), jnp.where(done, jax.random.randint(ks[2], s.shape, 0, S), s), correct)
-        return env, (row, vrow, n, reward, done)
+        return env, (row, vrow, n, reward, done, phase == 0, arow, action)
 
     def td_batch(params, key, env):  # T-step rollout cut mid-episode, GAE with bootstrap
-        env, (row, vrow, n, r, done) = jax.lax.scan(
+        env, (row, vrow, n, r, done, is_root, arow, action) = jax.lax.scan(
             lambda e, k: env_step(params, e, k), env, jax.random.split(key, a.rollout)
         )
         phase, s, correct = env
@@ -119,21 +134,23 @@ def run(method, rho, a, seed):
         _, adv = jax.lax.scan(gae, jnp.zeros_like(last_v), (delta, d_t), reverse=True)
         target = adv + v
         critic_loss = jnp.mean((params[1][vrow] - target) ** 2)
-        return row.ravel(), n.ravel(), target.ravel(), adv.ravel(), critic_loss, env
+        a_obj = action_obj(params[2], arow, action, adv * is_root) * is_root.size / jnp.maximum(is_root.sum(), 1)
+        return row.ravel(), n.ravel(), target.ravel(), adv.ravel(), a_obj, critic_loss, env
 
     def loss(params, key, env):
         if a.rollout:
-            row, n, g, adv, critic_loss, env = td_batch(params, key, env)
+            row, n, g, adv, a_obj, critic_loss, env = td_batch(params, key, env)
         else:
-            (row, n, g, adv, critic_loss) = mc_batch(params, key)
-        return -objective(params[0], row, n, g, adv, method, a.slack, rho) + critic_loss, env
+            row, n, g, adv, a_obj, critic_loss = mc_batch(params, key)
+        halt_obj = objective(params[0], row, n, g, adv, method, a.slack, rho)
+        return -(halt_obj + a_obj) + critic_loss, env
 
     def step(carry, key):
         params, opt_state, env = carry
         grads, env = jax.grad(loss, has_aux=True)(params, key, env)
         upd, opt_state = opt.update(grads, opt_state)
         params = optax.apply_updates(params, upd)
-        return (params, opt_state, env), jnp.stack(exact_eval(params[0], a))
+        return (params, opt_state, env), exact_eval(params, a)
 
     env = (jnp.zeros(B, int), jax.random.randint(jax.random.PRNGKey(seed + 1000), (B,), 0, S), jnp.zeros(B, bool))
     (params, _, _), hist = jax.lax.scan(
@@ -146,7 +163,6 @@ def run(method, rho, a, seed):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gamma", type=float, default=0.9)  # discount per compute step
-    ap.add_argument("--eps", type=float, default=0.1)  # prob of a random chain even with enough compute
     ap.add_argument("--chains", type=int, default=4)  # M
     ap.add_argument("--chain-len", type=int, default=3)  # L
     ap.add_argument("--slack", type=float, default=0.0)
@@ -161,13 +177,12 @@ def main():
     methods = [("pg", 0, "PG"), ("as_written", 0, "as written (fail w=-1)"),
                ("bounded", 1.0, "bounded, rho=1"), ("bounded", 9.0, "bounded, rho=9")]
 
-    p_ok = lambda n, k: np.where(n >= k, 1 - a.eps + a.eps / a.chains, 1 / a.chains)
+    p_ok = lambda n, k: np.where(n >= k, 1.0, 1 / a.chains)
     v = np.array([[a.gamma**n * p_ok(n, k) for n in range(1, C + 1)] for k in range(1, S + 1)])
     best_n = v.argmax(1) + 1
-    best_g = (v.max(1) * a.gamma**a.chain_len).mean()
-    best_ok = np.mean([p_ok(n, k) for n, k in zip(best_n, range(1, S + 1))])
+    best = [(v.max(1) * a.gamma**a.chain_len).mean(), np.mean([p_ok(n, k) for n, k in zip(best_n, range(1, S + 1))]), 1.0]
 
-    fig, ax = plt.subplots(1, 4, figsize=(20, 4.5))
+    fig, ax = plt.subplots(1, 5, figsize=(25, 4.5))
     for j, (m, rho, label) in enumerate(methods):
         res = [run(m, rho, a, sd) for sd in range(a.seeds)]
         hist = np.mean([r[0] for r in res], 0)
@@ -175,23 +190,24 @@ def main():
         c = f"C{j}"
         ax[0].plot(K, e0, "o-", color=c, label=label)
         ax[1].plot(np.arange(1, a.chain_len + 1), ec, "o-", color=c)
-        ax[2].plot(hist[:, 0], color=c)
-        ax[3].plot(hist[:, 1], color=c)
+        for i in range(3):
+            ax[2 + i].plot(hist[:, i], color=c)
         print(f"{label:24s} root E[N|s]={np.round(e0, 2)} chain E[N]={np.round(ec, 2)} "
-              f"G={hist[-1, 0]:.3f} correct={hist[-1, 1]:.3f}")
-    print(f"{'optimum':24s} root N={best_n} chain N=1 G={best_g:.3f} correct={best_ok:.3f}")
+              f"G={hist[-1, 0]:.3f} correct={hist[-1, 1]:.3f} pi(correct|enough)={hist[-1, 2]:.3f}")
+    print(f"{'optimum':24s} root N={best_n} chain N=1 G={best[0]:.3f} correct={best[1]:.3f}")
     ax[0].plot(K, best_n, "k--", lw=1, label="optimum")
     ax[1].axhline(1, color="k", ls="--", lw=1)
-    ax[2].axhline(best_g, color="k", ls="--", lw=1)
-    ax[3].axhline(best_ok, color="k", ls="--", lw=1)
+    for i in range(3):
+        ax[2 + i].axhline(best[i], color="k", ls="--", lw=1)
     ax[0].set(xlabel="needed compute k(s)", ylabel="final E[N | s]", title="root state")
     ax[1].set(xlabel="chain step", ylabel="final E[N]", title="chain states (compute cannot help)")
-    ax[2].set(xlabel="iteration", ylabel="exact E[G_root] of halting tables")
+    ax[2].set(xlabel="iteration", ylabel="exact E[G_root]")
     ax[3].set(xlabel="iteration", ylabel="exact P(correct chain)")
+    ax[4].set(xlabel="iteration", ylabel="action head: P(correct | enough compute)")
     ax[0].legend(fontsize=8)
     mode = f"bootstrapped T={a.rollout}, GAE lambda={a.gae_lambda}" if a.rollout else "Monte Carlo"
-    fig.suptitle(f"Multichain compute bandit ({mode}): {a.chains} chains of length {a.chain_len}, "
-                 f"gamma={a.gamma}, eps={a.eps}, slack={a.slack}, {a.seeds} seeds")
+    fig.suptitle(f"Multichain compute bandit, learned action head ({mode}): {a.chains} chains of length "
+                 f"{a.chain_len}, gamma={a.gamma}, {a.seeds} seeds")
     fig.tight_layout()
     fig.savefig(a.out, dpi=120)
     print("saved", a.out)
