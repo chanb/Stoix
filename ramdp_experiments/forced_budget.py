@@ -10,7 +10,7 @@ import pandas as pd
 from hardness_rollout import (FIXED8_CKPT, FIXED_CKPT, NUM_EPISODES, REPO_ROOT, RUNS, TEST_MAX_STEPS, build, forced_act_fn,
                               gf2_min_weight, rollout, sliding_bfs)
 
-BEST_SEED = {("lightsout", 1): 2, ("lightsout", 4): 4, ("slidingpuzzle", 1): 3, ("slidingpuzzle", 4): 2}
+BEST_SEED = {("lightsout", 2): 3, ("slidingpuzzle", 2): 4, ("lightsout", 1): 2, ("lightsout", 4): 4, ("slidingpuzzle", 1): 3, ("slidingpuzzle", 4): 2}
 
 name, split = sys.argv[1], sys.argv[2]
 N = sys.argv[3] if len(sys.argv) > 3 else "8"
