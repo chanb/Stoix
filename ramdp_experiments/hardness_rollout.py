@@ -96,6 +96,8 @@ TEST_MAX_STEPS = {"lightsout": 20, "slidingpuzzle": 40}  # eval_episode_length /
 FIXED_CKPT = {  # fixed budget N twins of RUNS; best seed by final evaluator/train/episode_discounted_return
     ("lightsout", 1): f"{SEM}/lightsout_cnn16x4concat_clip0.2_noresscale_nosem_acclast-sum_fixed_do0.0/last_N1_seed_{{}}/checkpoints",
     ("lightsout", 4): f"{SEM}/lightsout_cnn16x4concat_clip0.2_noresscale_nosem_acclast-sum_fixed_do0.0/last_N4_seed_{{}}/checkpoints",
+    ("lightsout", 2): f"{SEM}/lightsout_cnn16x4concat_clip0.2_noresscale_nosem_acclast-sum_fixed_do0.0/last_N2_seed_{{}}/checkpoints",
+    ("slidingpuzzle", 2): f"{SEM}/slidingpuzzle3x3_cnn16x4concat_clip0.2_acclast_fixed_do0.0/slidingtile_bank-bank-gs3-ppo_reinf-cnn+TF-iCoT-b2-g0.999-hd128-lr0.0003-clr0.0003-ec0.01-mgn1-nl2-nh4-md512-fixedN2-seed_{{}}/checkpoints",
     ("slidingpuzzle", 1): f"{SEM}/slidingpuzzle3x3_cnn16x4concat_clip0.2_acclast_fixed_do0.0/slidingtile_bank-bank-gs3-ppo_reinf-cnn+TF-iCoT-b1-g0.999-hd128-lr0.0003-clr0.0003-ec0.01-mgn1-nl2-nh4-md512-39e20ab8-seed_{{}}/checkpoints",
     ("slidingpuzzle", 4): f"{SEM}/slidingpuzzle3x3_cnn16x4concat_clip0.2_acclast_fixed_do0.0/slidingtile_bank-bank-gs3-ppo_reinf-cnn+TF-iCoT-b4-g0.999-hd128-lr0.0003-clr0.0003-ec0.01-mgn1-nl2-nh4-md512-da3ac6f7-seed_{{}}/checkpoints",
 }
