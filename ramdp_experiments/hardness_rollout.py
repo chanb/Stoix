@@ -28,7 +28,7 @@ from stoix.networks.base import FeedForwardCritic  # noqa: E402
 from stoix.networks.base_compute import FeedForwardActorWithComputeTime as Actor  # noqa: E402
 from stoix.systems.ramdp_vpg.ff_ppo import get_distribution_act_fn_with_compute_time  # noqa: E402
 from stoix.utils.checkpointing import Checkpointer  # noqa: E402
-from stoix.utils.make_env import make_train_eval_env  # noqa: E402
+from stoix.utils.make_env import make as make_env, make_train_eval_env  # noqa: E402
 
 SEM = "/home/bryanpu1/scratch/logs/ramdp/sem-round2"
 NUM_EPISODES = 50000
@@ -90,11 +90,15 @@ def forced_act_fn(actor, c):
     return act
 
 
-def build(name, ckpt=None):
+TEST_MAX_STEPS = {"lightsout": 20, "slidingpuzzle": 40}  # eval_episode_length / eval time_limit
+
+
+def build(name, ckpt=None, split="train"):
     run = RUNS[name]
     with initialize_config_dir(config_dir=str(REPO_ROOT / "stoix/configs/default/anakin"), version_base="1.2"):
         config = compose("default_ramdp_ff_ppo.yaml", overrides=(COMMON + " " + run["overrides"]).split())
-    env = make_train_eval_env(config)  # un-batched, training distribution
+    # Both un-batched: training distribution, or the held-out test instances (LightsOut hard goals / test bank).
+    env = make_train_eval_env(config) if split == "train" else make_env(config)[1]
     num_actions = int(env.action_space().num_values)
     with open_dict(config):
         config.system.action_dim = num_actions
