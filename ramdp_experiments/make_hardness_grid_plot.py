@@ -5,7 +5,6 @@ single 1x4 figure: [lightsout hardness, lightsout action, slidingpuzzle
 hardness, slidingpuzzle action], all against compute time.
 """
 
-import pickle
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -30,9 +29,10 @@ BOOTSTRAP_SEED = 0
 
 # Rollout caches the notebooks' per-step action-vs-compute-time cells read
 # (and that plot_data-*.pkl's hardness data was exported from).
+# Written by hardness_rollout.py (cnn16x4 concat, mn1-mx8, hent0 runs; best seed per env).
 ROLLOUT_CACHES = {
-    "lightsout": "rollout_cache-lightsout_5x4-trained-20260923032800-n50000-seed0-v3.pkl",
-    "slidingpuzzle": "rollout_cache-slidingtile_gs3-nrm200-20260923063537-n50000-seed0-v2.pkl",
+    "lightsout": "rollout_cache-lightsout-cnn16x4-hent0-n50000-seed0.pkl",
+    "slidingpuzzle": "rollout_cache-slidingpuzzle-cnn16x4-hent0-n50000-seed0.pkl",
 }
 SLIDINGPUZZLE_ACTION_NAMES = [r"$\uparrow$", r"$\rightarrow$", r"$\downarrow$", r"$\leftarrow$"]  # jumanji's MOVES order (Up, Right, Down, Left)
 
@@ -59,9 +59,12 @@ def iqm_bootstrap_ci(x, rng, n_bootstrap=N_BOOTSTRAP, ci=CI_LEVEL, max_chunk_ele
 
 
 def load_plot_data(name):
-    path = HERE / f"plot_data-{name}.pkl"
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    """Per-episode hardness at reset and the compute time of the first action."""
+    df = pd.read_pickle(HERE / ROLLOUT_CACHES[name]).dropna(subset=["shortest_path_length"])
+    return {
+        "hardness": df["shortest_path_length"].to_numpy(dtype=int),
+        "first_step_compute_time": np.array([ct[0] for ct in df["compute_times"]]),
+    }
 
 
 def load_step_actions(name):
@@ -133,7 +136,7 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
 
     handles = [Patch(facecolor=violin_color, alpha=0.4, label="distribution")]
 
-    ax.set_yticks([1, 2, 3, 4, 5])
+    ax.set_yticks([1, 2, 4, 6, 8])
     if xticklabels is not None:
         ax.set_xticks(unique_h, xticklabels)
 
