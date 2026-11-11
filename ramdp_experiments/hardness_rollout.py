@@ -72,7 +72,25 @@ network.actor_network.input_layer.hidden_sizes=[128]""",
 }
 
 
-def build(name):
+FIXED8_CKPT = {  # fixed budget N=8 twins of RUNS (same overrides except min_steps=8); best seed by final
+    # evaluator/train/episode_discounted_return. Weights load into the min_steps=1 module unchanged.
+    "lightsout": f"{SEM}/lightsout_cnn16x4concat_clip0.2_noresscale_nosem_acclast-sum_fixed_do0.0/last_N8_seed_4/checkpoints",
+    "slidingpuzzle": f"{SEM}/slidingpuzzle3x3_cnn16x4concat_clip0.2_acclast_fixed_do0.0/slidingtile_bank-bank-gs3-ppo_reinf-cnn+TF-iCoT-b8-g0.999-hd128-lr0.0003-clr0.0003-ec0.01-mgn1-nl2-nh4-md512-4ba1ea16-seed_0/checkpoints",
+}
+
+
+def forced_act_fn(actor, c):
+    """Greedy action after exactly `c` CoT steps (replay mode with target_compute_time=c)."""
+
+    def act(params, obs, key):
+        ct = jnp.full((jax.tree_util.tree_leaves(obs)[0].shape[0],), float(c))
+        pi = actor.apply(params, obs, torso_kwargs={"target_compute_time": ct})[0]
+        return pi.mode(), ct, None, None
+
+    return act
+
+
+def build(name, ckpt=None):
     run = RUNS[name]
     with initialize_config_dir(config_dir=str(REPO_ROOT / "stoix/configs/default/anakin"), version_base="1.2"):
         config = compose("default_ramdp_ff_ppo.yaml", overrides=(COMMON + " " + run["overrides"]).split())
@@ -96,10 +114,10 @@ def build(name):
     x = jax.tree_util.tree_map(lambda v: v[None], env.observation_space().generate_value())
     k1, k2 = jax.random.split(jax.random.PRNGKey(0))
     params = ActorCriticParams(actor.init(k1, x, torso_kwargs={"rng": k1}), critic.init(k2, x))
-    params, _ = Checkpointer(model_name="ramdp_ff_ppo", rel_dir=run["ckpt"], checkpoint_uid="final").restore_params(
+    params, _ = Checkpointer(model_name="ramdp_ff_ppo", rel_dir=ckpt or run["ckpt"], checkpoint_uid="final").restore_params(
         input_params=params
     )
-    return env, get_distribution_act_fn_with_compute_time(config, actor.apply), params.actor_params
+    return env, get_distribution_act_fn_with_compute_time(config, actor.apply), params.actor_params, actor
 
 
 def rollout(env, act_fn, params, max_steps, get_board, get_goal):
@@ -187,7 +205,7 @@ def sliding_bfs(n=3):
 
 
 def main(name):
-    env, act_fn, params = build(name)
+    env, act_fn, params, _ = build(name)
     if name == "lightsout":
         from stoix.envs.lightsout.lightsout_env import LightsOutEnv, default_config
 
