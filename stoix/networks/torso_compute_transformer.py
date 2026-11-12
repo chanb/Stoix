@@ -110,46 +110,6 @@ def _block_kernel_init(block_init: str, default: Initializer) -> Initializer:
     raise ValueError(f"block_init must be 'orthogonal' or 'trunc_normal', got {block_init!r}")
 
 
-def simplicial_embedding(x: chex.Array, group_size: int, temperature: float) -> chex.Array:
-    """Simplicial embedding (Lavoie et al., 2022). Splits the last axis into
-    groups of `group_size` and applies a softmax to each group. Each group
-    then is a point on a simplex. `group_size <= 0` disables it."""
-    if group_size <= 0:
-        return x
-    groups = x.reshape(x.shape[:-1] + (-1, group_size))
-    return jax.nn.softmax(groups / temperature, axis=-1).reshape(x.shape)
-
-
-def _readout_and_feedback(
-    x: chex.Array,
-    latent_rms_norm: bool,
-    group_size: int,
-    temperature: float,
-    readout_only: bool = False,
-) -> Tuple[chex.Array, chex.Array]:
-    """Returns `(state, fed_back)`: `state` is what the halting/action heads
-    read, `fed_back` is what re-enters the residual stream as a scratchpad token.
-
-    `latent_rms_norm=False` (original): both are `SEM(x)`. `True`: `state =
-    SEM(rms_norm(x))`, so the softmax groups see unit-RMS
-    logits instead of the raw residual, and `fed_back = sqrt(V) * state` (V =
-    `group_size`) brings the token back to roughly unit scale. With SEM off
-    (`group_size <= 0`) both are `rms_norm(x)`.
-
-    `readout_only=True`: SEM is used only on `state`; `fed_back` is
-    `rms_norm(x)` (or `x` without `latent_rms_norm`).
-    """
-    if readout_only:
-        x = rms_norm(x) if latent_rms_norm else x
-        return simplicial_embedding(x, group_size, temperature), x
-    if not latent_rms_norm:
-        state = simplicial_embedding(x, group_size, temperature)
-        return state, state
-    state = simplicial_embedding(rms_norm(x), group_size, temperature)
-    scale = float(np.sqrt(group_size)) if group_size > 0 else 1.0
-    return state, scale * state
-
-
 class TransformerBlock(nn.Module):
     """A single transformer block: self-attention + MLP, pre-norm by default.
 
@@ -393,9 +353,6 @@ class _CoTStep(nn.Module):
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
     num_state_tokens: int = 1
-    sem_group_size: int = 0
-    sem_temperature: float = 1.0
-    sem_readout_only: bool = False
     latent_rms_norm: bool = False
     input_injection: bool = False
     residual_scaling: bool = False
@@ -514,12 +471,8 @@ class _CoTStep(nn.Module):
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-        # The latent goes through (RMSNorm then) SEM before it is fed back or
-        # read by the halting/action heads.
-        state, fed_back = _readout_and_feedback(
-            x, self.latent_rms_norm, self.sem_group_size, self.sem_temperature,
-            self.sem_readout_only,
-        )
+        # The latent (RMSNormed with latent_rms_norm) is fed back and read by the heads.
+        state = rms_norm(x) if self.latent_rms_norm else x
         cached_keys = new_cached_keys
         cached_values = new_cached_values
         if self.replaying:
@@ -626,7 +579,7 @@ class _CoTStep(nn.Module):
         final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
         still_running = all_running & (~halts_this_step)
-        current_token = fed_back
+        current_token = state
 
         new_carry = (
             current_token,
@@ -745,14 +698,6 @@ class TransformerChainOfThoughtTorso(nn.Module):
     to N tokens of width `hidden_dim`. Tokens 0..N-2 only prefill the
     KV-cache. CoT step 0 runs on token N-1. `N = 1` is the original torso.
 
-    `sem_group_size` (default `0`, off) applies `simplicial_embedding` (groups
-    of this size, softmax temperature `sem_temperature`) to each state token
-    before the transformer, and to each latent the transformer makes, before
-    it is fed back or read by the halting/action heads. `sem_readout_only`
-    (default `False`) uses SEM only on what the heads read (action, halting,
-    and the value head of a `CoTCriticTorso`); state tokens and fed-back
-    thoughts skip it.
-
     `input_is_tokens` (default `False`) takes an input of shape `(*batch, N,
     F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
     `num_state_tokens` is not used. `concat_input_tokens` (default `False`)
@@ -763,10 +708,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
     instead of compounding its scale. All are off by default:
 
       - `latent_rms_norm`: parameter-free RMSNorm on every latent (state
-        tokens and each step's output) before SEM. The heads read
-        `SEM(rms_norm(x))`, and the fed-back token is `sqrt(sem_group_size) *
-        SEM(rms_norm(x))`. Without it, SEM gets the raw residual stream and
-        saturates. With SEM off, the latent is just `rms_norm(x)`.
+        tokens and each step's output). The heads read and the loop feeds back
+        `rms_norm(x)`.
       - `input_injection`: each fed-back thought (CoT step >= 1) becomes `a2 *
         thought + b2 * s`, where `s` is the token CoT step 0 runs on (the last
         state token). This keeps the observation in every step's input rather
@@ -812,9 +755,6 @@ class TransformerChainOfThoughtTorso(nn.Module):
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
     num_state_tokens: int = 1
-    sem_group_size: int = 0
-    sem_temperature: float = 1.0
-    sem_readout_only: bool = False
     input_is_tokens: bool = False
     concat_input_tokens: bool = False
     latent_rms_norm: bool = False
@@ -906,10 +846,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
         if self.use_input_layer_norm:
             state_tokens = _norm_cls(self.use_rmsnorm)()(state_tokens)
         # State tokens enter the residual stream exactly like fed-back thoughts.
-        _, state_tokens = _readout_and_feedback(
-            state_tokens, self.latent_rms_norm, self.sem_group_size, self.sem_temperature,
-            self.sem_readout_only,
-        )
+        if self.latent_rms_norm:
+            state_tokens = rms_norm(state_tokens)
         initial_token = state_tokens[..., -1, :]
         num_positions = self.max_steps + n - 1
         # Per-position scan input: state token p at position p < N, else unused.
@@ -967,9 +905,6 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.use_rmsnorm,
             self.qkv_dim,
             n,
-            self.sem_group_size,
-            self.sem_temperature,
-            sem_readout_only=self.sem_readout_only,
             latent_rms_norm=self.latent_rms_norm,
             input_injection=self.input_injection,
             residual_scaling=self.residual_scaling,

@@ -4,20 +4,20 @@ import numpy as np
 
 from stoix.networks.torso_compute_transformer import TransformerChainOfThoughtTorso
 
-N, H, G, MAX_STEPS = 3, 16, 4, 5
+N, H, MAX_STEPS = 3, 16, 5
 
 
 def _setup(min_steps=1):
     torso = TransformerChainOfThoughtTorso(
         hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, min_steps=min_steps,
-        num_state_tokens=N, sem_group_size=G,
+        num_state_tokens=N,
     )
     obs = jax.random.normal(jax.random.PRNGKey(0), (7, 10))
     params = torso.init(jax.random.PRNGKey(1), obs, deterministic=True)
     return torso, obs, params
 
 
-def test_rollout_replay_match_and_sem_on_output():
+def test_rollout_replay_match():
     torso, obs, params = _setup()
     emb, compute_time, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2))
     replay_emb, _, history, _, _ = torso.apply(params, obs, target_compute_time=compute_time)
@@ -25,8 +25,6 @@ def test_rollout_replay_match_and_sem_on_output():
     np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
     assert history.shape == (7, MAX_STEPS, H)
     assert jnp.all((compute_time >= 1) & (compute_time <= MAX_STEPS))
-    # Each group of G is on the simplex.
-    np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
 
 
 def test_prefill_tokens_do_not_count_as_compute():
@@ -52,7 +50,6 @@ def test_cnn_channel_tokens_into_torso():
     cnn = CNNTorso(channel_sizes=[8, N], kernel_sizes=[3, 3], strides=[1, 1], channel_tokens=True)
     torso = TransformerChainOfThoughtTorso(
         hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, input_is_tokens=True,
-        sem_group_size=G,
     )
     grid = jax.random.normal(jax.random.PRNGKey(0), (7, 5, 6, 3))
     cnn_params = cnn.init(jax.random.PRNGKey(1), grid)
@@ -63,7 +60,6 @@ def test_cnn_channel_tokens_into_torso():
     emb, compute_time, _, _ = torso.apply(params, tokens, rng=jax.random.PRNGKey(2))
     replay_emb = torso.apply(params, tokens, target_compute_time=compute_time)[0]
     np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
-    np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
     # N comes from the input: the scan has N - 1 prefill positions.
     assert params["params"]["Scan_CoTStep_0"]["pos_embedding"].shape[0] == MAX_STEPS + N
 
@@ -74,7 +70,7 @@ STABLE_LOOP_FLAGS = dict(latent_rms_norm=True, input_injection=True, residual_sc
 def _stable_setup(min_steps=1, **flags):
     torso = TransformerChainOfThoughtTorso(
         hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, min_steps=min_steps,
-        num_state_tokens=N, sem_group_size=G, **{**STABLE_LOOP_FLAGS, **flags},
+        num_state_tokens=N, **{**STABLE_LOOP_FLAGS, **flags},
     )
     obs = jax.random.normal(jax.random.PRNGKey(0), (7, 10))
     params = torso.init(jax.random.PRNGKey(1), obs, deterministic=True)
@@ -86,7 +82,7 @@ def test_stable_loop_flags_off_add_no_params():
     assert not any(k.startswith("alpha_") for k in params["params"]["Scan_CoTStep_0"])
 
 
-def test_stable_loop_flags_rollout_replay_match_and_sem_on_output():
+def test_stable_loop_flags_rollout_replay_match():
     torso, obs, params = _stable_setup()
     step_params = params["params"]["Scan_CoTStep_0"]
     np.testing.assert_allclose(jax.nn.sigmoid(step_params["alpha_1_logit"]), 0.75, atol=1e-6)
@@ -95,8 +91,8 @@ def test_stable_loop_flags_rollout_replay_match_and_sem_on_output():
     replay_emb, log_prob, _, _, _ = torso.apply(params, obs, target_compute_time=compute_time)
     np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
     assert jnp.all(jnp.isfinite(log_prob))
-    # The heads read the unscaled simplex point.
-    np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
+    # The heads read the RMS-normed latent.
+    np.testing.assert_allclose(jnp.sqrt(jnp.mean(emb**2, -1)), 1.0, atol=1e-3)
 
 
 def test_stable_loop_flags_gradients_finite():
@@ -150,7 +146,7 @@ def test_cot_critic_torso_returns_embedding():
 
     torso = TransformerChainOfThoughtTorso(
         hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, min_steps=MAX_STEPS,
-        num_state_tokens=N, sem_group_size=G,
+        num_state_tokens=N,
     )
     critic = CoTCriticTorso(torso)
     obs = jax.random.normal(jax.random.PRNGKey(0), (7, 10))
@@ -158,25 +154,6 @@ def test_cot_critic_torso_returns_embedding():
     emb = critic.apply(params, obs)
     np.testing.assert_allclose(emb, torso.apply({"params": params["params"]["torso"]}, obs, deterministic=True)[0])
     assert emb.shape == (7, H)
-
-
-def test_sem_readout_only_skips_sem_on_fed_back_and_state_tokens():
-    from stoix.networks.torso_compute_transformer import _readout_and_feedback, rms_norm
-
-    x = 3.0 * jax.random.normal(jax.random.PRNGKey(0), (7, H))
-    state, fed_back = _readout_and_feedback(x, True, G, 1.0, readout_only=True)
-    np.testing.assert_allclose(state.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
-    np.testing.assert_allclose(fed_back, rms_norm(x), atol=1e-6)
-    _, raw = _readout_and_feedback(x, False, G, 1.0, readout_only=True)
-    np.testing.assert_allclose(raw, x)
-
-    torso, obs, params = _stable_setup(sem_readout_only=True)
-    emb, compute_time, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2))
-    replay_emb = torso.apply(params, obs, target_compute_time=compute_time)[0]
-    np.testing.assert_allclose(emb, replay_emb, atol=1e-5)
-    np.testing.assert_allclose(emb.reshape(7, -1, G).sum(-1), 1.0, atol=1e-5)
-    full_sem = torso.clone(sem_readout_only=False).apply(params, obs, target_compute_time=compute_time)[0]
-    assert not np.allclose(emb, full_sem)
 
 
 def test_concat_input_tokens_makes_one_state_token():
@@ -200,7 +177,7 @@ def test_attention_dropout_same_mask_in_rollout_and_replay():
     _, obs, params = _setup()
     torso = TransformerChainOfThoughtTorso(
         hidden_dim=H, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS,
-        num_state_tokens=N, sem_group_size=G, attention_dropout=0.5,
+        num_state_tokens=N, attention_dropout=0.5,
     )
     keys = jax.random.split(jax.random.PRNGKey(3), 7)
     emb, ct, _, _ = torso.apply(params, obs, rng=jax.random.PRNGKey(2), dropout_key=keys)

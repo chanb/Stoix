@@ -6,7 +6,6 @@ from flax import linen as nn
 from flax.linen.initializers import Initializer, orthogonal
 
 from stoix.networks.layers import NoisyLinear
-from stoix.networks.torso_compute_transformer import rms_norm, simplicial_embedding
 from stoix.networks.utils import parse_activation_fn
 import jax
 import jax.numpy as jnp
@@ -20,9 +19,6 @@ class MLPTorso(nn.Module):
     use_layer_norm: bool = False
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
     activate_final: bool = True
-    # > 0: the output goes through SEM(rms_norm(x)) with groups of this size (same form as
-    # TransformerChainOfThoughtTorso with latent_rms_norm), e.g. right before a critic head.
-    sem_group_size: int = 0
 
     @nn.compact
     def __call__(self, observation: chex.Array) -> chex.Array:
@@ -36,8 +32,6 @@ class MLPTorso(nn.Module):
                 x = nn.LayerNorm()(x)
             if self.activate_final or layer_size != self.layer_sizes[-1]:
                 x = parse_activation_fn(self.activation)(x)
-        if self.sem_group_size > 0:
-            x = simplicial_embedding(rms_norm(x), self.sem_group_size, 1.0)
         return x
 
 

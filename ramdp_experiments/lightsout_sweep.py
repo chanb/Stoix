@@ -275,17 +275,14 @@ class Job:
     output_dir: Path
     wandb: bool
     wandb_project: str
-    # TransformerChainOfThoughtTorso state tokenization / simplicial embedding
+    # TransformerChainOfThoughtTorso state tokenization
     # (see torso_compute_transformer.py). Defaults reproduce the original torso.
     num_state_tokens: int = 1
-    sem_group_size: int = 0
     # Critic MLP (network.critic_network.pre_torso) overrides; empty keeps the network yaml.
     critic_layer_sizes: str = ""
     critic_activation: str = ""
-    critic_sem_group_size: int = 0
     vf_coef: float = 0.5
     latent_rms_norm: bool = False
-    sem_readout_only: bool = False
     input_injection: bool = False
     residual_scaling: bool = False
     block_init: str = "orthogonal"
@@ -384,20 +381,14 @@ class Job:
             extra.append("rms")
         if self.num_state_tokens != 1:
             extra.append(f"nst{self.num_state_tokens}")
-        if self.sem_group_size > 0:
-            extra.append(f"sem{self.sem_group_size}")
         if self.vf_coef != 0.5:
             extra.append(f"vf{self.vf_coef:g}")
         if self.critic_layer_sizes:
             extra.append("c" + self.critic_layer_sizes.replace(",", "x"))
         if self.critic_activation:
             extra.append(f"c{self.critic_activation}")
-        if self.critic_sem_group_size > 0:
-            extra.append(f"csem{self.critic_sem_group_size}")
         if self.latent_rms_norm:
             extra.append("lrn")
-        if self.sem_readout_only:
-            extra.append("semro")
         if self.input_injection:
             extra.append("inj")
         if self.residual_scaling:
@@ -554,9 +545,7 @@ class Job:
                 cmd.append(
                     f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
                 )
-            cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
             cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
-            cmd.append(f"++network.actor_network.pre_torso.sem_readout_only={self.sem_readout_only}")
             cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
             cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
             cmd.append(f"++network.actor_network.pre_torso.block_init={self.block_init}")
@@ -574,11 +563,6 @@ class Job:
             cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{self.critic_layer_sizes}]")
         if self.critic_activation:
             cmd.append(f"network.critic_network.pre_torso.activation={self.critic_activation}")
-        if self.critic_sem_group_size > 0:
-            # SEM on the critic MLP output, right before ScalarCriticHead - see MLPTorso.
-            cmd.append(
-                f"++network.critic_network.pre_torso.sem_group_size={self.critic_sem_group_size}"
-            )
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the sweep lands in the same
             # W&B project.
@@ -982,13 +966,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 wandb=args.wandb,
                 wandb_project=args.wandb_project,
                 num_state_tokens=args.num_state_tokens,
-                sem_group_size=args.sem_group_size,
                 critic_layer_sizes=args.critic_layer_sizes,
                 critic_activation=args.critic_activation,
-                critic_sem_group_size=args.critic_sem_group_size,
                 vf_coef=args.vf_coef,
                 latent_rms_norm=args.latent_rms_norm,
-                sem_readout_only=args.sem_readout_only,
                 input_injection=args.input_injection,
                 residual_scaling=args.residual_scaling,
                 block_init=args.block_init,
@@ -1503,13 +1484,6 @@ def main() -> None:
         "network yaml.",
     )
     parser.add_argument(
-        "--critic-sem-group-size",
-        type=int,
-        default=0,
-        help="SEM group size on the critic MLP output, right before the scalar critic head "
-        "(MLPTorso.sem_group_size); 0 (default) disables it.",
-    )
-    parser.add_argument(
         "--vf-coef",
         type=float,
         default=0.5,
@@ -1523,23 +1497,10 @@ def main() -> None:
         "the observation is projected to this many tokens. Default 1 (original torso).",
     )
     parser.add_argument(
-        "--sem-group-size",
-        type=int,
-        default=0,
-        help="TransformerChainOfThoughtTorso sem_group_size (transformer arch only): "
-        "simplicial embedding group size; 0 disables SEM. Default 0.",
-    )
-    parser.add_argument(
-        "--sem-readout-only",
-        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
-        default=False,
-        help="TransformerChainOfThoughtTorso sem_readout_only: SEM only on the latent the action/halting/value heads read; state tokens and fed-back thoughts skip SEM. Default false.",
-    )
-    parser.add_argument(
         "--latent-rms-norm",
         type=lambda x: x.strip().lower() in ("1", "true", "yes"),
         default=False,
-        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent before SEM; feed back sqrt(V)*SEM(rms_norm(x)). Default false.",
+        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent (state tokens and each step's output). Default false.",
     )
     parser.add_argument(
         "--input-injection",

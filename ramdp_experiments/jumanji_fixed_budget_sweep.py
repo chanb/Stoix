@@ -528,12 +528,10 @@ class Job:
     output_dir: Path
     wandb: bool
     wandb_project: str
-    # TransformerChainOfThoughtTorso state tokenization / simplicial embedding
+    # TransformerChainOfThoughtTorso state tokenization
     # (see torso_compute_transformer.py). Defaults reproduce the original torso.
     num_state_tokens: int = 1
-    sem_group_size: int = 0
     latent_rms_norm: bool = False
-    sem_readout_only: bool = False
     input_injection: bool = False
     residual_scaling: bool = False
     block_init: str = "orthogonal"
@@ -611,14 +609,10 @@ class Job:
             extra.append("ctok")
         elif self.num_state_tokens != 1 and self.arch == "transformer":
             extra.append(f"nst{self.num_state_tokens}")
-        if self.sem_group_size > 0:
-            extra.append(f"sem{self.sem_group_size}")
         if self.vf_coef != 0.5:
             extra.append(f"vf{self.vf_coef:g}")
         if self.latent_rms_norm:
             extra.append("lrn")
-        if self.sem_readout_only:
-            extra.append("semro")
         if self.input_injection:
             extra.append("inj")
         if self.residual_scaling:
@@ -742,9 +736,7 @@ class Job:
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
         if self.arch in ("transformer", "cnn+transformer"):
             # TransformerChainOfThoughtTorso only - see its docstring.
-            cmd.append(f"++network.actor_network.pre_torso.sem_group_size={self.sem_group_size}")
             cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
-            cmd.append(f"++network.actor_network.pre_torso.sem_readout_only={self.sem_readout_only}")
             cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
             cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
             cmd.append(f"++network.actor_network.pre_torso.block_init={self.block_init}")
@@ -1098,9 +1090,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                     wandb=args.wandb,
                     wandb_project=args.wandb_project,
                     num_state_tokens=args.num_state_tokens,
-                    sem_group_size=args.sem_group_size,
                     latent_rms_norm=args.latent_rms_norm,
-                    sem_readout_only=args.sem_readout_only,
                     input_injection=args.input_injection,
                     residual_scaling=args.residual_scaling,
                     block_init=args.block_init,
@@ -1436,23 +1426,10 @@ def main() -> None:
         "is projected to this many tokens. Default 1 (original torso).",
     )
     parser.add_argument(
-        "--sem-group-size",
-        type=int,
-        default=0,
-        help="TransformerChainOfThoughtTorso sem_group_size (transformer/cnn+transformer): "
-        "simplicial embedding group size; 0 disables SEM. Default 0.",
-    )
-    parser.add_argument(
-        "--sem-readout-only",
-        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
-        default=False,
-        help="TransformerChainOfThoughtTorso sem_readout_only: SEM only on the latent the action/halting/value heads read; state tokens and fed-back thoughts skip SEM. Default false.",
-    )
-    parser.add_argument(
         "--latent-rms-norm",
         type=lambda x: x.strip().lower() in ("1", "true", "yes"),
         default=False,
-        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent before SEM; feed back sqrt(V)*SEM(rms_norm(x)). Default false.",
+        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent (state tokens and each step's output). Default false.",
     )
     parser.add_argument(
         "--input-injection",
