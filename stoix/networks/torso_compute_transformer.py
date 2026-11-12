@@ -406,6 +406,8 @@ class _CoTStep(nn.Module):
     action_logit_accum: str = "last"
     action_logit_discount: float = 1.0
     attention_dropout: float = 0.0
+    halting_param: str = "hazard"
+    cumulative_halting_eps: float = 0.01
 
     @nn.compact
     def __call__(
@@ -538,6 +540,21 @@ class _CoTStep(nn.Module):
         is_final_step = step_count == self.max_steps
         can_halt = step_count >= self.min_steps
 
+        assert self.halting_param in ("hazard", "cumulative"), self.halting_param
+        self_halt = False
+        if self.halting_param == "cumulative":
+            # halting_prob is h_n = P(c = n). While running, exp(halting_log_prob) is the mass left,
+            # S = 1 - H_{n-1} (forced steps add 0), so the per-step prob is h_n / S and the
+            # per-step log probs telescope to log h_c. Once H_{n-1} + h_n >= 1 - eps the agent halts
+            # here with the remainder S: lam = 1 (held at 1 - _PROB_EPS so logs stay finite).
+            survival = jnp.maximum(jnp.exp(halting_log_prob), _PROB_EPS)
+            self_halt = can_halt & (halting_prob >= survival - self.cumulative_halting_eps)
+            halting_prob = jnp.where(
+                self_halt,
+                1.0 - _PROB_EPS,
+                jnp.clip(halting_prob / survival, _PROB_EPS, 1.0 - _PROB_EPS),
+            )
+
         if not self.replaying:
             # Only meaningful from the second step on (step 0 has no
             # previous thought to compare against - gated via `step_idx > 0`
@@ -567,7 +584,7 @@ class _CoTStep(nn.Module):
         else:
             rng, step_rng = jax.random.split(rng)
             sampled_halt = jax.random.bernoulli(step_rng, halting_prob)
-            halts_this_step = still_running & ((sampled_halt & can_halt) | is_final_step)
+            halts_this_step = still_running & (((sampled_halt | self_halt) & can_halt) | is_final_step)
 
         # Halting is forced (not a free policy choice) before min_steps or at
         # max_steps - stop-gradient halting_prob there so REINFORCE doesn't
@@ -798,6 +815,11 @@ class TransformerChainOfThoughtTorso(nn.Module):
     halting_temperature: float = 1.0
     halting_hidden_dims: Tuple[int, ...] = ()
     halting_bias_init: float = 0.0
+    # "hazard": sigmoid is P(halt now | still running). "cumulative": sigmoid is h_n = P(c = n);
+    # halt at the first n with sum_{j<=n} h_j >= 1 - cumulative_halting_eps (agent ends its own
+    # support; max_steps is only a cap). Turned into the per-step prob h_n / (1 - H_{n-1}).
+    halting_param: str = "hazard"
+    cumulative_halting_eps: float = 0.01
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
@@ -973,6 +995,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
             action_logit_accum=self.action_logit_accum,
             action_logit_discount=self.action_logit_discount,
             attention_dropout=self.attention_dropout,
+            halting_param=self.halting_param,
+            cumulative_halting_eps=self.cumulative_halting_eps,
         )
 
         initial_carry = (
