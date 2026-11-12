@@ -403,8 +403,6 @@ class _CoTStep(nn.Module):
     alpha_2_init: float = 0.25
     block_init: str = "orthogonal"
     halting_bias_init: float = 0.0
-    action_logit_accum: str = "last"
-    action_logit_discount: float = 1.0
     attention_dropout: float = 0.0
     halting_param: str = "hazard"
     cumulative_halting_eps: float = 0.01
@@ -625,11 +623,7 @@ class _CoTStep(nn.Module):
                 jnp.where(still_running & (~is_forced_step), halting_entropy_this_step, 0.0)
             )
         num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
-        if self.action_logit_accum == "last":
-            final_state = jnp.where(halts_this_step[..., None], state, final_state)
-        else:  # running (discounted) sum of the states of the steps taken
-            gamma = self.action_logit_discount if self.action_logit_accum == "discount" else 1.0
-            final_state = jnp.where(still_running[..., None], gamma * final_state + state, final_state)
+        final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
         still_running = all_running & (~halts_this_step)
         current_token = fed_back
@@ -792,13 +786,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
     `trunc_normal_kernel_init`). The observation projection and halting head keep
     `kernel_init` either way.
 
-    `action_logit_accum` (default `"last"`) sets the embedding the action head
-    reads: `"last"` is the state at the halt step, `"sum"`/`"mean"` the sum/mean
-    of the states of all steps taken, `"discount"` the discounted sum
-    `gamma^(t-1) s_1 + ... + gamma s_(t-1) + s_t` with `gamma = action_logit_discount`.
-    With a linear action head, `"sum"` equals adding each step's logits (the bias
-    is added once, not T times), so every step gets a direct gradient from the
-    action loss.
+    The action head reads the state at the halt step.
     """
 
     hidden_dim: int
@@ -835,8 +823,6 @@ class TransformerChainOfThoughtTorso(nn.Module):
     alpha_1_init: float = 0.75
     alpha_2_init: float = 0.25
     block_init: str = "orthogonal"
-    action_logit_accum: str = "last"
-    action_logit_discount: float = 1.0
     attention_dropout: float = 0.0
 
     @nn.compact
@@ -946,8 +932,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         still_running = jnp.ones(batch_shape, dtype=bool)
         num_steps_taken = jnp.zeros(batch_shape)
         halting_log_prob = jnp.zeros(batch_shape)
-        assert self.action_logit_accum in ("last", "sum", "mean", "discount"), self.action_logit_accum
-        final_state = initial_token if self.action_logit_accum == "last" else jnp.zeros_like(initial_token)
+        final_state = initial_token
         first_convergence_step = jnp.full(batch_shape, -1.0)
         num_close_steps = jnp.zeros(batch_shape)
         # Only ever written when replaying (see `_CoTStep`); carried
@@ -992,8 +977,6 @@ class TransformerChainOfThoughtTorso(nn.Module):
             alpha_2_init=self.alpha_2_init,
             block_init=self.block_init,
             halting_bias_init=self.halting_bias_init,
-            action_logit_accum=self.action_logit_accum,
-            action_logit_discount=self.action_logit_discount,
             attention_dropout=self.attention_dropout,
             halting_param=self.halting_param,
             cumulative_halting_eps=self.cumulative_halting_eps,
@@ -1035,8 +1018,6 @@ class TransformerChainOfThoughtTorso(nn.Module):
             per_step_halting_entropy,
             _,
         ), _ = cot_step(initial_carry, (jnp.arange(num_positions), step_inputs, inject_inputs))
-        if self.action_logit_accum == "mean":
-            final_state = final_state / num_steps_taken[..., None]
 
         if replaying:
             return (

@@ -85,22 +85,17 @@ def test_negative_halting_bias_makes_act_ponder_longer():
     np.testing.assert_array_equal(n, MAX_STEPS)  # sigmoid(-4) * 4 < 0.99
 
 
-def test_pondernet_matches_torso_with_action_logit_accum():
+def test_pondernet_matches_torso_at_fixed_budget():
     """Fixed budget: the PonderNet mixture is one policy, the action head on the torso output."""
-    for accum, gamma in [("sum", 1.0), ("mean", 1.0), ("discount", 0.5)]:
-        actor = FeedForwardActorWithComputeTime(
-            torso=TransformerChainOfThoughtTorso(
-                hidden_dim=16, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS,
-                min_steps=MAX_STEPS, action_logit_accum=accum, action_logit_discount=gamma,
-            ),
-            action_head=CategoricalHead(action_dim=A),
-        )
-        obs = jax.random.normal(jax.random.PRNGKey(0), (B, 10))
-        params = actor.init(jax.random.PRNGKey(1), obs, torso_kwargs={"deterministic": True})
-        action = jnp.arange(B) % A
-        pi = actor.apply(params, obs, torso_kwargs={"deterministic": True})[0]
-        log_prob = pondernet_mixture(
-            actor.apply, params, obs, action, MAX_STEPS, prior_lambda=0.3, action_logit_accum=accum,
-            action_logit_discount=gamma,
-        )[0]
-        np.testing.assert_allclose(log_prob, pi.log_prob(action), atol=1e-5)
+    actor = FeedForwardActorWithComputeTime(
+        torso=TransformerChainOfThoughtTorso(
+            hidden_dim=16, num_heads=2, mlp_dim=32, max_steps=MAX_STEPS, min_steps=MAX_STEPS,
+        ),
+        action_head=CategoricalHead(action_dim=A),
+    )
+    obs = jax.random.normal(jax.random.PRNGKey(0), (B, 10))
+    params = actor.init(jax.random.PRNGKey(1), obs, torso_kwargs={"deterministic": True})
+    action = jnp.arange(B) % A
+    pi = actor.apply(params, obs, torso_kwargs={"deterministic": True})[0]
+    log_prob = pondernet_mixture(actor.apply, params, obs, action, MAX_STEPS, prior_lambda=0.3)[0]
+    np.testing.assert_allclose(log_prob, pi.log_prob(action), atol=1e-5)
