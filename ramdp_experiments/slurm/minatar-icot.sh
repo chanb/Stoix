@@ -34,7 +34,9 @@ mkdir -p $SLURM_TMPDIR/tmp
 export CUDA_MPS_LOG_DIRECTORY=$SLURM_TMPDIR/tmp
 nvidia-cuda-mps-control -d
 
-cd /home/chanb/research/iclr_2027/Stoix
+LOG_DIR=""
+REPO_PATH=""
+cd ${REPO_PATH}/Stoix
 
 games=(asterix breakout freeway seaquest space_invaders)
 game=${games[$SLURM_ARRAY_TASK_ID]}
@@ -52,6 +54,6 @@ else
     sweep_args="ramdp_experiments/jumanji_fixed_budget_sweep.py --budget ${budget}"
 fi
 
-python ${sweep_args} --systems ff_ppo_reinforce --seeds 5 --runs-per-gpu 2 --architectures cnn+transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --total-num-envs 128 --rollout-length 64 --envs ${game} --gamma ${gamma} --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --clip-eps 0.2 --clip-value-loss false --ent-coef 0.01 --gae-lambda 0.95 --standardize-advantages true --critic-before-actor false --use-input-layer-norm true --actor-weight-decay 0.0 --max-grad-norm 0.5 --use-expectile-value-loss true --expectile 0.5 --wandb true --wandb-project minatar-icot-${project_name} --output-dir /home/chanb/scratch/logs/ramdp/minatar-icot-${project_name} --gpus 0 --server vulcan --yes
+python ${sweep_args} --systems ff_ppo_reinforce --seeds 5 --runs-per-gpu 2 --architectures cnn+transformer --hidden-dim 64 --mlp-dim 128 --num-layers 2 --num-heads 4 --total-timesteps 1e8 --total-num-envs 128 --rollout-length 64 --envs ${game} --gamma ${gamma} --lr 3e-4 --critic-lr 3e-4 --epochs 4 --num-minibatches 8 --clip-eps 0.2 --clip-value-loss false --ent-coef 0.01 --gae-lambda 0.95 --standardize-advantages true --critic-before-actor false --use-input-layer-norm true --actor-weight-decay 0.0 --max-grad-norm 0.5 --use-expectile-value-loss true --expectile 0.5 --wandb true --wandb-project minatar-icot-${project_name} --output-dir ${LOG_DIR}/logs/ramdp/minatar-icot-${project_name} --gpus 0 --server vulcan --yes
 
 echo "finished with exit code $? at: $(date)"
