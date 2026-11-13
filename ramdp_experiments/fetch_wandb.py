@@ -178,6 +178,13 @@ def sokoban_filter(c):
     return True
 
 
+# Per-project wandb group to keep for variable-budget (min_steps != max_steps) runs;
+# other variable-budget groups in the project are dropped. Fixed-budget runs are unaffected.
+VARIABLE_BUDGET_GROUP = {
+    "sokoban-nov10": "sokoban-unfilt-train-eval-unfiltered-valid_ppo_reinf-cnn+TF-iCoT_mn1-mx8_g0.999_3655101b",
+}
+
+
 def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta]]:
     api = wandb.Api()
     runs = api.runs(project, filters={
@@ -203,6 +210,9 @@ def fetch_run_metas(project: str) -> List[Tuple["wandb.apis.public.Run", RunMeta
         if mn is None or mx is None:
             continue
         if run_filter(c):
+            continue
+        vb_group = VARIABLE_BUDGET_GROUP.get(project)
+        if vb_group is not None and int(mn) != int(mx) and r.group != vb_group:
             continue
         sgh_raw = cfg_get(c, "network.actor_network.pre_torso.stop_gradient_halting_input", False)
         sgh = str(sgh_raw) == "True"
