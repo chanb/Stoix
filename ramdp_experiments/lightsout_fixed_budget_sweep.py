@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import queue
 import re
 import shlex
@@ -75,6 +76,7 @@ ARCH_TO_NETWORK = {
         "mlp": "mlp_compute",
         "iru_unshared": "iru_unshared_compute",
         "transformer": "transformer_compute",
+        "cnn+transformer": "cnn_transformer_compute",
         "gru": "gru_compute",
         "iru": "iru_compute",
     },
@@ -85,6 +87,7 @@ ARCH_TO_NETWORK = {
 # UnsharedIRUAdaptiveComputationTimeTorso.
 NO_LAYER_NORM_ARCHES = (
     "transformer",
+    "cnn+transformer",
     "gru",
     "iru",
     "iru_unshared",
@@ -92,7 +95,7 @@ NO_LAYER_NORM_ARCHES = (
 # Architectures whose pre_torso has `num_heads`/`mlp_dim` params (attention heads / transformer
 # feedforward width) - TransformerChainOfThoughtTorso and TransformerExplicitCoTTorso; every
 # other torso has no such concept.
-TRANSFORMER_ARCHES = ("transformer",)
+TRANSFORMER_ARCHES = ("transformer", "cnn+transformer")
 DEFAULT_GRID_SIZES = ("3x3", "4x4", "5x5")
 GRID_SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 
@@ -125,6 +128,7 @@ EXPLICIT_COT_SYSTEMS = tuple(EXPLICIT_COT_SCRIPT_BY_SYSTEM)
 # -> explicit-CoT transformer ("TF-eCoT"); mlp/gru/iru/iru_unshared are already short.
 ARCH_SHORT_TAG = {
     "transformer": "TF-iCoT",
+    "cnn+transformer": "cnn+TF-iCoT",
     EXPLICIT_COT_ARCH: "TF-eCoT",
 }
 
@@ -216,6 +220,18 @@ class Job:
     output_dir: Path
     wandb: bool
     wandb_project: str
+    # TransformerChainOfThoughtTorso state tokenization
+    # (see torso_compute_transformer.py). Defaults reproduce the original torso.
+    num_state_tokens: int = 1
+    # Critic MLP (network.critic_network.pre_torso) overrides; empty keeps the network yaml.
+    critic_layer_sizes: str = ""
+    critic_activation: str = ""
+    vf_coef: float = 0.5
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
+    block_init: str = "orthogonal"
+    critic_cot_steps: int = 0
 
     @property
     def env(self) -> str:
@@ -288,6 +304,24 @@ class Job:
             extra.append("sn")
         if self.use_rmsnorm:
             extra.append("rms")
+        if self.num_state_tokens != 1:
+            extra.append(f"nst{self.num_state_tokens}")
+        if self.vf_coef != 0.5:
+            extra.append(f"vf{self.vf_coef:g}")
+        if self.critic_layer_sizes:
+            extra.append("c" + self.critic_layer_sizes.replace(",", "x"))
+        if self.critic_activation:
+            extra.append(f"c{self.critic_activation}")
+        if self.latent_rms_norm:
+            extra.append("lrn")
+        if self.input_injection:
+            extra.append("inj")
+        if self.residual_scaling:
+            extra.append("rs")
+        if self.block_init != "orthogonal":
+            extra.append(f"bi{self.block_init}")
+        if self.critic_cot_steps:
+            extra.append(f"ccot{self.critic_cot_steps}")
         if extra:
             parts.append("-".join(extra))
 
@@ -326,8 +360,8 @@ class Job:
             f"arch.total_timesteps={self.total_timesteps:g}",
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
-            "arch.num_evaluation=50",
-            "arch.num_eval_episodes=10",
+            f"arch.num_evaluation={os.environ.get('NUM_EVALUATION', 50)}",  # NUM_EVALUATION: shorter smoke tests
+            "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # min_steps == max_steps == budget: no adaptivity, every example always
@@ -379,6 +413,7 @@ class Job:
         # ff_ppo_explicit_cot.py's module docstrings.
         cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
         cmd.append(f"system.expectile={self.expectile:g}")
+        cmd.append(f"system.vf_coef={self.vf_coef:g}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
             # TransformerExplicitCoTTorso only (see
@@ -397,6 +432,15 @@ class Job:
                 f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
+        if self.arch in TRANSFORMER_ARCHES:
+            # TransformerChainOfThoughtTorso only - see its docstring.
+            cmd.append(
+                f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
+            )
+            cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
+            cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
+            cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
+            cmd.append(f"++network.actor_network.pre_torso.block_init={self.block_init}")
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso/
             # TransformerExplicitCoTTorso only, no other architecture has this param.
@@ -407,6 +451,12 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
+        if self.critic_layer_sizes:
+            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{self.critic_layer_sizes}]")
+        if self.critic_activation:
+            cmd.append(f"network.critic_network.pre_torso.activation={self.critic_activation}")
+        if self.critic_cot_steps:
+            cmd.append(f"+network.critic_network.cot_steps={self.critic_cot_steps}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the sweep lands in the same
             # W&B project.
@@ -434,10 +484,24 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_input_layer_norm={self.use_input_layer_norm}"
             )
-        # LightsOutEnv's native observation is (m, n, 2) (see
-        # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
-        # 2 * grid_size vector.
-        cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
+        if self.arch == "cnn+transformer":
+            # Same CNN as the round-2 grid envs (jumanji_sweep.py ENV_CNN_ARCH): the actor gets one
+            # token per last-layer channel (8 tokens of m * n features); the critic CNN is flattened
+            # into its MLP.
+            for net, channels in (("actor", "32,8"), ("critic", "32,64")):
+                cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{channels}]")
+                cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
+                cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
+                cmd.append(f"network.{net}_network.input_layer.activation=gelu")
+            cmd.append("network.critic_network.input_layer.hidden_sizes=[]")
+            cmd.append("++network.actor_network.input_layer.channel_tokens=True")
+            cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
+            cmd.append("network.actor_network.pre_torso.activation=gelu")
+        else:
+            # LightsOutEnv's native observation is (m, n, 2) (see
+            # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
+            # 2 * grid_size vector.
+            cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
         return cmd
 
     def run_dir(self) -> Path:
@@ -695,6 +759,15 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 output_dir=args.output_dir,
                 wandb=args.wandb,
                 wandb_project=args.wandb_project,
+                num_state_tokens=args.num_state_tokens,
+                critic_layer_sizes=args.critic_layer_sizes,
+                critic_activation=args.critic_activation,
+                vf_coef=args.vf_coef,
+                latent_rms_norm=args.latent_rms_norm,
+                input_injection=args.input_injection,
+                residual_scaling=args.residual_scaling,
+                block_init=args.block_init,
+                critic_cot_steps=args.critic_cot_steps,
             )
         )
 
@@ -715,6 +788,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             "to that job's system)."
         )
     return deduped_jobs
+
+CUDA_INIT_ERROR = "Unable to initialize backend 'cuda'"
+CUDA_INIT_RETRIES = 3
 
 
 def run_job(
@@ -756,9 +832,22 @@ def run_job(
             f"# CMD={' '.join(cmd)}\n\n"
         )
         log_file.flush()
-        proc = subprocess.run(
-            run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
-        )
+        # Many processes initializing CUDA at once (e.g. under MPS) occasionally fail with
+        # "Unable to initialize backend 'cuda'" before training starts; that is transient, so
+        # retry those (and only those) a few times, appending to the same log.
+        for attempt in range(1, CUDA_INIT_RETRIES + 1):
+            proc = subprocess.run(
+                run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
+            )
+            log_file.flush()
+            if proc.returncode == 0 or attempt == CUDA_INIT_RETRIES:
+                break
+            with open(log_path) as f:
+                if CUDA_INIT_ERROR not in f.read():
+                    break
+            log_file.write(f"\n# CUDA init failed (attempt {attempt}); retrying in 30s\n\n")
+            log_file.flush()
+            time.sleep(30)
     elapsed = time.time() - start
 
     result = {
@@ -1081,6 +1170,59 @@ def main() -> None:
         "has no TransformerBlock); ignored (forced to the first value) otherwise. Default false.",
     )
     parser.add_argument(
+        "--critic-layer-sizes",
+        default="",
+        help="Comma-separated ints - network.critic_network.pre_torso.layer_sizes (critic MLP). "
+        "Empty (default) keeps the network yaml.",
+    )
+    parser.add_argument(
+        "--critic-activation",
+        default="",
+        help="network.critic_network.pre_torso.activation (e.g. gelu). Empty (default) keeps the "
+        "network yaml.",
+    )
+    parser.add_argument(
+        "--vf-coef",
+        type=float,
+        default=0.5,
+        help="system.vf_coef (PPO systems only): critic loss weight. Default 0.5 (ff_ppo.yaml).",
+    )
+    parser.add_argument(
+        "--num-state-tokens",
+        type=int,
+        default=1,
+        help="TransformerChainOfThoughtTorso num_state_tokens (transformer arch only): "
+        "the observation is projected to this many tokens. Default 1 (original torso).",
+    )
+    parser.add_argument(
+        "--latent-rms-norm",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent (state tokens and each step's output). Default false.",
+    )
+    parser.add_argument(
+        "--input-injection",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso input_injection (transformer arch only): re-inject the step-0 state token into every fed-back thought. Default false.",
+    )
+    parser.add_argument(
+        "--residual-scaling",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
+    )
+    parser.add_argument(
+        "--block-init",
+        choices=("orthogonal", "trunc_normal"),
+        default="orthogonal",
+        help="TransformerChainOfThoughtTorso block_init (transformer arch only): kernel init of the TransformerBlock projections - orthogonal(sqrt(2)) or truncated_normal(1/sqrt(fan_in)). Default orthogonal.",
+    )
+    parser.add_argument(
+        "--critic-cot-steps", type=int, default=0,
+        help="If > 0, the critic is its own copy of the actor CoT torso, always looping this many steps. Default 0 (MLP critic).",
+    )
+    parser.add_argument(
         "--use-rmsnorm",
         default="false",
         help="Comma-separated bools (true/false) - RMSNorm instead of LayerNorm "
@@ -1249,6 +1391,7 @@ def main() -> None:
         "mlp",
         "iru_unshared",
         "transformer",
+        "cnn+transformer",
         "gru",
         "iru",
         EXPLICIT_COT_ARCH,

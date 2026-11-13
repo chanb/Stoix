@@ -45,6 +45,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import queue
 import re
 import shlex
@@ -274,6 +275,21 @@ class Job:
     output_dir: Path
     wandb: bool
     wandb_project: str
+    # TransformerChainOfThoughtTorso state tokenization
+    # (see torso_compute_transformer.py). Defaults reproduce the original torso.
+    num_state_tokens: int = 1
+    # Critic MLP (network.critic_network.pre_torso) overrides; empty keeps the network yaml.
+    critic_layer_sizes: str = ""
+    critic_activation: str = ""
+    vf_coef: float = 0.5
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
+    block_init: str = "orthogonal"
+    cnn_tokens: bool = False
+    halting_loss_type: str = "pg"
+    extra_overrides: str = ""  # raw space-separated Hydra overrides, appended last
+    actor_cnn_channels: str = ""  # --cnn-tokens actor CNN channel sizes, e.g. "64,8"
 
     @property
     def env(self) -> str:
@@ -363,6 +379,30 @@ class Job:
             extra.append("sn")
         if self.use_rmsnorm:
             extra.append("rms")
+        if self.num_state_tokens != 1:
+            extra.append(f"nst{self.num_state_tokens}")
+        if self.vf_coef != 0.5:
+            extra.append(f"vf{self.vf_coef:g}")
+        if self.critic_layer_sizes:
+            extra.append("c" + self.critic_layer_sizes.replace(",", "x"))
+        if self.critic_activation:
+            extra.append(f"c{self.critic_activation}")
+        if self.latent_rms_norm:
+            extra.append("lrn")
+        if self.input_injection:
+            extra.append("inj")
+        if self.residual_scaling:
+            extra.append("rs")
+        if self.block_init != "orthogonal":
+            extra.append(f"bi{self.block_init}")
+        if self.cnn_tokens:
+            extra.append("cnntok")
+        if self.halting_loss_type != "pg":
+            extra.append(f"hl{self.halting_loss_type}")
+        if self.extra_overrides:
+            extra.append(self.extra_overrides.replace(" ", "-"))
+        if self.actor_cnn_channels:
+            extra.append("acnn" + self.actor_cnn_channels.replace(",", "x"))
         if extra:
             parts.append("-".join(extra))
 
@@ -401,8 +441,8 @@ class Job:
             f"arch.total_timesteps={self.total_timesteps:g}",
             f"arch.total_num_envs={self.total_num_envs}",
             f"arch.seed={self.seed}",
-            "arch.num_evaluation=50",
-            "arch.num_eval_episodes=10",
+            f"arch.num_evaluation={os.environ.get('NUM_EVALUATION', 50)}",  # NUM_EVALUATION: shorter smoke tests
+            "arch.num_eval_episodes=256",
             f"network.actor_network.pre_torso.hidden_dim={self.hidden_dim}",
             f"++network.actor_network.pre_torso.num_layers={self.num_layers}",
             # Independently swept - see the compute torsos' min_steps mechanism
@@ -418,6 +458,11 @@ class Job:
             f"system.max_grad_norm={self.max_grad_norm:g}",
             f"system.rollout_length={self.rollout_length}",
             f"logger.base_exp_path={self.output_dir / self.run_name}",
+            # Keep the final learner state for post-hoc evaluation (ff_ppo.py saves only the
+            # last eval step) in the run dir, not the cwd.
+            "logger.checkpointing.save_model=True",
+            f"logger.checkpointing.save_args.rel_dir={self.output_dir / self.run_name / 'checkpoints'}",
+            "logger.checkpointing.save_args.checkpoint_uid=final",
         ]
         # epochs/num_minibatches/clip_eps: PPO-specific hyperparameters -
         # see ff_ppo.yaml.
@@ -469,6 +514,9 @@ class Job:
         # ff_ppo_explicit_cot.py's module docstrings.
         cmd.append(f"system.use_expectile_value_loss={self.use_expectile_value_loss}")
         cmd.append(f"system.expectile={self.expectile:g}")
+        cmd.append(f"system.vf_coef={self.vf_coef:g}")
+        if self.system in LATENT_KL_PPO_SYSTEMS:
+            cmd.append(f"system.halting_loss_type={self.halting_loss_type}")
         if self.arch in TRANSFORMER_ARCHES or self.arch in EXPLICIT_COT_ARCHES:
             # Attention head count / feedforward width - TransformerChainOfThoughtTorso/
             # TransformerExplicitCoTTorso only (see
@@ -487,6 +535,20 @@ class Job:
                 f"++network.actor_network.pre_torso.use_sandwich_norm={self.use_sandwich_norm}"
             )
             cmd.append(f"++network.actor_network.pre_torso.use_rmsnorm={self.use_rmsnorm}")
+        if self.arch in TRANSFORMER_ARCHES:
+            # TransformerChainOfThoughtTorso only - see its docstring.
+            if self.cnn_tokens:
+                # One state token per last-layer CNN kernel (CNNTorso.channel_tokens).
+                cmd.append("++network.actor_network.input_layer.channel_tokens=True")
+                cmd.append("++network.actor_network.pre_torso.input_is_tokens=True")
+            else:
+                cmd.append(
+                    f"++network.actor_network.pre_torso.num_state_tokens={self.num_state_tokens}"
+                )
+            cmd.append(f"++network.actor_network.pre_torso.latent_rms_norm={self.latent_rms_norm}")
+            cmd.append(f"++network.actor_network.pre_torso.input_injection={self.input_injection}")
+            cmd.append(f"++network.actor_network.pre_torso.residual_scaling={self.residual_scaling}")
+            cmd.append(f"++network.actor_network.pre_torso.block_init={self.block_init}")
         if self.arch in EXPLICIT_COT_ARCHES:
             # Thought-token vocabulary size - TransformerExplicitCoTTorso/
             # TransformerExplicitCoTTorso only, no other architecture has this param.
@@ -497,6 +559,10 @@ class Job:
             cmd.append(
                 f"++network.actor_network.pre_torso.use_latent_feedback={self.use_latent_feedback}"
             )
+        if self.critic_layer_sizes:
+            cmd.append(f"network.critic_network.pre_torso.layer_sizes=[{self.critic_layer_sizes}]")
+        if self.critic_activation:
+            cmd.append(f"network.critic_network.pre_torso.activation={self.critic_activation}")
         if self.wandb:
             # Fixed project name (not derived per-job) so every job in the sweep lands in the same
             # W&B project.
@@ -550,6 +616,19 @@ class Job:
             # stoix/envs/lightsout/lightsout_env.py) - flatten it to a
             # 2 * grid_size vector for non-CNN torsos.
             cmd.append(f"+env.wrapper._target_=stoa.FlattenObservationWrapper")
+        elif self.cnn_tokens:
+            # SEM round 2's sliding-puzzle encoders (jumanji_sweep.ENV_CNN_ARCH["slidingtile_bank"]):
+            # actor CNN [32, 8] -> 8 tokens, critic CNN [32, 64] flattened into its MLP, GELU.
+            # One state token per last-layer actor channel: --num-state-tokens sets that count (default 8).
+            n_tok = self.num_state_tokens if self.num_state_tokens != 1 else 8
+            actor_ch = self.actor_cnn_channels or f"32,{n_tok}"
+            for net, ch in (("actor", actor_ch), ("critic", "32,64")):
+                cmd.append(f"network.{net}_network.input_layer.channel_sizes=[{ch}]")
+                cmd.append(f"network.{net}_network.input_layer.kernel_sizes=[3,3]")
+                cmd.append(f"network.{net}_network.input_layer.strides=[1,1]")
+                cmd.append(f"network.{net}_network.input_layer.activation=gelu")
+            cmd.append("network.critic_network.input_layer.hidden_sizes=[]")
+            cmd.append("network.actor_network.pre_torso.activation=gelu")
         else:
             cmd.append(f"network.actor_network.input_layer.channel_sizes=[16]")
             cmd.append(f"network.actor_network.input_layer.kernel_sizes=[3]")
@@ -560,6 +639,7 @@ class Job:
             cmd.append(f"network.critic_network.input_layer.strides=[1]")
             cmd.append(f"network.critic_network.input_layer.hidden_sizes=[256]")
             cmd.append(f"network.critic_network.pre_torso.layer_sizes=[256]")
+        cmd.extend(self.extra_overrides.split())
         return cmd
 
     def run_dir(self) -> Path:
@@ -711,8 +791,10 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         for max_steps in args.max_steps
         if min_steps <= max_steps
     ]
+    if args.budgets:  # fixed budgets: min_steps == max_steps == b (overrides --min/max-steps)
+        step_combos = [(b, b) for b in args.budgets]
     n_skipped_step_combos = len(args.min_steps) * len(args.max_steps) - len(step_combos)
-    if n_skipped_step_combos:
+    if n_skipped_step_combos and not args.budgets:
         print(
             f"Skipping {n_skipped_step_combos} (min_steps, max_steps) combo(s) with "
             "min_steps > max_steps."
@@ -763,6 +845,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         halting_hidden_dims,
         (use_dpo_loss, dpo_alpha, dpo_beta),
         (use_expectile_value_loss, expectile),
+        halting_loss_type,
         seed,
     ) in itertools.product(
         args.grid_sizes,
@@ -785,6 +868,7 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         args.halting_hidden_dims,
         dpo_combos,
         expectile_combos,
+        args.halting_loss_type,
         range(args.seeds),
     ):
         # latent_kl_coef only exists on ff_ppo.py's own systems
@@ -818,6 +902,8 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
         # every other architecture.
         if arch not in HALTING_HIDDEN_DIMS_ARCHES:
             halting_hidden_dims = args.halting_hidden_dims[0]
+        if system not in LATENT_KL_PPO_SYSTEMS:
+            halting_loss_type = "pg"
         m, n = (int(x) for x in GRID_SIZE_RE.match(grid_size).groups())
         episode_length = args.episode_length if args.episode_length is not None else m * n
         eval_episode_length = (
@@ -879,6 +965,18 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
                 output_dir=args.output_dir,
                 wandb=args.wandb,
                 wandb_project=args.wandb_project,
+                num_state_tokens=args.num_state_tokens,
+                critic_layer_sizes=args.critic_layer_sizes,
+                critic_activation=args.critic_activation,
+                vf_coef=args.vf_coef,
+                latent_rms_norm=args.latent_rms_norm,
+                input_injection=args.input_injection,
+                residual_scaling=args.residual_scaling,
+                block_init=args.block_init,
+                cnn_tokens=args.cnn_tokens,
+                halting_loss_type=halting_loss_type,
+                extra_overrides=" ".join(args.extra_overrides),
+                actor_cnn_channels=args.actor_cnn_channels,
             )
         )
 
@@ -899,6 +997,9 @@ def build_grid(args: argparse.Namespace) -> List[Job]:
             "to that job's system)."
         )
     return deduped_jobs
+
+CUDA_INIT_ERROR = "Unable to initialize backend 'cuda'"
+CUDA_INIT_RETRIES = 3
 
 
 def run_job(
@@ -940,9 +1041,22 @@ def run_job(
             f"# CMD={' '.join(cmd)}\n\n"
         )
         log_file.flush()
-        proc = subprocess.run(
-            run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
-        )
+        # Many processes initializing CUDA at once (e.g. under MPS) occasionally fail with
+        # "Unable to initialize backend 'cuda'" before training starts; that is transient, so
+        # retry those (and only those) a few times, appending to the same log.
+        for attempt in range(1, CUDA_INIT_RETRIES + 1):
+            proc = subprocess.run(
+                run_cmd, cwd=REPO_ROOT, env=full_env, stdout=log_file, stderr=subprocess.STDOUT
+            )
+            log_file.flush()
+            if proc.returncode == 0 or attempt == CUDA_INIT_RETRIES:
+                break
+            with open(log_path) as f:
+                if CUDA_INIT_ERROR not in f.read():
+                    break
+            log_file.write(f"\n# CUDA init failed (attempt {attempt}); retrying in 30s\n\n")
+            log_file.flush()
+            time.sleep(30)
     elapsed = time.time() - start
 
     result = {
@@ -1358,6 +1472,90 @@ def main() -> None:
         "otherwise. Default false.",
     )
     parser.add_argument(
+        "--critic-layer-sizes",
+        default="",
+        help="Comma-separated ints - network.critic_network.pre_torso.layer_sizes (critic MLP). "
+        "Empty (default) keeps the network yaml.",
+    )
+    parser.add_argument(
+        "--critic-activation",
+        default="",
+        help="network.critic_network.pre_torso.activation (e.g. gelu). Empty (default) keeps the "
+        "network yaml.",
+    )
+    parser.add_argument(
+        "--vf-coef",
+        type=float,
+        default=0.5,
+        help="system.vf_coef (PPO systems only): critic loss weight. Default 0.5 (ff_ppo.yaml).",
+    )
+    parser.add_argument(
+        "--num-state-tokens",
+        type=int,
+        default=1,
+        help="TransformerChainOfThoughtTorso num_state_tokens (transformer arch only): "
+        "the observation is projected to this many tokens. Default 1 (original torso).",
+    )
+    parser.add_argument(
+        "--latent-rms-norm",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso latent_rms_norm (transformer arch only): RMSNorm each latent (state tokens and each step's output). Default false.",
+    )
+    parser.add_argument(
+        "--input-injection",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso input_injection (transformer arch only): re-inject the step-0 state token into every fed-back thought. Default false.",
+    )
+    parser.add_argument(
+        "--residual-scaling",
+        type=lambda x: x.strip().lower() in ("1", "true", "yes"),
+        default=False,
+        help="TransformerChainOfThoughtTorso residual_scaling (transformer arch only): coupled residual scaling a1*h + b1*f(norm(h)). Default false.",
+    )
+    parser.add_argument(
+        "--cnn-tokens",
+        type=lambda v: v.lower() in ("1", "true", "yes"),
+        default=False,
+        help="cnn+transformer only: use SEM round 2's sliding-puzzle CNN encoders (actor CNN "
+        "[32,8] -> one state token per last-layer kernel, critic CNN [32,64] -> MLP, GELU) "
+        "instead of the default [16] CNN.",
+    )
+    parser.add_argument(
+        "--budgets",
+        type=lambda v: [int(x) for x in v.split(",")],
+        default=None,
+        help="Comma-separated fixed compute budgets: one job per b with min_steps == max_steps "
+        "== b (every step forced, so the halting head is unused). Overrides --min/max-steps.",
+    )
+    parser.add_argument(
+        "--actor-cnn-channels",
+        default="",
+        help="--cnn-tokens only: actor CNN channel sizes, e.g. '64,8' (the last one is the number "
+        "of state tokens). Default '32,<num-state-tokens or 8>'.",
+    )
+    parser.add_argument(
+        "--extra-overrides",
+        action="append",
+        default=[],
+        help="Raw space-separated Hydra overrides appended to every job's command (and to its "
+        "run name), e.g. 'system.pondernet_kl_coef=0.001'. Repeatable.",
+    )
+    parser.add_argument(
+        "--halting-loss-type",
+        type=lambda v: v.split(","),
+        default=["pg"],
+        help="Comma-separated system.halting_loss_type values (pg, pondernet, act), swept. "
+        "ff_ppo.py's own systems only. Default pg.",
+    )
+    parser.add_argument(
+        "--block-init",
+        choices=("orthogonal", "trunc_normal"),
+        default="orthogonal",
+        help="TransformerChainOfThoughtTorso block_init (transformer arch only): kernel init of the TransformerBlock projections - orthogonal(sqrt(2)) or truncated_normal(1/sqrt(fan_in)). Default orthogonal.",
+    )
+    parser.add_argument(
         "--use-rmsnorm",
         default="false",
         help="Comma-separated bools (true/false) - RMSNorm instead of LayerNorm "
@@ -1433,7 +1631,8 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results_lightsout_sweep",
+        # $SCRATCH, not the repo in $HOME: run outputs and checkpoints go here.
+        default=Path(os.environ.get("SCRATCH", REPO_ROOT)) / "results_lightsout_sweep",
         help="Where per-run logger.base_exp_path and logs/ + manifest.jsonl are written.",
     )
     parser.add_argument("--python", default=str(REPO_ROOT / ".venv" / "bin" / "python"), help="Python interpreter.")

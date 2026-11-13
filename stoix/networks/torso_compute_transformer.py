@@ -79,6 +79,37 @@ def _resolve_qkv_dim(hidden_dim: int, qkv_dim: Optional[int]) -> int:
     return hidden_dim if qkv_dim is None else qkv_dim
 
 
+def rms_norm(x: chex.Array, eps: float = 1e-5) -> chex.Array:
+    """Parameter-free RMSNorm."""
+    return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+
+
+def _logit(p: float) -> float:
+    return float(np.log(p / (1.0 - p)))
+
+
+# `truncated_normal(stddev=1/sqrt(fan_in))`, truncated at +-2 stddev without
+# rescaling, so the realized std is ~0.88 / sqrt(fan_in) (flax
+# `truncated_normal` semantics). `variance_scaling(truncated_normal)` divides
+# its stddev by 0.87962566, so a scale of 0.87962566^2 cancels that. Fan-in for
+# DenseGeneral's `out` is the product of its contracted (heads, head_dim) axes.
+_TRUNC_NORMAL_CORRECTION = 0.87962566103423978
+trunc_normal_kernel_init = nn.initializers.variance_scaling(
+    _TRUNC_NORMAL_CORRECTION**2, "fan_in", "truncated_normal"
+)
+
+
+def _block_kernel_init(block_init: str, default: Initializer) -> Initializer:
+    """Kernel init of every `TransformerBlock` projection in the CoT loop:
+    `"orthogonal"` keeps the torso's `kernel_init` (orthogonal(sqrt(2)) by
+    default), `"trunc_normal"` uses `trunc_normal_kernel_init`."""
+    if block_init == "orthogonal":
+        return default
+    if block_init == "trunc_normal":
+        return trunc_normal_kernel_init
+    raise ValueError(f"block_init must be 'orthogonal' or 'trunc_normal', got {block_init!r}")
+
+
 class TransformerBlock(nn.Module):
     """A single transformer block: self-attention + MLP, pre-norm by default.
 
@@ -143,6 +174,8 @@ class TransformerBlock(nn.Module):
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
+    # Attention-weight dropout in `step`, applied only when `dropout_key` is given.
+    attention_dropout: float = 0.0
 
     def setup(self) -> None:
         qkv_dim = _resolve_qkv_dim(self.hidden_dim, self.qkv_dim)
@@ -168,12 +201,25 @@ class TransformerBlock(nn.Module):
             self.attn_post_norm = norm_cls()
             self.mlp_post_norm = norm_cls()
 
-    def _mlp(self, tokens: chex.Array) -> chex.Array:
+    @staticmethod
+    def _residual(
+        h: chex.Array, out: chex.Array, res_scale: Optional[Tuple[chex.Array, chex.Array]]
+    ) -> chex.Array:
+        """`h + out`, or the coupled `a1 * h + b1 * out` when
+        `res_scale = (a1, b1)` (see `_CoTStep`'s `residual_scaling`)."""
+        if res_scale is None:
+            return h + out
+        a1, b1 = res_scale
+        return a1 * h + b1 * out
+
+    def _mlp(
+        self, tokens: chex.Array, res_scale: Optional[Tuple[chex.Array, chex.Array]] = None
+    ) -> chex.Array:
         y = self.mlp_norm(tokens)
         y = self.mlp_dense_0(y)
         y = parse_activation_fn(self.activation)(y)
         y = self.mlp_dense_1(y)
-        y = tokens + y
+        y = self._residual(tokens, y, res_scale)
         return self.mlp_post_norm(y) if self.use_sandwich_norm else y
 
     def __call__(self, tokens: chex.Array, mask: Optional[chex.Array] = None) -> chex.Array:
@@ -198,8 +244,15 @@ class TransformerBlock(nn.Module):
         cached_values: chex.Array,
         step_idx: chex.Array,
         max_steps: int,
+        res_scale: Optional[Tuple[chex.Array, chex.Array]] = None,
+        dropout_key: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
+        dropout_key: optional per-example keys `(*batch, 2)`. With
+            `attention_dropout > 0`, the mask is a function of (key, step_idx)
+            only, so the same keys drop the same weights in rollout and replay.
+        res_scale: optional `(a1, b1)` - both residuals become `a1 * h + b1 *
+            sublayer(norm(h))` instead of `h + sublayer(norm(h))`.
         token: `(*batch, hidden_dim)` - this layer's input at this step.
         cached_keys, cached_values: `(*batch, max_steps + 1, num_heads,
             head_dim)` - this layer's cache (positions > step_idx are
@@ -222,12 +275,19 @@ class TransformerBlock(nn.Module):
         scores = jnp.einsum("...hd,...khd->...hk", q, cached_keys) * scale
         scores = jnp.where(key_mask, scores, _NEG_INF)
         weights = jax.nn.softmax(scores, axis=-1)
+        if self.attention_dropout > 0.0 and dropout_key is not None:
+            keep_prob = 1.0 - self.attention_dropout
+            mask_fn = lambda k: jax.random.bernoulli(  # noqa: E731
+                jax.random.fold_in(k, step_idx), keep_prob, weights.shape[-2:]
+            )
+            keep = jax.vmap(mask_fn)(dropout_key.reshape(-1, 2)).reshape(weights.shape)
+            weights = jnp.where(keep, weights / keep_prob, 0.0)
         attn_out = jnp.einsum("...hk,...khd->...hd", weights, cached_values)
 
-        token = token + self.out_proj(attn_out)
+        token = self._residual(token, self.out_proj(attn_out), res_scale)
         if self.use_sandwich_norm:
             token = self.attn_post_norm(token)
-        return self._mlp(token), cached_keys, cached_values
+        return self._mlp(token, res_scale), cached_keys, cached_values
 
 
 class HaltingHead(nn.Module):
@@ -245,13 +305,16 @@ class HaltingHead(nn.Module):
     hidden_dims: Tuple[int, ...] = ()
     activation: str = "relu"
     kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    bias_init: float = 0.0  # initial halting logit offset; < 0 starts with low halting probs
 
     @nn.compact
     def __call__(self, x: chex.Array) -> chex.Array:
         for dim in self.hidden_dims:
             x = nn.Dense(dim, kernel_init=self.kernel_init)(x)
             x = parse_activation_fn(self.activation)(x)
-        return nn.Dense(1, kernel_init=self.kernel_init)(x)
+        return nn.Dense(
+            1, kernel_init=self.kernel_init, bias_init=nn.initializers.constant(self.bias_init)
+        )(x)
 
 
 class _CoTStep(nn.Module):
@@ -289,11 +352,30 @@ class _CoTStep(nn.Module):
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
+    num_state_tokens: int = 1
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
+    alpha_1_init: float = 0.75
+    alpha_2_init: float = 0.25
+    block_init: str = "orthogonal"
+    halting_bias_init: float = 0.0
+    attention_dropout: float = 0.0
+    halting_param: str = "hazard"
+    cumulative_halting_eps: float = 0.01
 
     @nn.compact
     def __call__(
-        self, carry: Tuple[chex.Array, ...], step_idx: chex.Array
+        self, carry: Tuple[chex.Array, ...], xs: Tuple[chex.Array, chex.Array, chex.Array]
     ) -> Tuple[Tuple[chex.Array, ...], None]:
+        # `pos` is the scratchpad position. The first `num_state_tokens - 1`
+        # positions only prefill the KV-cache with state tokens (no halting).
+        # The CoT step `step_idx` starts at the last state token.
+        # `inject_token` is the token CoT step 0 runs on, repeated per position.
+        pos, state_token, inject_token = xs
+        num_prefill = self.num_state_tokens - 1
+        num_positions = self.max_steps + num_prefill
+        step_idx = pos - num_prefill
         (
             current_token,
             cached_keys,
@@ -310,12 +392,18 @@ class _CoTStep(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            dropout_key,
         ) = carry
+        # Prefill positions are never "running": they cannot halt, count as
+        # compute, or add halting log prob.
+        all_running = still_running
+        still_running = still_running & (step_idx >= 0)
+        hist_idx = jnp.maximum(step_idx, 0)  # prefill writes are overwritten at step 0
 
         pos_embedding = self.param(
             "pos_embedding",
             normal(stddev=0.02),
-            (self.max_steps + 1, self.hidden_dim),
+            (num_positions + 1, self.hidden_dim),
         )
         blocks = [
             TransformerBlock(
@@ -323,33 +411,74 @@ class _CoTStep(nn.Module):
                 self.num_heads,
                 self.mlp_dim,
                 self.activation,
-                self.kernel_init,
+                _block_kernel_init(self.block_init, self.kernel_init),
                 self.use_sandwich_norm,
                 self.use_rmsnorm,
                 self.qkv_dim,
+                self.attention_dropout,
             )
             for _ in range(self.num_layers)
         ]
         halting_head = HaltingHead(
-            self.halting_hidden_dims, self.activation, self.kernel_init
+            self.halting_hidden_dims, self.activation, self.kernel_init, self.halting_bias_init
         )
 
-        x = current_token + pos_embedding[step_idx]
+        # Coupled residual scaling: learned per-dim a1 (block residuals) and a2 (input mixing), with b1/b2 tied to
+        # them so the per-step map stays contractive. Without input injection
+        # b2 = 1 - a1^(2L), which gives b1 = 1 - a1 (a convex residual).
+        res_scale = None
+        a2, b2 = 1.0, 1.0
+        if self.residual_scaling:
+            a1 = nn.sigmoid(
+                self.param(
+                    "alpha_1_logit",
+                    nn.initializers.constant(_logit(self.alpha_1_init)),
+                    (self.hidden_dim,),
+                )
+            )
+            a1_pow = a1 ** (2 * self.num_layers)
+            if self.input_injection:
+                a2 = nn.sigmoid(
+                    self.param(
+                        "alpha_2_logit",
+                        nn.initializers.constant(_logit(self.alpha_2_init)),
+                        (self.hidden_dim,),
+                    )
+                )
+                b2 = 1.0 - a2 * a1_pow
+            else:
+                b2 = 1.0 - a1_pow
+            b1 = b2 * (1.0 - a1) / (1.0 - a1_pow + 1e-5)
+            res_scale = (a1, b1)
+
+        token = jnp.where(pos < self.num_state_tokens, state_token, current_token)
+        if self.input_injection:
+            # Re-inject the observation into every fed-back thought
+            # (`a2 * thought + b2 * s`). Step 0 already *is* that token.
+            token = jnp.where(pos >= self.num_state_tokens, a2 * token + b2 * inject_token, token)
+        x = token + pos_embedding[pos]
         new_cached_keys = []
         new_cached_values = []
         for layer_idx, block in enumerate(blocks):
+            layer_key = None
+            if dropout_key is not None:  # one key stream per layer
+                layer_key = jax.vmap(jax.random.fold_in, (0, None))(
+                    dropout_key.reshape(-1, 2), layer_idx + 1
+                ).reshape(dropout_key.shape)
             x, k, v = block.step(
-                x, cached_keys[layer_idx], cached_values[layer_idx], step_idx, self.max_steps
+                x, cached_keys[layer_idx], cached_values[layer_idx], pos, num_positions,
+                res_scale, layer_key,
             )
             new_cached_keys.append(k)
             new_cached_values.append(v)
-        state = x
+        # The latent (RMSNormed with latent_rms_norm) is fed back and read by the heads.
+        state = rms_norm(x) if self.latent_rms_norm else x
         cached_keys = new_cached_keys
         cached_values = new_cached_values
         if self.replaying:
             # Only ever populated when replaying - see
             # `TransformerChainOfThoughtTorso`'s docstring for `states_history`.
-            states_history = states_history.at[..., step_idx, :].set(state)
+            states_history = states_history.at[..., hist_idx, :].set(state)
 
         halting_input = state
         if self.stop_gradient_halting_input:
@@ -361,6 +490,21 @@ class _CoTStep(nn.Module):
         step_count = step_idx + 1
         is_final_step = step_count == self.max_steps
         can_halt = step_count >= self.min_steps
+
+        assert self.halting_param in ("hazard", "cumulative"), self.halting_param
+        self_halt = False
+        if self.halting_param == "cumulative":
+            # halting_prob is h_n = P(c = n). While running, exp(halting_log_prob) is the mass left,
+            # S = 1 - H_{n-1} (forced steps add 0), so the per-step prob is h_n / S and the
+            # per-step log probs telescope to log h_c. Once H_{n-1} + h_n >= 1 - eps the agent halts
+            # here with the remainder S: lam = 1 (held at 1 - _PROB_EPS so logs stay finite).
+            survival = jnp.maximum(jnp.exp(halting_log_prob), _PROB_EPS)
+            self_halt = can_halt & (halting_prob >= survival - self.cumulative_halting_eps)
+            halting_prob = jnp.where(
+                self_halt,
+                1.0 - _PROB_EPS,
+                jnp.clip(halting_prob / survival, _PROB_EPS, 1.0 - _PROB_EPS),
+            )
 
         if not self.replaying:
             # Only meaningful from the second step on (step 0 has no
@@ -391,7 +535,7 @@ class _CoTStep(nn.Module):
         else:
             rng, step_rng = jax.random.split(rng)
             sampled_halt = jax.random.bernoulli(step_rng, halting_prob)
-            halts_this_step = still_running & ((sampled_halt & can_halt) | is_final_step)
+            halts_this_step = still_running & (((sampled_halt | self_halt) & can_halt) | is_final_step)
 
         # Halting is forced (not a free policy choice) before min_steps or at
         # max_steps - stop-gradient halting_prob there so REINFORCE doesn't
@@ -412,7 +556,7 @@ class _CoTStep(nn.Module):
         step_contribution = jnp.where(still_running & (~is_forced_step), step_log_prob, 0.0)
         halting_log_prob = halting_log_prob + step_contribution
         if self.replaying:
-            per_step_halting_log_prob = per_step_halting_log_prob.at[..., step_idx].set(
+            per_step_halting_log_prob = per_step_halting_log_prob.at[..., hist_idx].set(
                 step_contribution
             )
             # Bernoulli entropy of this step's halting decision - masked
@@ -428,13 +572,13 @@ class _CoTStep(nn.Module):
                 halting_prob * jnp.log(halting_prob)
                 + (1.0 - halting_prob) * jnp.log(1.0 - halting_prob)
             )
-            per_step_halting_entropy = per_step_halting_entropy.at[..., step_idx].set(
+            per_step_halting_entropy = per_step_halting_entropy.at[..., hist_idx].set(
                 jnp.where(still_running & (~is_forced_step), halting_entropy_this_step, 0.0)
             )
         num_steps_taken = num_steps_taken + still_running.astype(jnp.float32)
         final_state = jnp.where(halts_this_step[..., None], state, final_state)
 
-        still_running = still_running & (~halts_this_step)
+        still_running = all_running & (~halts_this_step)
         current_token = state
 
         new_carry = (
@@ -453,6 +597,7 @@ class _CoTStep(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            dropout_key,
         )
         return new_carry, None
 
@@ -548,6 +693,43 @@ class TransformerChainOfThoughtTorso(nn.Module):
     width than `hidden_dim`, which stays the width of the initial
     observation-projection Dense layer, the residual stream, and everything
     else (positional embedding, `out_proj`, MLP, halting head).
+
+    `num_state_tokens` (default `1`) is N: one `Dense` maps the observation
+    to N tokens of width `hidden_dim`. Tokens 0..N-2 only prefill the
+    KV-cache. CoT step 0 runs on token N-1. `N = 1` is the original torso.
+
+    `input_is_tokens` (default `False`) takes an input of shape `(*batch, N,
+    F)`, e.g. from `CNNTorso(channel_tokens=True)`. N comes from the input and
+    `num_state_tokens` is not used. `concat_input_tokens` (default `False`)
+    instead gives each of the N input tokens its own `Dense(F -> hidden_dim /
+    N)` and concatenates the N outputs into 1 state token of width `hidden_dim`.
+
+    Three options keep the weight-tied loop stable, so more CoT steps refine the latent
+    instead of compounding its scale. All are off by default:
+
+      - `latent_rms_norm`: parameter-free RMSNorm on every latent (state
+        tokens and each step's output). The heads read and the loop feeds back
+        `rms_norm(x)`.
+      - `input_injection`: each fed-back thought (CoT step >= 1) becomes `a2 *
+        thought + b2 * s`, where `s` is the token CoT step 0 runs on (the last
+        state token). This keeps the observation in every step's input rather
+        than only in the attention cache. Without `residual_scaling`, `a2 = b2
+        = 1`.
+      - `residual_scaling`: every block residual in the loop becomes `a1 * h +
+        b1 * sublayer(norm(h))`, with learned per-dim `a1 = sigmoid(.)`
+        (initialized to `alpha_1_init`) and `a2` (initialized to
+        `alpha_2_init`), and `b2 = 1 - a2 a1^(2L)`, `b1 = b2 (1 - a1) / (1 -
+        a1^(2L))`, which keeps the per-step map contractive. Without injection, `b2 = 1 - a1^(2L)`.
+
+    `block_init` (default `"orthogonal"`) sets the kernel init of every
+    `TransformerBlock` projection (Q/K/V, attention out, both MLP layers).
+    `"orthogonal"` uses `kernel_init` (orthogonal(sqrt(2))); its sqrt(2) gain
+    on the residual-branch outputs grows the residual stream every block.
+    `"trunc_normal"` uses `truncated_normal(1/sqrt(fan_in))` (see
+    `trunc_normal_kernel_init`). The observation projection and halting head keep
+    `kernel_init` either way.
+
+    The action head reads the state at the halt step.
     """
 
     hidden_dim: int
@@ -563,9 +745,25 @@ class TransformerChainOfThoughtTorso(nn.Module):
     stop_gradient_halting_input: bool = False
     halting_temperature: float = 1.0
     halting_hidden_dims: Tuple[int, ...] = ()
+    halting_bias_init: float = 0.0
+    # "hazard": sigmoid is P(halt now | still running). "cumulative": sigmoid is h_n = P(c = n);
+    # halt at the first n with sum_{j<=n} h_j >= 1 - cumulative_halting_eps (agent ends its own
+    # support; max_steps is only a cap). Turned into the per-step prob h_n / (1 - H_{n-1}).
+    halting_param: str = "hazard"
+    cumulative_halting_eps: float = 0.01
     use_sandwich_norm: bool = False
     use_rmsnorm: bool = False
     qkv_dim: Optional[int] = None
+    num_state_tokens: int = 1
+    input_is_tokens: bool = False
+    concat_input_tokens: bool = False
+    latent_rms_norm: bool = False
+    input_injection: bool = False
+    residual_scaling: bool = False
+    alpha_1_init: float = 0.75
+    alpha_2_init: float = 0.25
+    block_init: str = "orthogonal"
+    attention_dropout: float = 0.0
 
     @nn.compact
     def __call__(
@@ -574,6 +772,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
         rng: Optional[chex.PRNGKey] = None,
         target_compute_time: Optional[chex.Array] = None,
         deterministic: bool = False,
+        dropout_key: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, ...]:
         """
         Args:
@@ -590,6 +789,10 @@ class TransformerChainOfThoughtTorso(nn.Module):
             deterministic: if True (and `target_compute_time` is None), halt
                 as soon as the halting probability crosses 0.5 instead of
                 sampling. Useful for greedy evaluation.
+            dropout_key: per-example keys `(*batch, 2)`. With `attention_dropout
+                > 0`, drops attention weights with a mask set by (key, layer,
+                position), so the same keys give the same mask in rollout and
+                replay. `None` (e.g. evaluation, critic) means no dropout.
 
         Returns:
             `(embedding, compute_time, first_convergence_step,
@@ -617,18 +820,50 @@ class TransformerChainOfThoughtTorso(nn.Module):
             f"qkv_dim ({qkv_dim}) must be divisible by num_heads ({self.num_heads})."
         )
 
-        # The first scratchpad token is the observation projected into the
-        # model width.
-        initial_token = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+        # The first N scratchpad tokens are the observation projected into N
+        # tokens of the model width.
+        if self.input_is_tokens:
+            # `observation` is already `(*batch, N, F)` (e.g. CNN kernel
+            # features). One shared Dense maps each token to `hidden_dim`.
+            batch_shape, n = observation.shape[:-2], observation.shape[-2]
+            if self.concat_input_tokens:
+                # Token i gets its own Dense(F -> hidden_dim / N); the N outputs make 1 token.
+                assert self.hidden_dim % n == 0, f"hidden_dim ({self.hidden_dim}) % N ({n}) != 0"
+                per_token_dense = nn.vmap(
+                    nn.Dense, in_axes=-2, out_axes=-2,
+                    variable_axes={"params": 0}, split_rngs={"params": True},
+                )
+                state_tokens = per_token_dense(self.hidden_dim // n, kernel_init=self.kernel_init)(
+                    observation
+                ).reshape(batch_shape + (1, self.hidden_dim))
+                n = 1
+            else:
+                state_tokens = nn.Dense(self.hidden_dim, kernel_init=self.kernel_init)(observation)
+        else:
+            n = self.num_state_tokens
+            state_tokens = nn.Dense(n * self.hidden_dim, kernel_init=self.kernel_init)(observation)
+            state_tokens = state_tokens.reshape(batch_shape + (n, self.hidden_dim))
         if self.use_input_layer_norm:
-            initial_token = _norm_cls(self.use_rmsnorm)()(initial_token)
+            state_tokens = _norm_cls(self.use_rmsnorm)()(state_tokens)
+        # State tokens enter the residual stream exactly like fed-back thoughts.
+        if self.latent_rms_norm:
+            state_tokens = rms_norm(state_tokens)
+        initial_token = state_tokens[..., -1, :]
+        num_positions = self.max_steps + n - 1
+        # Per-position scan input: state token p at position p < N, else unused.
+        step_inputs = jnp.concatenate(
+            [state_tokens, jnp.zeros(batch_shape + (self.max_steps - 1, self.hidden_dim))],
+            axis=-2,
+        )
+        step_inputs = jnp.moveaxis(step_inputs, -2, 0)
+        inject_inputs = jnp.broadcast_to(initial_token, (num_positions,) + initial_token.shape)
 
         # Pre-allocate each layer's KV-cache; positions written by
         # `_CoTStep`/`TransformerBlock.step` are set incrementally, and
         # not-yet-written positions are masked out of attention (see
         # `TransformerBlock.step`), never read.
         head_dim = qkv_dim // self.num_heads
-        cache_shape = batch_shape + (self.max_steps + 1, self.num_heads, head_dim)
+        cache_shape = batch_shape + (num_positions + 1, self.num_heads, head_dim)
         cached_keys = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
         cached_values = [jnp.zeros(cache_shape) for _ in range(self.num_layers)]
 
@@ -669,6 +904,17 @@ class TransformerChainOfThoughtTorso(nn.Module):
             self.use_sandwich_norm,
             self.use_rmsnorm,
             self.qkv_dim,
+            n,
+            latent_rms_norm=self.latent_rms_norm,
+            input_injection=self.input_injection,
+            residual_scaling=self.residual_scaling,
+            alpha_1_init=self.alpha_1_init,
+            alpha_2_init=self.alpha_2_init,
+            block_init=self.block_init,
+            halting_bias_init=self.halting_bias_init,
+            attention_dropout=self.attention_dropout,
+            halting_param=self.halting_param,
+            cumulative_halting_eps=self.cumulative_halting_eps,
         )
 
         initial_carry = (
@@ -687,6 +933,7 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
+            dropout_key,
         )
         (
             _,
@@ -704,7 +951,8 @@ class TransformerChainOfThoughtTorso(nn.Module):
             states_history,
             per_step_halting_log_prob,
             per_step_halting_entropy,
-        ), _ = cot_step(initial_carry, jnp.arange(self.max_steps))
+            _,
+        ), _ = cot_step(initial_carry, (jnp.arange(num_positions), step_inputs, inject_inputs))
 
         if replaying:
             return (
@@ -715,3 +963,14 @@ class TransformerChainOfThoughtTorso(nn.Module):
                 per_step_halting_entropy,
             )
         return final_state, num_steps_taken, first_convergence_step, num_close_steps
+
+
+class CoTCriticTorso(nn.Module):
+    """Critic torso: runs `torso` (a `TransformerChainOfThoughtTorso`, usually with
+    `min_steps == max_steps`) greedily and returns only its embedding."""
+
+    torso: nn.Module
+
+    @nn.compact
+    def __call__(self, observation: chex.Array) -> chex.Array:
+        return self.torso(observation, deterministic=True)[0]

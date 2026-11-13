@@ -18,6 +18,8 @@ actor_network:
     activation: gelu
     use_input_layer_norm: False
     halting_temperature: 1.0 # <1.0 sharpens the halting probability towards 0/1, >1.0 softens it towards 0.5.
+    halting_param: hazard # "cumulative": sigmoid is P(c = n); halt once the summed P(c = j) reach 1 - cumulative_halting_eps.
+    cumulative_halting_eps: 0.01
   action_head:
     _target_: stoix.networks.heads.CategoricalHead
 

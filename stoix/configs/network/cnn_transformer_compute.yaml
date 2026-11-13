@@ -7,6 +7,7 @@
 # thinking?" decision at each step from a learned probability (see
 # stoix.networks.torso_compute_transformer.TransformerChainOfThoughtTorso).
 actor_network:
+  input_dropout: 0.0 # Feature-wise dropout on the CNN output; same mask in rollout and update.
   input_layer:
     _target_: stoix.networks.torso.CNNTorso
     channel_sizes: [32, 64]
@@ -28,6 +29,7 @@ actor_network:
     activation: relu
     use_input_layer_norm: False
     halting_temperature: 1.0 # <1.0 sharpens the halting probability towards 0/1, >1.0 softens it towards 0.5.
+    attention_dropout: 0.0 # Dropout on attention weights; same mask in rollout and update.
   action_head:
     _target_: stoix.networks.heads.CategoricalHead
 
