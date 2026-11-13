@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(JAX_PLATFORMS=cpu timeout 300 python -c ' *)",
-      "Bash(python3 -m py_compile ramdp_experiments/minatar_fixed_budget_sweep.py)",
-      "Bash(python3 ramdp_experiments/minatar_fixed_budget_sweep.py --envs seaquest --systems ff_ppo_explicit_naive --use-latent-feedback true,false --seeds 1 --dry-run --limit 2)"
-    ]
-  }
-}
