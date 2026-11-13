@@ -1,8 +1,8 @@
 """Combines the hardness-vs-compute-time and action-vs-compute-time plots
 from both `analysis-compute_time-hardness.ipynb` (Lights Out) and
-`analysis-compute_time-hardness-slidingpuzzle.ipynb` (sliding puzzle) into a
-single 1x4 figure: [lightsout hardness, lightsout action, slidingpuzzle
-hardness, slidingpuzzle action], all against compute time.
+`analysis-compute_time-hardness-slidingpuzzle.ipynb` (sliding puzzle) into
+two 1x2 figures (Lightsout, sliding puzzle), both against compute time:
+analysis-hardness_grid.pdf (shortest path length) and analysis-action_grid.pdf (chosen action).
 """
 
 import pickle
@@ -144,7 +144,7 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
         marker="o",
         # Unordered actions: no connecting line (it would imply a trend
         # between neighbouring indices), so the markers need to be visible.
-        ms=1,
+        ms=3 if categorical else 1,
         linestyle="none" if categorical else "-",
         linewidth=1,
         color=mean_color,
@@ -157,7 +157,7 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
     # titles colliding.
     ax.text(
         0.95,
-        0.05,
+        0.02 if categorical else 0.05,
         stat_label,
         transform=ax.transAxes,
         ha="right",
@@ -165,39 +165,20 @@ def plot_violin_panel(ax, hardness, values, xlabel, categorical=False, xticklabe
         fontsize=8,
         bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.0),
     )
+    if categorical:
+        # Empty strip below c=1 for the eta^2 label, so it can't cover an IQM point (Lights Out button 16 sits at c=1).
+        ax.set_ylim(0.3, None)
     ax.set_xlabel(xlabel)
     ax.grid(True, alpha=0.3)
     return handles
 
 
-def main():
-    lightsout = load_plot_data("lightsout")
-    slidingpuzzle = load_plot_data("slidingpuzzle")
-
-    env_map = {
-        "lightsout-5x4": "Lightsout",
-        "slidingtile-3x3": "Sliding puzzle",
-    }
-
-    nrows = 1
-    ncols = 2
-    # doc_width_in = doc_width_pt / 72.27
-    # fig, axes = plt.subplots(nrows, ncols, figsize=(doc_width_in * 1.3, doc_width_in * 0.42))
-    figsize = set_size(doc_width_pt, fraction=0.95, subplots=(nrows, ncols), use_golden_ratio=False)
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
-
-    handles = plot_violin_panel(
-        axes[0],
-        lightsout["hardness"],
-        lightsout["first_step_compute_time"],
-        xlabel="Shortest path length",
-    )
-    plot_violin_panel(
-        axes[1],
-        slidingpuzzle["hardness"],
-        slidingpuzzle["first_step_compute_time"],
-        xlabel="Shortest path length",
-    )
+def plot_grid(panels, out_name):
+    """1x2 figure, one panel per (title, x, compute_time, plot_violin_panel kwargs) in `panels`."""
+    figsize = set_size(doc_width_pt, fraction=0.95, subplots=(1, len(panels)), use_golden_ratio=False)
+    fig, axes = plt.subplots(1, len(panels), figsize=figsize)
+    for ax, (_, x, values, kwargs) in zip(axes, panels):
+        plot_violin_panel(ax, x, values, **kwargs)
     axes[0].set_ylabel("Compute steps")
 
     # Matches analysis-unshared_iru.ipynb's plot_pareto_row exactly: a single
@@ -206,18 +187,15 @@ def main():
     # *outside* the resulting figure box (y > 1 or y < 0) - bbox_inches=
     # "tight" at save time expands the saved page to include them. A second
     # tight_layout call after placing them would move the axes again and
-    # invalidate the positions those placements were computed from, so unlike
-    # an earlier version of this script, there is only one here.
+    # invalidate the positions those placements were computed from.
     fig.tight_layout(pad=0.2, w_pad=1.0)
 
     GROUP_TITLE_GAP_IN = 0.07  # group titles' bottom edge above the figure box
     GROUP_TITLE_HEIGHT_IN = 0.2  # room the legend leaves for the group titles
     fig_h = fig.get_figheight()
-    PANEL_GROUPS = [("Lightsout", [0]), ("Sliding puzzle", [1])]
-    for title, cols in PANEL_GROUPS:
-        x0 = min(axes[i].get_position().x0 for i in cols)
-        x1 = max(axes[i].get_position().x1 for i in cols)
-        fig.text((x0 + x1) / 2, 1.0 + GROUP_TITLE_GAP_IN / fig_h, title, ha="center", va="bottom", fontsize=12)
+    for ax, (title, *_) in zip(axes, panels):
+        pos = ax.get_position()
+        fig.text((pos.x0 + pos.x1) / 2, 1.0 + GROUP_TITLE_GAP_IN / fig_h, title, ha="center", va="bottom", fontsize=12)
 
     by_label = {}
     for ax in axes:
@@ -232,9 +210,33 @@ def main():
         borderaxespad=0.0,
         frameon=True,
     )
-    out_path = HERE / "analysis-hardness_grid.pdf"
+    out_path = HERE / out_name
     fig.savefig(out_path, dpi=600, format="pdf", bbox_inches="tight")
     print(f"Saved {out_path}")
+
+
+def main():
+    lightsout = load_plot_data("lightsout")
+    slidingpuzzle = load_plot_data("slidingpuzzle")
+    hardness_kwargs = dict(xlabel="Shortest path length")
+    plot_grid(
+        [
+            ("Lightsout", lightsout["hardness"], lightsout["first_step_compute_time"], hardness_kwargs),
+            ("Sliding puzzle", slidingpuzzle["hardness"], slidingpuzzle["first_step_compute_time"], hardness_kwargs),
+        ],
+        "analysis-hardness_grid.pdf",
+    )
+
+    lightsout_actions, lightsout_ct = load_step_actions("lightsout")
+    slidingpuzzle_actions, slidingpuzzle_ct = load_step_actions("slidingpuzzle")
+    plot_grid(
+        [
+            ("Lightsout", lightsout_actions, lightsout_ct, dict(xlabel="Action (button index)", categorical=True)),
+            ("Sliding puzzle", slidingpuzzle_actions, slidingpuzzle_ct,
+             dict(xlabel="Action", categorical=True, xticklabels=SLIDINGPUZZLE_ACTION_NAMES)),
+        ],
+        "analysis-action_grid.pdf",
+    )
 
 
 if __name__ == "__main__":
